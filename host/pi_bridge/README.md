@@ -12,7 +12,7 @@ Both share one serial lock, so the viewer and a `t_scope.py` session can coexist
 serialised; the viewer's acquisition loop simply yields between records).
 
 ## Viewer
-Both channels live (SSE push, ~12 fps with firmware v3 and the current server), FNIRSI-style
+Both channels live (SSE push, ~20 fps with firmware v3; the raw record takes ~30 ms on the Pi), FNIRSI-style
 status bar (V/div, probe, coupling, timebase, trigger), 10×8 graticule with volt/time scaling
 from the record header + OpenScope's calibration tables, measurements (Vpp/Vmax/Vmin/mean/
 AC-RMS/freq/period/duty, clipping warning), controls (timebase, V/div per channel, trigger
