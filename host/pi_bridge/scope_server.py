@@ -25,6 +25,10 @@ END = re.compile(rb"SCOPEBIN END gen=(\d+)\r\n")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 # --- calibration tables (OpenScope firmware 2eae008: src/ui/scope_timebase.c, scope_cal.c) ---
+# Per-unit corrections measured against the Pi's own crystal (hardware PWM on GPIO18,
+# 2026-10-10): every "measured" OpenScope code was within 0.2 %, the provisional 0x0D read
+# 1.05 % slow -> it is the round 125 kS/s. Overrides replace the firmware's rate_hz when set.
+RATE_OVERRIDE = {0x0D: 124960.0}
 TIMEBASE_RATE = {0x0D: 123662.7, 0x0E: 49930.1, 0x0F: 24979.1, 0x10: 12490.0,
                  0x11: 4990.8, 0x12: 2494.9, 0x13: 1250.4, 0x14: 500.2}
 TIMEBASE_TIER = {0x0D: "provisional"}                      # others in the dict: "measured"
@@ -187,7 +191,13 @@ def measure(raw, vpc, rate):
     unit = "V" if vpc else "cnt"
     s = vpc if vpc else 1.0
     zero = 128 if vpc else 0
+    # Top/base = median of the samples above/below the mean: a square wave's flat levels,
+    # immune to noise peaks and overshoot (max-min over-reads by 2-3 counts on coarse ranges).
+    above = sorted(x for x in raw if x > mean) or [mean]
+    below = sorted(x for x in raw if x <= mean) or [mean]
+    vtop, vbase = above[len(above) // 2], below[len(below) // 2]
     out = {"unit": unit, "vmax": (mx - zero) * s, "vmin": (mn - zero) * s, "vpp": (mx - mn) * s,
+           "vtop": (vtop - zero) * s, "vbase": (vbase - zero) * s, "vamp": (vtop - vbase) * s,
            "vavg": (mean - zero) * s, "vrms_ac": math.sqrt(var) * s,
            "clipped": bool(mn <= 0 or mx >= 227), "freq": None, "period": None, "duty": None}
     span = mx - mn
@@ -200,10 +210,25 @@ def measure(raw, vpc, rate):
                 state = False
             elif not state and x > hi:
                 state = True
-                rises.append(i)
+                # sub-sample edge: interpolate the mean-level crossing just before i
+                j = i
+                while j > 0 and raw[j - 1] > mean:
+                    j -= 1
+                if j > 0 and raw[j] != raw[j - 1]:
+                    rises.append(j - 1 + (mean - raw[j - 1]) / (raw[j] - raw[j - 1]))
+                else:
+                    rises.append(float(j))
         if len(rises) >= 3:
-            per = (rises[-1] - rises[0]) / (len(rises) - 1)
-            seg = raw[rises[0]:rises[-1]]
+            # Median of the individual cycle periods: a free-run record holds one time seam
+            # (the FPGA write pointer), which corrupts exactly one cycle; (last-first)/n
+            # would spread that error over the whole estimate (up to 1/cycles, 12% at 0x0D).
+            pers = sorted(b - a for a, b in zip(rises, rises[1:]))
+            med = pers[len(pers) // 2] if len(pers) % 2 else (pers[len(pers) // 2 - 1] + pers[len(pers) // 2]) / 2
+            # mean of the periods that agree with the median (drops the seam cycle only);
+            # a plain median is biased by integer edge positions on fast-edged signals.
+            good = [q for q in pers if abs(q - med) <= max(1.5, 0.15 * med)]
+            per = sum(good) / len(good) if good else med
+            seg = raw[int(rises[0]):int(rises[-1])]
             out["duty"] = sum(1 for x in seg if x > mean) / max(1, len(seg))
             if rate:
                 out["period"] = per / rate
@@ -253,7 +278,7 @@ class Hub:
             now = time.time()
             times = [t for t in times if now - t < 3.0] + [now]
             self.fps = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else 0.0
-            rate = h.get("rate_hz") or TIMEBASE_RATE.get(h.get("tb"), 0)
+            rate = RATE_OVERRIDE.get(h.get("tb")) or h.get("rate_hz") or TIMEBASE_RATE.get(h.get("tb"), 0)
             vpc1, vpc2 = h.get("vpc1_nv", 0) / 1e9, h.get("vpc2_nv", 0) / 1e9
             fr = {"seq": self.seq + 1, "t": now, "hdr": h, "rate": rate, "vpc1": vpc1, "vpc2": vpc2,
                   "ch1": base64.b64encode(c1).decode(), "ch2": base64.b64encode(c2).decode(),

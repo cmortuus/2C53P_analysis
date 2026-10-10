@@ -1,0 +1,6 @@
+
+Horizontal (freq 10000 Hz expected)
+code   s/div        tier       meas Hz      err %      n
+0x0D   0.000259     provisional 9897.9       -1.02      5
+
+restored timebase 0x0E, CH1 range 3

@@ -1,0 +1,11 @@
+
+Horizontal (freq 100 Hz expected)
+code   s/div        tier       meas Hz      err %      n
+0x0E   0.000641     measured   190.57       +90.57     5
+0x0F   0.00128      measured   99.915       -0.08      5
+0x10   0.00256      measured   99.92        -0.08      5
+0x11   0.00641      measured   99.821       -0.18      5
+0x12   0.0128       measured   99.8         -0.20      5
+0x13   0.0256       measured   100.15       +0.15      5
+
+restored timebase 0x0E, CH1 range 3

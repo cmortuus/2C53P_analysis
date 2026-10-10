@@ -42,6 +42,16 @@ ssh pi@scope-pi.local 'python3 iap_flash.py status && sudo python3 iap_flash.py 
 ssh pi@scope-pi.local 'sudo systemctl start scope-server'
 ```
 
+## Reference signal for calibration checks
+`config.txt` has `dtoverlay=pwm,pin=18,func=2`; the server does not touch it. Hardware PWM on
+GPIO18 (header pin 12, outer row, 6th from the SD-card end; GND = pin 6, 3rd) from the Pi's crystal:
+```bash
+C=/sys/class/pwm/pwmchip0; echo 0 | sudo tee $C/export; echo 1000000 | sudo tee $C/pwm0/period   # ns
+echo 500000 | sudo tee $C/pwm0/duty_cycle; echo 1 | sudo tee $C/pwm0/enable
+```
+Then `host/t_calcheck.py --freq 1000 --vpp 3.3 --wave square --ch 1`. Verified 2026-10-10: all
+measured timebase codes within ±0.2 %, 0x0D is really 125 kS/s (override in `scope_server.py`).
+
 ## Hardware / mounting
 - Pi Zero 2 W, micro-SD, **micro-USB OTG adapter** on the port marked `USB` (inner one; `PWR IN`
   is the outer one), USB-A→USB-C cable to the scope.

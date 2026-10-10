@@ -247,7 +247,7 @@ function updateStatus(f) {
     $('tmode').value = ['auto', 'normal', 'single'][h.tmode] || 'auto'; $('tedge').value = h.tedge ? 'falling' : 'rising';
   }
   const m1 = f.meas.ch1 || {}, m2 = f.meas.ch2 || {};
-  const rows = [['Vpp', 'vpp'], ['Vmax', 'vmax'], ['Vmin', 'vmin'], ['Mean', 'vavg'], ['RMS (AC)', 'vrms_ac'], ['Freq', 'freq'], ['Period', 'period'], ['Duty', 'duty']];
+  const rows = [['Vpp', 'vpp'], ['Top−Base', 'vamp'], ['Vmax', 'vmax'], ['Vmin', 'vmin'], ['Mean', 'vavg'], ['RMS (AC)', 'vrms_ac'], ['Freq', 'freq'], ['Period', 'period'], ['Duty', 'duty']];
   $('mt').innerHTML = rows.map(([n, k]) => {
     const fmt = m => k === 'freq' ? fmtF(m[k]) : k === 'period' ? fmtT(m[k]) : k === 'duty' ? (m[k] == null ? '—' : (m[k] * 100).toFixed(1) + ' %') : fmtM(m[k], m.unit);
     return `<tr><td>${n}</td><td>${h.en1 ? fmt(m1) : '—'}</td><td>${h.en2 ? fmt(m2) : '—'}</td></tr>`;

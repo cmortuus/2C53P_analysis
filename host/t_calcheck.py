@@ -16,7 +16,7 @@ Horizontal error = (measured period / expected period - 1): a +1.5 % error means
 scope's sample-rate table for that code is 1.5 % too high (the timebase labels read
 short). Vertical error = measured Vpp / expected Vpp - 1 for that range's mV/count.
 """
-import argparse, json, statistics, time, urllib.request
+import argparse, json, math, statistics, time, urllib.request
 
 
 def api(url, path, body=None):
@@ -46,6 +46,8 @@ def main():
     ap.add_argument("--ch", type=int, default=2, choices=(1, 2))
     ap.add_argument("--probe", type=int, default=1, help="probe factor the scope is set to (1 or 10)")
     ap.add_argument("--frames", type=int, default=5)
+    ap.add_argument("--wave", choices=("square", "sine"), default="sine",
+                    help="square: amplitude = top-base levels; sine: amplitude = 2*sqrt(2)*AC RMS")
     ap.add_argument("--skip-h", action="store_true"); ap.add_argument("--skip-v", action="store_true")
     a = ap.parse_args()
     info = api(a.url, "/api/info")
@@ -90,7 +92,9 @@ def sweep(a, info, ch, cpd):
                 continue
             api(a.url, "/api/cmd", {"cmd": "fpga scope vdiv %d %d" % (a.ch, rng)})
             fr = frames(a.url, a.frames)
-            vs = [f["meas"][ch]["vpp"] for f in fr if f["meas"][ch].get("unit") == "V"]
+            key = "vamp" if a.wave == "square" else "vrms_ac"
+            vs = [f["meas"][ch][key] * (1 if a.wave == "square" else 2 * math.sqrt(2))
+                  for f in fr if f["meas"][ch].get("unit") == "V"]
             clip = any(f["meas"][ch].get("clipped") for f in fr)
             if not vs:
                 print("%-5d %-12s %-12s uncal" % (rng, "%.3g" % vdiv, info["range_tier"][rng])); continue
