@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2C53T Live</title>
+<style>
+  :root {
+    --bg: #000; --panel: #111418; --panel2: #1a1e24; --line: #2a3038; --text: #e6e9ee; --dim: #8a93a0;
+    --ch1: #ffd21f; --ch2: #22d3ee; --accent: #3b82f6; --run: #22c55e; --stop: #ef4444; --warn: #f59e0b;
+    --grid: rgba(150,160,175,.32); --grid-strong: rgba(170,180,195,.55);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .app { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 10px; padding: 10px; max-width: 1500px; margin: 0 auto; }
+  @media (max-width: 900px) { .app { grid-template-columns: minmax(0,1fr); padding: 6px; } }
+
+  /* status bar — FNIRSI style */
+  .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: stretch; margin-bottom: 6px; }
+  .chip { display: flex; align-items: center; background: linear-gradient(#2a2f36, #1b1f24); border: 1px solid #343a43;
+    border-radius: 4px; overflow: hidden; height: 30px; white-space: nowrap; }
+  .chip .tag { padding: 0 8px; height: 100%; display: flex; align-items: center; font-weight: 700; color: #000; }
+  .chip .val { padding: 0 9px; font-variant-numeric: tabular-nums; }
+  .chip.ch1 .tag { background: var(--ch1); } .chip.ch1 .val { color: var(--ch1); }
+  .chip.ch2 .tag { background: var(--ch2); } .chip.ch2 .val { color: var(--ch2); }
+  .chip.off { opacity: .45; }
+  .chip.h .tag { background: #3a414b; color: #fff; }
+  .chip.trig .val { color: #ffb020; }
+  .spacer { flex: 1; }
+  .pill { height: 30px; min-width: 64px; border-radius: 15px; border: 0; font-weight: 700; color: #fff; cursor: pointer; padding: 0 14px; }
+  .pill.run { background: var(--run); } .pill.stop { background: var(--stop); }
+  .link { display: flex; align-items: center; gap: 6px; color: var(--dim); padding: 0 6px; font-variant-numeric: tabular-nums; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--stop); }
+  .dot.ok { background: var(--run); }
+
+  .screen { position: relative; background: #000; border: 1px solid #2b313a; border-radius: 6px; padding: 6px; }
+  canvas { display: block; width: 100%; height: auto; aspect-ratio: 10 / 8; }
+  .overlay { position: absolute; left: 14px; bottom: 12px; color: var(--dim); font-size: 11px; pointer-events: none; }
+
+  .side { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+  .card h3 { margin: 0 0 8px; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); font-weight: 600; }
+  .row { display: grid; grid-template-columns: 78px 1fr; align-items: center; gap: 6px; margin: 6px 0; }
+  .row label { color: var(--dim); }
+  select, input[type=text], button.b { width: 100%; background: var(--panel2); color: var(--text); border: 1px solid #333a44;
+    border-radius: 5px; height: 30px; padding: 0 8px; font: inherit; }
+  button.b { cursor: pointer; } button.b:hover { border-color: #4b5563; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .toggles { display: flex; gap: 12px; } .toggles label { display: flex; gap: 5px; align-items: center; cursor: pointer; }
+
+  table.meas { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table.meas th, table.meas td { padding: 3px 4px; text-align: right; border-bottom: 1px solid #20252c; }
+  table.meas th:first-child, table.meas td:first-child { text-align: left; color: var(--dim); font-weight: 400; }
+  table.meas th.c1 { color: var(--ch1); } table.meas th.c2 { color: var(--ch2); }
+  .warn { color: var(--warn); }
+  .console pre { background: #07090c; border: 1px solid #20252c; border-radius: 5px; padding: 6px; max-height: 160px;
+    overflow: auto; margin: 6px 0 0; font: 11px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; color: #b9c2cf; }
+  .hint { color: var(--dim); font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div>
+    <div class="bar">
+      <div class="chip ch1" id="chip1"><span class="tag">CH1</span><span class="val" id="s1">—</span></div>
+      <div class="chip ch2" id="chip2"><span class="tag">CH2</span><span class="val" id="s2">—</span></div>
+      <div class="chip h"><span class="tag">H</span><span class="val" id="sh">—</span></div>
+      <div class="chip trig"><span class="tag" style="background:#ffb020">T</span><span class="val" id="st">—</span></div>
+      <div class="spacer"></div>
+      <div class="link"><span class="dot" id="dot"></span><span id="fps">offline</span></div>
+      <button class="pill run" id="runbtn">RUN</button>
+    </div>
+    <div class="screen">
+      <canvas id="cv" width="1000" height="800"></canvas>
+      <div class="overlay" id="ov"></div>
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <h3>Measurements</h3>
+      <table class="meas">
+        <thead><tr><th></th><th class="c1">CH1</th><th class="c2">CH2</th></tr></thead>
+        <tbody id="mt"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Horizontal</h3>
+      <div class="row"><label>Timebase</label><select id="tb"></select></div>
+      <div class="row"><label>View</label>
+        <select id="zoom"><option value="32">10 div (32 S/div)</option><option value="64">2× wider</option><option value="102.4">Full record</option></select></div>
+    </div>
+
+    <div class="card">
+      <h3>Vertical</h3>
+      <div class="row"><label style="color:var(--ch1)">CH1 V/div</label><select id="r1"></select></div>
+      <div class="row"><label style="color:var(--ch2)">CH2 V/div</label><select id="r2"></select></div>
+      <div class="row"><label>Show</label>
+        <div class="toggles"><label><input type="checkbox" id="v1" checked> CH1</label><label><input type="checkbox" id="v2" checked> CH2</label></div></div>
+    </div>
+
+    <div class="card">
+      <h3>Trigger</h3>
+      <div class="row"><label>Mode</label><select id="tmode"><option>auto</option><option>normal</option><option>single</option></select></div>
+      <div class="row"><label>Edge</label><select id="tedge"><option>rising</option><option>falling</option></select></div>
+      <div class="row"><label>Level</label><input type="range" id="tlvl" min="-100" max="100" value="0"></div>
+      <div class="hint">Level −100…100 (firmware units). Edge filtering is done by the scope's MCU.</div>
+    </div>
+
+    <div class="card">
+      <h3>Capture</h3>
+      <div class="btns">
+        <button class="b" id="png">Save PNG</button>
+        <button class="b" id="csv">Save CSV</button>
+      </div>
+    </div>
+
+    <div class="card console">
+      <h3>Shell</h3>
+      <input type="text" id="cmd" placeholder="e.g. fpga scope cal   (Enter)">
+      <pre id="out">Allowed: fpga scope …, btn …, version, status, settings, help</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const COL = { ch1: getComputedStyle(document.documentElement).getPropertyValue('--ch1').trim(),
+              ch2: getComputedStyle(document.documentElement).getPropertyValue('--ch2').trim() };
+let info = null, frame = null, running = true, busy = {};
+
+function fmtV(v) { if (v == null || !isFinite(v)) return '—'; const a = Math.abs(v);
+  return a >= 1 ? v.toFixed(a >= 10 ? 1 : 2) + ' V' : a >= 1e-3 ? (v * 1e3).toFixed(a >= 0.1 ? 0 : 1) + ' mV' : (v * 1e6).toFixed(0) + ' µV'; }
+function fmtT(s) { if (s == null || !isFinite(s)) return '—'; const a = Math.abs(s);
+  return a >= 1 ? s.toFixed(2) + ' s' : a >= 1e-3 ? (s * 1e3).toPrecision(3) + ' ms' : a >= 1e-6 ? (s * 1e6).toPrecision(3) + ' µs' : (s * 1e9).toPrecision(3) + ' ns'; }
+function fmtF(f) { if (f == null || !isFinite(f)) return '—'; return f >= 1e6 ? (f / 1e6).toPrecision(4) + ' MHz' : f >= 1e3 ? (f / 1e3).toPrecision(4) + ' kHz' : f.toPrecision(4) + ' Hz'; }
+function fmtM(v, unit) { return unit === 'V' ? fmtV(v) : (v == null ? '—' : v.toFixed(1) + ' cnt'); }
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  return r.json();
+}
+async function sh(cmd, quiet) {
+  busy.until = Date.now() + 1500;            // don't overwrite controls from stale frames meanwhile
+  const r = await api('/api/cmd', { cmd });
+  if (!quiet || !r.ok) $('out').textContent = '> ' + cmd + '\n' + (r.out || '');
+  return r;
+}
+
+// ---------- controls ----------
+function rangeLabel(ch, idx, probe) {
+  const mv = info.mv_per_count[ch][idx]; const tier = info.range_tier[idx];
+  if (!mv) return `range ${idx} (uncal)`;
+  return (tier === 'provisional' ? '~' : '') + fmtV(mv / 1000 * info.counts_per_div * probe) + '/div';
+}
+function fillRanges(probe1, probe2) {
+  for (const [sel, ch, p] of [[$('r1'), 1, probe1], [$('r2'), 2, probe2]]) {
+    const keep = sel.value; sel.innerHTML = '';
+    for (let i = 9; i >= 0; i--) { const o = document.createElement('option'); o.value = i; o.textContent = rangeLabel(ch, i, p); sel.appendChild(o); }
+    if (keep !== '') sel.value = keep;
+  }
+}
+async function init() {
+  info = await api('/api/info');
+  const tb = $('tb'); tb.innerHTML = '';
+  for (const t of info.timebases) {
+    const o = document.createElement('option'); o.value = t.code;
+    o.textContent = (t.tier === 'provisional' ? '~' : '') + fmtT(t.s_per_div) + '/div  (' + (t.rate >= 1e3 ? (t.rate / 1e3).toFixed(t.rate >= 1e5 ? 0 : 1) + ' kS/s' : t.rate.toFixed(0) + ' S/s') + ')';
+    tb.appendChild(o);
+  }
+  fillRanges(1, 1);
+  running = info.run; setRunBtn();
+}
+$('tb').onchange = e => sh('fpga scope timebase 0x' + (+e.target.value).toString(16).toUpperCase().padStart(2, '0'));
+$('r1').onchange = e => sh('fpga scope vdiv 1 ' + e.target.value);
+$('r2').onchange = e => sh('fpga scope vdiv 2 ' + e.target.value);
+$('tmode').onchange = e => sh('fpga scope trigmode ' + e.target.value);
+$('tedge').onchange = e => sh('fpga scope edge ' + e.target.value);
+$('tlvl').onchange = e => sh('fpga scope level ' + e.target.value);
+$('v1').onchange = $('v2').onchange = $('zoom').onchange = () => draw();
+$('cmd').onkeydown = e => { if (e.key === 'Enter' && e.target.value.trim()) { sh(e.target.value.trim()); e.target.value = ''; } };
+function setRunBtn() { const b = $('runbtn'); b.textContent = running ? 'RUN' : 'STOP'; b.className = 'pill ' + (running ? 'run' : 'stop'); }
+$('runbtn').onclick = async () => { running = !running; setRunBtn(); await api('/api/run', { run: running }); };
+$('csv').onclick = () => { location.href = '/api/frame.csv'; };
+$('png').onclick = () => { const a = document.createElement('a'); a.download = 'scope_' + new Date().toISOString().replace(/[:.]/g, '-') + '.png'; a.href = cv.toDataURL('image/png'); a.click(); };
+
+// ---------- drawing ----------
+const DIVX = 10, DIVY = 8;
+function grid() {
+  const W = cv.width, H = cv.height, dx = W / DIVX, dy = H / DIVY;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(150,160,175,.30)'; ctx.lineWidth = 1; ctx.setLineDash([2, 6]);
+  ctx.beginPath();
+  for (let i = 1; i < DIVX; i++) { ctx.moveTo(i * dx + .5, 0); ctx.lineTo(i * dx + .5, H); }
+  for (let j = 1; j < DIVY; j++) { ctx.moveTo(0, j * dy + .5); ctx.lineTo(W, j * dy + .5); }
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.strokeStyle = 'rgba(170,180,195,.55)'; ctx.beginPath();
+  ctx.moveTo(W / 2 + .5, 0); ctx.lineTo(W / 2 + .5, H); ctx.moveTo(0, H / 2 + .5); ctx.lineTo(W, H / 2 + .5);
+  for (let i = 0; i <= DIVX * 5; i++) { const x = i * dx / 5 + .5; ctx.moveTo(x, H / 2 - 4); ctx.lineTo(x, H / 2 + 4); }
+  for (let j = 0; j <= DIVY * 5; j++) { const y = j * dy / 5 + .5; ctx.moveTo(W / 2 - 4, y); ctx.lineTo(W / 2 + 4, y); }
+  ctx.stroke();
+  ctx.strokeStyle = '#3a414b'; ctx.strokeRect(.5, .5, W - 1, H - 1);
+}
+function trace(bytes, color, spd) {
+  const W = cv.width, H = cv.height, n = bytes.length;
+  const span = spd * DIVX; const center = frame.hdr.ordered ? 512 : n / 2;
+  let s0 = Math.max(0, Math.round(center - span / 2)), s1 = Math.min(n, Math.round(center + span / 2));
+  const xs = W / (s1 - s0 - 1), ys = H / DIVY / info.counts_per_div;
+  ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.lineJoin = 'round'; ctx.beginPath();
+  for (let i = s0; i < s1; i++) { const x = (i - s0) * xs, y = H / 2 - (bytes[i] - 128) * ys; i === s0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+  ctx.stroke();
+}
+function draw() {
+  grid();
+  if (!frame || !info) return;
+  const spd = parseFloat($('zoom').value);
+  if ($('v1').checked && frame.hdr.en1) trace(frame.b1, COL.ch1, spd);
+  if ($('v2').checked && frame.hdr.en2) trace(frame.b2, COL.ch2, spd);
+  // markers: channel zero (left) and trigger point (top)
+  const H = cv.height, W = cv.width;
+  for (const [c, on] of [[COL.ch1, frame.hdr.en1], [COL.ch2, frame.hdr.en2]]) if (on) {
+    ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(0, H / 2 - 7); ctx.lineTo(10, H / 2); ctx.lineTo(0, H / 2 + 7); ctx.fill(); }
+  if (frame.hdr.ordered) { ctx.fillStyle = '#ffb020'; ctx.beginPath(); ctx.moveTo(W / 2 - 7, 0); ctx.lineTo(W / 2 + 7, 0); ctx.lineTo(W / 2, 10); ctx.fill(); }
+  const sdiv = frame.rate ? spd / frame.rate : null;
+  $('ov').textContent = (frame.rate ? (frame.rate / 1e3).toFixed(1) + ' kS/s · ' : '') + (frame.hdr.ordered ? 'triggered' : 'free-run') +
+    ' · gen ' + frame.hdr.gen + (frame.hdr.ready ? '' : ' · DEMO (no real samples yet)');
+  $('sh').textContent = sdiv ? fmtT(sdiv) + '/div' : 'tb 0x' + frame.hdr.tb.toString(16) + ' (uncal)';
+}
+
+// ---------- frames ----------
+function b64(s) { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; }
+const CPL = ['DC', 'AC', 'GND'];
+function updateStatus(f) {
+  const h = f.hdr, p1 = h.prb1 ? 10 : 1, p2 = h.prb2 ? 10 : 1;
+  const vd1 = f.vpc1 ? fmtV(f.vpc1 * info.counts_per_div) + '/div' : 'uncal r' + h.rng1;
+  const vd2 = f.vpc2 ? fmtV(f.vpc2 * info.counts_per_div) + '/div' : 'uncal r' + h.rng2;
+  $('s1').textContent = `${vd1}  ×${p1}  ${CPL[h.cpl1] || ''}`; $('chip1').classList.toggle('off', !h.en1);
+  $('s2').textContent = `${vd2}  ×${p2}  ${CPL[h.cpl2] || ''}`; $('chip2').classList.toggle('off', !h.en2);
+  $('st').textContent = `${['Auto', 'Normal', 'Single'][h.tmode] || ''} ${h.tedge ? '↓' : '↑'} CH${h.tsrc + 1}`;
+  if (!busy.until || Date.now() > busy.until) {
+    fillRanges(p1, p2);
+    $('tb').value = h.tb; $('r1').value = h.rng1; $('r2').value = h.rng2;
+    $('tmode').value = ['auto', 'normal', 'single'][h.tmode] || 'auto'; $('tedge').value = h.tedge ? 'falling' : 'rising';
+  }
+  const m1 = f.meas.ch1 || {}, m2 = f.meas.ch2 || {};
+  const rows = [['Vpp', 'vpp'], ['Vmax', 'vmax'], ['Vmin', 'vmin'], ['Mean', 'vavg'], ['RMS (AC)', 'vrms_ac'], ['Freq', 'freq'], ['Period', 'period'], ['Duty', 'duty']];
+  $('mt').innerHTML = rows.map(([n, k]) => {
+    const fmt = m => k === 'freq' ? fmtF(m[k]) : k === 'period' ? fmtT(m[k]) : k === 'duty' ? (m[k] == null ? '—' : (m[k] * 100).toFixed(1) + ' %') : fmtM(m[k], m.unit);
+    return `<tr><td>${n}</td><td>${h.en1 ? fmt(m1) : '—'}</td><td>${h.en2 ? fmt(m2) : '—'}</td></tr>`;
+  }).join('') + (m1.clipped || m2.clipped ? `<tr><td colspan="3" class="warn">Clipping on ${[m1.clipped && 'CH1', m2.clipped && 'CH2'].filter(Boolean).join(' + ')} — use a larger V/div</td></tr>` : '');
+}
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.onmessage = ev => {
+    const f = JSON.parse(ev.data); f.b1 = b64(f.ch1); f.b2 = b64(f.ch2); frame = f;
+    $('dot').className = 'dot ok'; $('fps').textContent = f.fps.toFixed(1) + ' fps';
+    updateStatus(f); draw();
+  };
+  es.onerror = () => { $('dot').className = 'dot'; $('fps').textContent = 'reconnecting…'; };
+}
+grid(); init().then(connect);
+</script>
+</body>
+</html>

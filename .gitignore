@@ -1,0 +1,28 @@
+# --- secrets (WiFi password lives in these; never commit) ---
+host/pi_bridge/cloudinit/network-config
+samples/pi_logs/
+
+# --- third-party / downloaded / generated (rebuild from HANDOFF.md instructions) ---
+downloads/
+third_party/
+ghidra/*
+!ghidra/*.java
+!ghidra/*.sh
+!ghidra/README*
+.venv/
+__pycache__/
+*.pyc
+esp32_bridge/build/
+esp32_bridge/managed_components/
+esp32_bridge/sdkconfig
+esp32_bridge/sdkconfig.old
+
+# --- FNIRSI's own firmware / extracted segments (not ours to redistribute) ---
+2C53P_Firmware_V1.14/
+rw_init_0x20000000.bin
+# PCB photos from the EEVblog forum (third-party)
+reference/
+
+# --- OS noise ---
+.DS_Store
+._*

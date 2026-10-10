@@ -1,0 +1,15 @@
+[Unit]
+Description=2C53T live viewer (HTTP :8080) + raw shell proxy (:7001)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/scope/scope_server.py --http 8080 --tcp 7001
+WorkingDirectory=/opt/scope
+Restart=always
+RestartSec=2
+User=pi
+Group=dialout
+
+[Install]
+WantedBy=multi-user.target

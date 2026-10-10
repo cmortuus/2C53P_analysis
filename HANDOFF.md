@@ -1,0 +1,228 @@
+# FNIRSI 2C53P — read & control from a computer (handoff)
+
+## LIVE VIEWER ON THE PI + firmware v3 (2026-10-10 evening)
+- **Viewer live:** `http://scope-pi.local:8080` — `host/pi_bridge/scope_server.py` (stdlib+pyserial) runs as `scope-server.service` on the Pi (`/opt/scope`), serving `web/index.html` (both channels via SSE, FNIRSI-style status bar, measurements, timebase/V-div/trigger/RUN-STOP controls, PNG/CSV, allow-listed shell box) and keeping the **raw shell proxy on :7001** (socat `scope-bridge` disabled). API in `host/pi_bridge/README.md`. Allow-list only — `mem write`/`fwload`/flash/reinit are never reachable from the web.
+- **Rate:** 6 fps at first → **12.7 fps** after the server stopped waiting for 30 ms of silence after each record (the record always ends `SCOPEBIN END gen=N\r\n> `). Raw record time on the Pi is ~73 ms = ~10 ms park + ~63 ms USB (the firmware sent 64 B per RTOS tick).
+- **Firmware v3 built, NOT yet flashed:** `firmware_builds/openscope-2c53t-guest-coldtrace-2eae008+scope_dumpbin-v3.bin` (651,452 B, sha256 `8e886d18…1952`), staged on the Pi at `~/openscope-…-v3.bin` with `~/iap_flash.py` (doctor passes there). Changes vs v2 (`patches/openscope-2c53t-scope-dumpbin.patch`, 161 lines, now also touches `fpga.c`): `usb_send_bulk()` hands each 1 KB buffer to the USB core in one transfer (the AT32 ISR chains the packets, `usbd_int.c`), and `fpga_acq_pause()` polls the ack every 1 ms instead of 10 ms. Expected: ~2 KB in a few ms, records limited by the ~25 ms acquisition commit → 20–30 fps. Byte stream on the wire is unchanged (host parsers untouched). Flash from the Pi: see "Flashing firmware from the Pi" in `host/pi_bridge/README.md` (needs the owner: MENU + pinhole reset with USB connected; service stopped first).
+- **Calibration sweep tool:** `host/t_calcheck.py --freq F --vpp V [--ch 2]` sweeps timebases/ranges through the viewer API and prints % error vs the generator; restores settings afterwards. Not yet run with a signal (generator was off). Known: this unit's 0x10 timebase reads ~1.5 % high vs 60 Hz mains.
+- **Git:** repo initialised in this folder; `.gitignore` excludes `host/pi_bridge/cloudinit/network-config` and `samples/pi_logs/` (both contain the WiFi password), `downloads/`, `third_party/`, `ghidra/`, `.venv/`, FNIRSI's firmware and the EEVblog photos. The firmware patch and `firmware_builds/` are GPL-3 (derived from OpenScope-2C53T); our own code is separate.
+- **Still to do:** flash v3 + re-measure fps; run `t_calcheck.py` with the 2C53P generator (sine 1 kHz 0.33 Vpp was the earlier test signal); mounting (Pi + 2-port power brick, see README); **UI reskin** of OpenScope's on-device UI to resemble the stock FNIRSI look (the owner prefers the stock design — future work in `firmware/src/ui/`, keep as a separate patch).
+
+## REMOTE LINK WORKING (2026-10-10)
+2C53T (OpenScope + `scope dumpbin` v2) → USB → **Pi Zero 2 W `scope-pi.local` (10.10.12.222, WiFi)** → `socat` bridge :7001 → Mac. `host/t_scope.py --tcp scope-pi.local:7001 [--plot|--csv|--set "<shell cmd>"]`: 10/10 CRC-clean, ~7 records/s. Control works through the same link (e.g. `fpga scope timebase 0x0E`). Verified with the 2C53P generator into CH2 (needs the generator's black lead tied to the probe ground; without it you see clipped 60 Hz mains). Pi WiFi fix (WPA2-only wpa_supplicant, NM unmanages wlan0) documented in `host/pi_bridge/README.md`.
+
+## 2C53T bring-up DONE (2026-10-10)
+- Unit arrived; stock booted once. **Calibration page backed up**: CRC32 `1ADD539B`, 513 non-FF bytes, unit-specific (157/256 cal bytes differ from OpenScope's reference unit) → `cal_backup_2c53t/` (photos + `cal_page_0x08006000_2026-10-10.bin`, sha256 `4536f493…a3a8`, read-only; copy in `~/Documents`).
+- Flashed via IAP: `firmware_builds/openscope-2c53t-guest-coldtrace-2eae008+scope_dumpbin-v2.bin` (sha `6d959121…`). The v1 image tore every record (acq task commits every ~25 ms, faster than a 2 KB CDC send); v2 parks the acq task (`fpga_acq_pause/resume`) around CRC+send → 10/10 clean, ~3.3 records/s (rate limited by park latency; tune later).
+- USB CDC shell enumerates reliably on this unit: `/dev/cu.usbmodem<serial>1` ("AT32 Virtual Com Port").
+- Gotcha: a running stock unit mounts its user storage (`NO NAME`, 14.7 MB); `iap_flash.py status` wrongly calls it upgrade mode. Real upgrade drive = volume `IAP`, media "Msc iap", `Ready.TXT`. Upgrade mode needs USB connected first; on this unit a *tap* of Power shuts down; to leave the caldump loop use MENU + pinhole reset.
+
+## Arrival-day pointers (2026-10-10)
+- **Step-by-step: `T_ARRIVAL_RUNBOOK.md`** (backup → flash → first contact → Pi → recovery).
+- `host/t_calbackup.py` — pulls the 4 KB calibration page over the shell (`mem read`, 16×64 words), writes `cal_page_0x08006000_<date>.bin`, verifies CRC32 against the caldump screen.
+- IAP tool (`third_party/OpenScope-2C53T/scripts/iap_flash.py`) passes `doctor` on this Mac (mtools present). Always pass the image path explicitly; its picker also lists `archive/factory_iap_bootloader_2C53T.bin`, which must never be flashed as an app.
+- Stock 2C53T firmware for recovery: `downloads/2c53t_stock/` — V1.2.0 (`APP_2C53T_V1.2.0_251015.bin`, 751,232 B, sha256 `a17c5c35c97bb898f15672a1747bc1041d8ed507c16999ddba0d1e4e2ec0c760` = OpenScope's verified hash) and V1.1.2 (`APP_2C53T_V1.1.2_250929.bin`, sha256 `5e240cee…614b`), from `cdn.shopify.com/s/files/1/0694/8310/2426/files/2C53T_Firmware_V1.2.0.zip` (fetched 2026-10-10 via the WiFi interface — the wired LAN firewalls Shopify's CDN).
+- Pi bridge: `scope-pi` 10.1.13.114 (wired), `scope-bridge` active. Pi's single USB port means hub (Ethernet + scope) or WiFi (router currently rejects the Pi, assoc status 16; Pi WiFi MAC <Pi WiFi MAC>).
+
+## Status change (2026-10-08 evening)
+The owner **ordered a FNIRSI 2C53T** (Amazon B0D6VX6BFL) to become the project device for the live PC link, because its platform (AT32F403A with unerasable ROM DFU, USB IAP flashing without opening the case, community-documented FPGA protocol, OpenScope-2C53T open firmware with a USB CDC shell) is far lower-risk than patching the 2C53P's Synwit MCU. The 2C53P stays as the daily scope; its `.bin` decoder (Phase 1) is done and its UART0 tools exist in `host/`. Next: prepare the 2C53T toolchain/build and design the streaming + control extension on OpenScope (or a minimal patch to stock) before the unit arrives.
+
+## 2C53T platform notes (from OpenScope-2C53T docs, pre-arrival)
+- **MCU AT32F403A** (Cortex-M4F, 240 MHz, 1 MB flash, 224 KB SRAM). FPGA **Gowin GW1N-UV2**: samples via **SPI3** (PB3/4/5, CS PB6, 60 MHz mode 3; CS → cmd byte → status byte → clock 0xFF for data; interleaved CH1,CH2 8-bit unsigned; mode 2 "normal" = 1024 B = 512 pairs, mode 3 "dual" = 2048 B, mode 1 roll = 300-sample ring, modes 4–8 ext/meter ADC/siggen/cal readback/self-test; −28 LSB offset applied in firmware), control via **USART2** (PA2/PA3, 9600 8N1, 10-byte frames `00 00 cmdH cmdL + 5 params + cksum`, replies `5A A5` 12 B data / `AA 55` 10 B echo; scope uses cmds 0x00, 0x01, 0x0B–0x11; 7 config writers: CH1, CH2, trigger, timebase, meter range, siggen freq, siggen waveform). W25Q128JV on SPI2; ST7789V LCD on EXMC; **USB full-speed on PA11/PA12 (stock: DFU/IAP only)**; DAC = signal generator. FreeRTOS: tasks key/osc/fpga/dvom_TX/dvom_RX/display; TMR3 ISR paces acquisition (ping-pong SPI3 queue).
+- **Flash layout**: stock IAP bootloader at 0x08000000; **calibration page 0x08006000–0x08006FFF (4 KB, per unit, unrecoverable)**; guest/app images at 0x08007000. ROM DFU (`2e3c:df11`, BOOT0 jumper + pinhole reset, case open) is mask ROM → recovery nearly always possible.
+- **Flashing without opening**: hold MENU + tap Power → FAT12 `IAP` drive → `python3 scripts/iap_flash.py flash <bin>` (needs `mtools`; **never drag-drop from macOS Finder**). `make guest-coldtrace` is the only OpenScope target that configures the FPGA and captures.
+- **Calibration backup procedure**: flash the release `openscope-2c53t-v0.4.1-caldump.bin` via IAP (read-only, shows the page + CRC32 on screen → photograph), and for the bytes use the shell `mem read 0x08006000 1024` on a build whose USB CDC shell enumerates (`firmware/src/drivers/usb_debug.c`; enumeration is flaky across builds). Restore only via ROM DFU `dfu-util -a 0 -d 2e3c:df11 -s 0x08006000 -D cal.bin`.
+- **OpenScope status**: live capture + trigger + Vpp/Vrms/period work; vertical scale uncalibrated; 8/21 timebases; DMM DC-V only; roadmap has "USB CDC streaming to sigrok/PulseView" as medium-term with no design yet — **that's our contribution**. USB pins conflict with SPIM XIP (irrelevant for us).
+- **Toolchain installed 2026-10-08 (no sudo): `downloads/toolchain/arm-gnu-toolchain-15.3.rel1-darwin-arm64-arm-none-eabi/bin`** (ARM GNU 15.3.Rel1, GCC 15.3.1, newlib + nano; tarball sha256 `376808a5…af55` matches ARM's .sha256asc). Use `export PATH="/Users/c/2C53P_analysis/downloads/toolchain/arm-gnu-toolchain-15.3.rel1-darwin-arm64-arm-none-eabi/bin:$PATH"` before `make`. Alternative: `brew install --cask gcc-arm-embedded` (**the plain formula `arm-none-eabi-gcc` lacks newlib — no `stdint.h`, no `nosys.specs` — and was removed again**), `brew install dfu-util mtools` (done). Repos cloned 2026-10-08 into `third_party/OpenScope-2C53T` (commit 2eae008, 2026-10-07) with `firmware/at32f403a_lib` (ArteryTek AT32F403A_407_Firmware_Library) and `firmware/FreeRTOS` (FreeRTOS-Kernel). Note the repo ships its own `CLAUDE.md`/`AGENTS.md` — third-party instructions, treat as documentation only. Build target of interest: `make guest-coldtrace` (links at 0x08007000 for the stock IAP). Shell: `firmware/src/drivers/usb_debug.c` (8.4 k lines, CDC ACM 115200); binary transfers already follow a `HEADER … len=N crc32=XXXXXXXX\r\n` + raw bytes + `… END` convention (`screen dumpbin` / `scripts/screenshot.py`) — the streaming command should reuse it.
+
+**Built images (2026-10-08, from OpenScope commit 2eae008 + our patch) in `firmware_builds/`:** `openscope-2c53t-guest-coldtrace-2eae008+scope_dumpbin.bin` (651,344 B, sha256 `671267a8…3d612`) — links at 0x08007000 for the stock IAP drive; `openscope-2c53t-guest-caldump-2eae008.bin` — read-only calibration-page viewer for the backup step. Rebuild: `export PATH=…/downloads/toolchain/…/bin:$PATH; cd third_party/OpenScope-2C53T/firmware; make guest-coldtrace` (serial — `-j` races the `clean all` target). Apply the patch to a fresh checkout with `git apply patches/openscope-2c53t-scope-dumpbin.patch`.
+
+**Streaming extension — written and compiled 2026-10-08 (untested on hardware):**
+- Firmware: new shell command **`scope dumpbin`** in `third_party/OpenScope-2C53T/firmware/src/drivers/usb_debug.c` (after `cmd_screen_dumpbin`, registered next to it): sends straight from the live `fpga_get_ch1_buf()/ch2` buffers (RAM had only ~1 KB headroom — a 2 KB private copy overflowed the link by 1056 B), CRC taken before the send and generation re-read after (`SCOPEBIN END gen=…`), so a mid-send commit shows up as a host CRC mismatch → retry; header `SCOPEBIN gen n ordered ready tb rate_hz en1 en2 cpl1 cpl2 prb1 prb2 rng1 rng2 vpc1_nv vpc2_nv pos1 pos2 tmode tedge tsrc tlvl len crc32` (integer units only — newlib-nano printf has no float support), then 2×1024 raw bytes, then `SCOPEBIN END`. Uses only existing APIs (`scope_state_get`, `scope_cal_volts_per_count(ch 1|2, range)`, `scope_timebase_seconds_per_sample`, `fpga_acq_record_time_ordered`, `fpga_data_ready`, `crc32_update`, `usb_send_bytes`). One-shot by design: the host polls (~20–30 fps over CDC), so nothing blocks the shell and control stays on the existing `fpga scope timebase/vdiv/level/trigmode/edge/range` commands.
+- Host: `host/t_scope.py` — polls, CRC-checks, converts to volts/seconds from the header, live plot / CSV / TCP JSON broadcast (`--serve`, for the Pi), `--set` passthrough for shell commands.
+- Caveats to verify on hardware: the CDC shell's flaky enumeration (USB clocked from HICK); `ready=0` means the demo trace, not data; `vpc=0`/`sps=0` on uncalibrated ranges/timebases (plot counts then).
+
+**ESP32-S3 bridge (ordered 2026-10-08: AITRIP ESP32-S3-DevKitC-1 N16R8, Amazon B0CGYXJB6Y).** Project `esp32_bridge/` = transparent USB-CDC-host ↔ WiFi TCP bridge (ESP-IDF `usb_host` + `espressif/usb_host_cdc_acm`, port 7001, up to 4 clients, DTR asserted; README has wiring incl. the `USB-OTG` VBUS solder pad). `host/t_scope.py --tcp <ip>:7001` replaces `--port`. ESP-IDF v5.4.2 cloned to `downloads/esp/esp-idf`, tools in `downloads/esp/tools` (`export IDF_TOOLS_PATH=…/downloads/esp/tools; . …/esp-idf/export.sh`). **Built clean on first try 2026-10-09** (`build/scope_bridge.bin`, 818 KB, 47% of the app partition free) — WiFi SSID/password are compile-time (`idf.py menuconfig` → "Scope bridge", or set `CONFIG_BRIDGE_WIFI_SSID/PASSWORD` in `sdkconfig`) so rebuild before flashing: `idf.py -p /dev/cu.usbmodem* flash monitor` on the board's UART port. Untested on hardware (board on order).
+
+**Bridge hardware — FINAL (2026-10-09): the owner found a spare Pi Zero 2 W.** That is the deployment bridge: USB host for the scope + `socat` CDC→TCP on port 7001 as a systemd service (`host/pi_bridge/`: README, `install.sh`, `scope-bridge.sh`). `t_scope.py --tcp scope-pi.local:7001` is the client. The ESP32-S3 bridge (`esp32_bridge/`, built) is now an optional smaller alternative; the Pi 5 is just for bench use.
+
+**Bridge hardware (earlier reasoning, 2026-10-08):** bring-up over USB using one of the owner's spare **Pi 5s** (or an Atomic Pi) as the USB host — the scope is a CDC device, so any Linux box runs `host/t_scope.py` unchanged. Long-term: a **small cheap USB-host board** strapped to the scope — preferred **ESP32-S3** (native USB-OTG host + ESP-IDF `cdc_acm_host` + WiFi, ~$6–10; supplies VBUS to the scope; matches OpenScope's planned ESP32 co-processor), or a Pi Zero 2 W at MSRP (~$15 from PiShop/Adafruit — the ~$120 local price is scalping). Pico W only as a TinyUSB-host tinker option. Budget cap: whole project well under $200. The UART-shell transport below is now a **fallback** (e.g. if CDC enumeration proves unfixable), not the plan.
+- Finding: the 2C53T's `RX/TX/GND` debug pads are **not a free UART** — the RX pad is USART2 RX (PA3, the FPGA link) tapped out; the TX pad's MCU pin is unmapped (candidate: PA9 = USART1 TX, unused by stock, "probed dead"). Free-pin inventory: PA0, PA1, PA9, PC1–PC4, PC13–15, PD2, PD3, PD6 unknown/unused. If a UART transport is ever needed: USART1 on PA9 in single-wire half-duplex (`usart_single_line_halfduplex_select`), mirroring the RTT transport glue in `usb_debug.c` (`usb_send_bytes` → also write to UART; task loop → feed `shell_feed()` from a UART RX ring). OpenScope's `esp_comm.c` is a separate half-duplex packet protocol (0xAA-framed) with the UART write function injected — pins never chosen.
+- Original plan text: that needs (1) mapping the 2C53T's `RX/TX/GND` debug pads to MCU USART pins, (2) adding a UART transport to OpenScope's shell (it already has CDC + RTT transports in `usb_debug.c`), then a MicroPython UART↔WiFi bridge on the Pico (≈40 KB/s needed at 20 fps → 921600 baud is enough). Side benefit: avoids the flaky CDC enumeration.
+
+## Goal
+The owner owns a **FNIRSI 2C53P** (4.3" touchscreen 3-in-1: 2-ch 50 MHz / 250 MSa/s scope + 19,999-count DMM + DDS signal generator, ~$116 on Amazon, ASIN B0D3L78C6K).
+He wants to **read its signals (live waveform data) and control it (timebase, V/div, trigger, mode, generator) from a computer.**
+
+## Bottom line so far
+- **Stock firmware cannot do this.** USB is a mass-storage device (a flash drive) only, with no serial, HID or vendor interface (proof below).
+- Two paths:
+  1. **Offline, no modification (do first):** the scope saves waveforms as `.bin` files. Mount the drive with "USB Sharing", then decode `.bin` → CSV/plot on the Mac.
+  2. **Live (the real ask):** patch or replace the app firmware to add a USB CDC-ACM (virtual serial) interface that streams the sample buffer and accepts commands. Big job and risk of bricking. Details below.
+- Do not use the 2C53T open firmware (github.com/DavidClawson/OpenScope-2C53T): different hardware (AT32F403A + Gowin). Its README explicitly says not to flash a 2C53P. It is still useful as a reference for project structure and approach.
+
+## Files in this folder
+| Path | What |
+|---|---|
+| `../2C53P_Firmware_V1.14.zip` | Official FNIRSI package, downloaded from fnirsi.com → Downloads → Manuals & Firmwares → 2C53P (cdn.shopify.com). sha256 `0495117e…fd88d` |
+| `2C53P_Firmware_V1.14/2C53P_APP_V1.14_250925.bin` | MCU application image, 308,416 B, sha256 `0391c8a2…8f72` |
+| `2C53P_Firmware_V1.14/2C53P_FPGA_V2.2_240625.bin` | FPGA bitstream, 768,541 B, sha256 `b929b728…6dcf` |
+| `2C53P_Firmware_V1.14/2C53P Update Log.txt` | Changelog (V1.8 → V1.14, all FPGA V2.2) |
+| `rw_init_0x20000000.bin` | Decompressed RW init data (640 B, loads at 0x20000000); holds the USB descriptors |
+| `tools/fw_inspect.py` | Re-derives everything below: vector table, scatter-load table, RW decompression, USB descriptor parse |
+
+Older firmware is also on FNIRSI's page: V1.10 and V1.8_NEW, same CDN folder `https://cdn.shopify.com/s/files/1/0694/8310/2426/files/2C53P_Firmware_V1.10.zip` / `..._V1.8_NEW.zip`. Diffing versions helps locate functions. The cloud sandbox proxy blocks cdn.shopify.com. Fetch these through the browser if needed.
+
+## Verified findings (from static analysis of APP V1.14)
+**Image layout**
+- Not encrypted or compressed (entropy ~6.6, a normal Thumb code image).
+- **Load base = 0x0000E000.** Vector table at file offset 0: SP=0x2000B2C0, Reset=0x0000E1BD. Flash starts at 0x0, so the 0x0000–0xDFFF region (56 KB) is a separate **bootloader** that app updates don't overwrite.
+- File offset → address: `addr = off + 0xE000`.
+- ARM-linker (Keil/armcc-style) scatter-load table at file+0x4B388:
+  - `src 0x593C0 → dst 0x20000000, size 0x280, fn 0xED78` (compressed RW data, `__decompress`)
+  - `src 0x594C0 → dst 0x20000280, size 0xB040, fn 0x43074` (zero-init)
+- The RW compression is ARM's RLE+LZ `__decompress`. The algorithm is implemented in `tools/fw_inspect.py::dec()`.
+
+**MCU**
+- The USB stack strings say **Synwit** (华芯微特): "Synwit USB Mass Storage 1.00", manufacturer "Synwit ", serial "A00008040115". The 0x0416 VID is the Synwit/Nuvoton-style SDK default.
+- Exact part is **not confirmed**. Likely the SWM34x family (SWM341: Cortex-M33 with a built-in TFT-LCD controller, flash at 0x0), which fits a 64-pin MCU driving the 480×272 display directly. Confirm by opening the case and reading the chip markings. The peripheral-base literal usage (0x4000_0000–0x400F_FFFF) can be matched against the SWM341 reference manual.
+- FPGA: per the EEVblog teardown thread, an **Anlogic** FPGA plus an **MTX2088** ADC (single ADC, so 250 MSa/s on 1 channel, ~125 MSa/s per channel with 2 channels).
+
+**USB (decoded from RW init data)**
+- Device: bcdUSB 2.00, class 0, **VID 0x0416 PID 0x5020**, EP0 64 B.
+- Config: 1 interface — **class 0x08 Mass Storage, subclass 0x06 SCSI, protocol 0x50 Bulk-Only**. EP 0x81 bulk IN 64 B, EP 0x01 bulk OUT 64 B. Nothing else.
+- Full-speed (64 B bulk) → ~1 MB/s ceiling for any future streaming.
+
+**Filesystem paths (FatFs, drive `P:`)** — file offsets:
+- `0x4A9B0` / `0x23C64` `P:/Screenshot simple file/%d.bin` ← **saved waveform data (target for path 1)**
+- `0x4AB39` `P:/Screenshot file/%d.bmp` (screenshots)
+- `0x4A99C` `P:/Upgrade/FPGA.bin`, `0x2520` `P:/Upgrade` (update drop folder)
+- `0x4A96F` `P2:/System file/%d.bmp`, `0x2F26C` `P:/System file/0.jpg` (UI assets on external flash)
+- Version format `V%s.%d.%d` at 0x4AB2F next to `"1.14"`, `"2C53P"`.
+- `UART0` / `UART2` strings at 0x2FF4C/0x2FF54. Worth finding out what is on those UARTs: a debug console or the DMM/FPGA link would be a cheap hardware tap.
+- Multilingual "USB Sharing" UI strings around 0x49174 (the mass-storage toggle lives in the app, not only in the bootloader).
+
+**Update mechanism (from FNIRSI's download page plus strings)**
+- The update copies files into the `Upgrade` folder over USB mass storage. FNIRSI warns: **Windows 10/11 only, "Do NOT use a Mac to update the firmware, as this may brick the device"** (probably macOS writing `._*` / `.DS_Store` resource files). If flashing from a Mac, at least disable those writes (`mdutil -i off`, `dot_clean`, or copy with `cp -X`), or use a Windows VM.
+
+## Phase 2 progress (2026-10-08, static RE of V1.14 — addresses are *runtime* addrs, file off = addr − 0xE000)
+**Tooling in this folder**
+- `.venv/` (uv, Python 3.12, capstone). `tools/xref.py <bin> <addr>…` finds ADR/LDR-literal/MOVW+MOVT refs to an address.
+- `tools/ghidra/import.sh` → headless import into `ghidra/2C53P.gpr` (Ghidra 12.1.4 via Homebrew, `ghidraRun` to open). `Setup2C53P.java` (pre-script) adds RAM/periph/SDRAM blocks, loads `rw_init_0x20000000.bin`, forces Thumb, makes vector handlers (106 entries) functions. `Labels2C53P.java` (post-script) applies the names/comments below — **add new findings there**, then `import.sh -process` re-applies them without re-importing; `import.sh -check` prints key symbols + code coverage; `import.sh -seed` seeds functions from `push {…,lr}` prologues in undefined flash and re-analyzes (current state: 510 functions, 210 KB code / 87 KB undefined, mostly literal pools and tables). Java 21 is wired in via `JAVA_HOME` in the script (Ghidra can't prompt for a JDK headless).
+- `tools/bin2csv.py` — preliminary decoder for the inferred format below. **Unverified until a sample file exists.**
+
+**Waveform save routine — found**
+- `save_simple_wave_bin` @ **0x3F6C8**: `sprintf(path, "P:/Screenshot simple file/%d.bin", *(u8*)0x20000223)`; `f_open(mode 0x0A)`; `f_write(0x200019A9, 926)`; then one more `f_write` of 1 byte = `*(u8*)0x2000013B` (channel mask), overridden to 4 when `*(u8*)0x2000013A == 1`; `f_close`. → **file is 927 bytes.**
+- `load_simple_wave_bin(n)` @ 0x3C510 is the inverse (reads 926 B, seeks to end−1, reads the mask byte).
+- `g_simple_wave` @ 0x200019A9 (926 B). Draw code (0x2F208) and measurement code (0x276A6) index it as `[i]` and `[i+0x1CF]` for i in 0..460 and plot `y = 240 − v` into a 461-px-wide RGB565 area at 0x80700000, so: **CH1 = 461 × u8 at +0, 2 unknown bytes at +461/462; CH2 = 461 × u8 at +463, 2 unknown bytes at +924/925.** Values are screen pixels (0..240), not raw ADC. **No timebase / V/div / probe fields are stored** — units must come from the user's notes, which is why the sample notes matter.
+- BMP screenshot writer is the next function, 0x3F764 (480×272, 16 bpp, framebuffer pointer at `*(u32*)0x2000006C`).
+- FatFs: `f_open`=0x37084, `f_read`=0x37470, `f_write`=0x37D08, `f_lseek`=0x36118, `f_close`=0x35F58; `sprintf`=0x418A4; `malloc`-like=0x439F8.
+- Settings struct `g_settings` @ 0x20000128: `+4` CH1 pos (px), `+5` CH2 pos, `+0x12` ?, `+0x13` ch mask (b0 CH1, b1 CH2), `+0xFB` save-file index. Reference-wave buffer `g_ref_wave` @ 0x20001D48 (magic 0xAA/0x55).
+
+**Hardware (from EEVblog thread, UniSoft's teardown — see refs)**
+- MCU **Synwit SWM34SRET6** (SWM341 family; Arm China STAR-MC1 ≈ Cortex-M33, 150 MHz; 512 KB flash @0x0, 64 KB SRAM @0x20000000, 8 MB stacked SDRAM @0x80000000). Datasheet (CN, 917 pp): https://img.xiaoman.net.cn/wp-content/uploads/2024/04/20240407170841652.pdf ; SDK https://github.com/Synwit-Co-Ltd/SWM341_Lib (has USB CDC + MSC device examples — directly reusable for Phase 3A).
+- FPGA Anlogic **EG4S20BG256** (B vs non-B variant disputed), ADC **MTX2088** (AD9288 clone, dual 8-bit 100 MS/s), SPI NOR **W25Q128JV** (FAT image with UI assets = drive `P2:`). PCB has labeled **SWD/JTAG pads for MCU and FPGA** (pinout not documented).
+- SWM341 memory map: SYSCON 0x40000000, DMA 0x40000800, LCDC 0x40002000, USB 0x40005000, GPIOA/B/C/D 0x40040000/0800/1000/1800, UART0–3 0x40042000/2800/3000/3800, SPI0/1 0x40044000/4800, PWM 0x40046000, TIMER 0x40046800, BTIMER 0x40048800, FLASHC 0x4004A000, SFC 0x4004A800, PORT(pinmux) 0x400A0000, ANALOGC 0x400AA000, SDRAMC 0x88000000. ROM IAP: FLASH_Erase 0x11000471, FLASH_Write 0x110004C1.
+- **Read-protection** is selected by the u32 at vector-table offset 0x1C: 0 = none, 0x43211234 = SWD read-protect, 0xABCD1234 = fully locked (only ISP mass-erase). The APP image's word 0x1C is reported by `fw_inspect`/below; the *bootloader's* word 0x1C (flash 0x0) is what matters and needs a dump or SWD probe.
+- **ISP recovery**: pin A8 high >5 ms at power-up → ROM serial ISP on B12 (RX) / B14 (TX) = the SWD pins, 115200 baud, SYNWIT-PRG tool. This is the brick-recovery path for Phase 3 (needs the ISP pad to be reachable).
+
+**FPGA → MCU data path — found**
+- `fpga_dma_init` @ 0x35DB0: configures DMA ch0 `{mode 0x200, count 0x207 (=519 words), src GPIOD+0x30 (0x40041830), dst g_fpga_frame 0x20001D48, ctrl 0x01004401}` via `FUN_0000EEAC` (DMA config), sets GPIOC[5] (output, control line), PWM 0x40046900 (a clock/trigger for the transfer), pinmux 0x400A0020, and GPIOD[0..7] as inputs. → **the FPGA delivers capture frames over an 8-bit parallel bus on GPIOD, DMA'd as 519 × u32 (2076 B) per frame.**
+- Frame layout (0x20001D48): u32 magic ×2 (`0xAA,0xAA` = CH1 frame, `0xA5,0x5A`-style markers = CH2 frame), 461 × u32 samples @+8 (low byte = 8-bit ADC code), ~48 words of metadata @+0x744 (frequency/measurement counters assembled byte-wise into 0x20000188…; valid-range `start`/`len` at +0x804/+0x80C), u32 magic ×2 (`0x55,0x55`) @+0x814. `wave_draw_main` (0x2F170) converts: `px = (code & 0xFF) − 8`, clamped 0..240, into `g_simple_wave` (CH1) / `g_wave_ch2` (0x20001B78).
+- So the on-screen trace **is** the ADC data at screen decimation (461 pts, 8-bit); the `.bin` file is essentially ADC codes − 8. Vertical scale = AFE gain (V/div), so volts = (px − center_px) × (V/div ÷ px_per_div) — constants to be fit from samples.
+
+- DMA details (SWM341_dma.h): source = GPIOD **IDR** (+0x30), Mode SINGLE, Unit WORD, Handshake 0x44 = `DMA_EXHS_TIMR4` (Timer 4 external trigger — the FPGA's byte strobe goes into TIMR4; PORTC pin 4 is set to func 5 for it), IRQ on. 0x40046900 = **TIMR4** (TIMER block 0x40046800, 0x40 per timer); `fpga_dma_init` does `TIMR_Init(TIMR4, mode 8 = external-count on PORTC.4/TIMR4_IN, period from *(u16*)0x20000064)`, `TIMR_Start(TIMR4)`. `DMA_IRQHandler` (0xEFA8): clear int → `TIMR_Stop(TIMR4)` → `GPIO_SetBit(GPIOC, 5)`. So per frame: the FPGA strobes PORTC.4, each edge counts in TIMR4 and triggers one DMA word read of GPIOD[7:0]; after 519 words the IRQ stops TIMR4 and raises C5 (ack/"busy"). Who clears C5 / restarts TIMR4+DMA for the next frame is still to be found (no literal GPIOC ODR writes; probably via the FPGA command path).
+- IRQ map (SWM341.h IRQn): 0 UART0 → 0x2E0A0, 4 DMA → 0xEFA8, 8 UART2 → 0x2E19C, 36 GPIOB → 0x11398, 37 GPIOC → 0x1142C (pin C8 = GT911 touch INT, I2C reg 0x814E), 73 LCD → 0x2162C, 77 USB → 0x2F070.
+
+(Correction: PORTC.4 func 5 = **TIMR4_OUT** — the MCU generates the read clock on PC4 from TIMR4; each timer event also fires the DMA read of GPIOD. So the FPGA just presents the next byte per clock.)
+
+**Firmware runs FreeRTOS** (`xQueueGenericSend` 0x40C10, `xQueueReceive` 0x40F0C). Inter-task command queues: `g_fpga_cmd_queue`/`g_dmm_cmd_queue` 0x20000288 (u16 items → 10-byte UART2 frames), `g_uart0_cmd_queue` 0x20000284 (u16 items → UART0 replies/notifications).
+
+**UART2 (0x40043000) = FPGA control link (the FPGA also fronts the DMM, as on the 2C53T)** — after the pin-mux audit no other serial path exists (SPI0 = NOR flash, SPI1 unused, all other PORTA/B/C alt-funcs are LCD/SDRAM): `UART2_IRQHandler` receives `5A A5` 12-byte frames (BCD meter digits + range/mode flags, parsed by `dmm_parse_frame` 0xF428) and `AA 55` 10-byte echo frames into 0x200002D2; the DMM task (0xF858) queues u16 items like 0x0501/0x0503/0x0508/0x0509/0x0514 and 0x0500+range which 0xF6A2 packs into a 10-byte frame at 0x20000119 (`[2]=cmdH [3]=cmdL [9]=cmdL+cmdH`) and sends via `uart2_send` (0x2E2A4). Same protocol family as OpenScope-2C53T's `FPGA_PROTOCOL_COMPLETE.md` (there also 9600 8N1, "meter" frames). Baud not yet confirmed.
+
+**UART0 (0x40042000, 921600 per the LEP-patch author — no literal baud constant in the image; the only 921600 word, at 0x4EDC6, is inside a bitmap table) = factory test / PC protocol, bidirectional, in stock firmware.** `uart0_cmd_responder` (0x23178) runs on `g_uart0_cmd_queue` items: **GET** 1..0x13 → `g_settings` bytes (+0,+1,+2,+3, ch1/ch2 pos, +6,+7,+0xA,+0xB,+0xC, ch mask, +0x14,+0x15,+0x16,+0x19), 0x1A boot id, 0x1C..0x21 misc, 0x28..0x3B → bytes at 0x20000190+cmd (measurement results), 0x54/0x55 → u16 @0x20000136/0x20000138; **SET** 3,4 (→+2,+3), 5,6 (ch pos), 0xF, 0x10 (full re-apply), 0x12, 0x13, 0x21, 0x28..0x3B (cal reset) then `settings_apply` (0x16000). Reply frame = `[cmd][data…][cksum][0x0A]` (built at 0x200002F2, header byte 0x55 for setting replies, 0xAA family for others); the UI also pushes `0x55xx`/`0xAAxx` notifications on every settings change. Requests arrive via `uart0_frame_read` (0x2E2CC) from the 10-byte ISR buffer; the `'d'` boot-ID packet is parsed in `uart0_rx_task` (0x23120). **Handshake semantics (decoded in full):** the link is device-driven. The responder task (loop at 0x3FD14, `vTaskDelayUntil` 10 ticks) blocks on the queue; for each u16 item `{hdr,cmd}` it sends `hdr cmd data[n] cksum 0A` (cksum = hdr+cmd+Σdata) and waits. If `hdr==0x55` it requires the host to **echo the frame verbatim** (ACK), else resends after 100 polls (~1 s) — with nothing attached the first boot notification repeats forever. If `hdr==0xAA` (a *query*: 0xAA21 at boot, 0xAA03/04/05/06/10/12/13/55/0F from UI/DMM code) the host answer `X cmd value… cksum 0A` (cksum = Σ bytes before it) is parsed and **applied as a SET** (cases 3,4,5,6,0xF,0x10,0x12,0x13,0x21,0x28–0x3B,0x3C,0x55). So host→scope control exists only as answers to queries; unsolicited host frames are ignored (or trigger a resend). ⇒ Stock firmware gives a **live settings monitor + answer-based control**, no waveform data. Host tools: `host/` (`fnirsi_uart0.py` protocol+monitor, `pi_server.py` Pi bridge, `client.py`, README with wiring).
+
+**UART0 (0x40042000, 921600 8N1)** is a live factory/jig channel: `UART0_IRQHandler` buffers up to 10 RX bytes at 0x200002C8; per github.com/efim-sys/2C53P_LEP_patch the boot flow (`boot_config_check` 0x1AF38) requires config at **flash 0xD000** (marker 0xEB at 0xD028) and otherwise shows "Load encryption program!" and waits in `uart0_poll_boot_packet` (0x15120) for `64 hi lo cksum 0A` (sets boot ID, writes config, reboots); command `0x1A` reads the boot ID back. ⇒ **Config/calibration lives at 0xD000–0xDFFF, inside the 56 KB "bootloader" region; back it up before any flashing.** UART0 pins unknown (SWM341 default UART0 = B12 RX / B14 TX = the SWD pads).
+
+**Pin-mux (from `PORT_Init` calls; func codes per SWM341_port.h; PORT bases A=0x400A0000, B=+0x10, C=+0x20, D=+0x30, E=+0x40, M=+0x80, N=+0x90)**
+- Board init 0x3F564 = **LCD RGB bus**: A2/A9/A10/A11 = LCD_B4..B7, B15 = LCD_B3, A14/A15 = LCD_G2/G3, C0–C3 = LCD_G4..G7, C9–C13 = LCD_R3..R7, B2 VSYNC, B3 HSYNC, B4 DEN, B5 DCLK. Board init 0x3F908 = **SDRAM**: B6 LDQM, B7 WE, B8 CAS, B9 RAS, B10 CS, M12 UDQM, M13 CLK, M14 CKE, M15 A12, N2 A11, N3 A9, N6–N15 / E0–E15 / C14–C15 = SDRAM address/data. (So E/N/C14/15 are SDRAM, not LCD.)
+- SPI1 (B2–B5 / C4–C7 / N0,N1,N4,N5 options) is never muxed → unused.
+- FPGA bus: GPIOD[0..7] inputs (data), PORTC.4 = TIMR4_OUT (read clock), GPIOC.5 output (ack/busy).
+- SPI0 init 0x111DC: PORTM.2 f1, M4 f1(in), M5 f2 + GPIOM.3 output (CS) → **SPI0 on PORTM, chip-select M3** — not the W25Q128 (that is on the SFC, memory-mapped at 0x7Fxxxxxx). Strong candidate for FPGA configuration (Anlogic SPI slave config) and FPGA register writes.
+- B12 is an EXTI input (GPIOB IRQ36 checks pin 12) and B14 a GPIO output set by the main task; PORTB.14 is forced to func 0 at 0x15224 → **UART0 is not on the SWD pins B12/B14.** UART0 pin-mux not yet located (candidates per port.h: A12/A13 f1, C12/C13 f1/f2 — but C12/C13 are f3/f6 here — or M0/M1 f1).
+
+**Manual (V1.1, cdn.shopify.com/…/2C53P-_Manual.pdf; English on PDF pp.22–37)**: pressing **Save** in the scope menu writes `Screenshot file/N.bmp` *and* `Screenshot simple file/N.bin` (same N); Settings → **USB sharing** mounts the drive; firmware goes in `Upgrade file`; generator output is the top-edge "Function Signal Generator Output Port" (sine to 10 MHz, 0.1–3.0 V); spec says 8-bit vertical, trigger range "8 cells", storage depth 64 kB, display 480×272. No PC software exists for any 2C53x.
+
+**.bin format cross-check**: 2C53T files are 607 B = CH1[301] + CH2[301] + mask + u32 301 (github.com/RafaelDiasCampos/FNIRSI-2C53T-Decoder: 8 vertical divs, values 0x1C–0xE4 = 200 steps, volts = (b−128)·8·Vdiv/200). The 2C53P variant (from this RE) is 927 B = CH1[461] + 2 + CH2[461] + 2 + mask, values 0..240 after the firmware's −8 offset; 240 px / 8 div = 30 px/div, centre 120 (unverified). `bin2csv.py` defaults updated accordingly; the saved `.bmp` shows the graticule and settings, so every sample is self-documenting.
+
+**How settings reach the acquisition hardware (working model, partly verified)**
+- No scope-setting commands are ever pushed to the UART2 queue (only DMM items 0x05xx / 0x02A0 / 0x0500+range), and no other serial link to the FPGA exists. All 10 code sites touching `g_fpga_cmd_queue` are accounted for: the DMM task (0xF858) pushes 0x0501/0x0503/0x0508/0x0509/0x0514 and 0x02A0 (after a 0x11→0x22→0x53→0xB0 start-up handshake), the menu handler pushes 0x050C–0x0517 keyed on the DMM function (`DAT_20000240`), and 0x2D284 pushes 0x0500+range. **None are scope settings** — so this queue/UART2 is DMM-only. The transport for scope settings (timebase/trigger/gain) to the FPGA/AFE is **still unidentified** — candidates: GPIO mode lines + PWM (block 0x40046000, ~39 sites; 0x400460A8 is only the backlight: `0xEE04` writes brightness×20, default 1000) and the 74HC4053 muxes/relays for gain (teardown). Next step: find the writers of `g_timebase_idx` (0x2000012A) in the touch/menu code and follow the apply chain. The FPGA streams 461-point frames + measurement metadata regardless. ⇒ For PC control, patch-free: use UART0 SET commands (they call the same apply paths); with a patch: write `g_settings` and call the apply functions.
+- **UART0 is never initialised or pin-muxed in the APP image** (no `UART_Init(&UART0)`, no UART0 PORT_Init). It must be set up by the **bootloader** (0x0–0xCFFF) and inherited. At startup the app pushes notification `0xAA21` to the UART0 queue, so **UART0 TX can be located with a scope/logic analyser at power-up: look for a 921600-baud burst on the test pads** (SWM341 UART0 options: A12/A13, B12/B14, C12/C13, M0/M1 — B12/B14 and C12/C13 are taken by GPIO/LCD in the app, leaving **A12/A13 or M0/M1** as the likely pair).
+
+**Config / calibration sector 0xD000 — layout found** (`config_save_and_reboot` 0x28BA4 packs 20 words and programs them with the ROM/driver FLASH_Erase 0x103C0 + FLASH_Write 0x10408, then spins until the watchdog resets):
+`+0x00 g_settings[0..3] (+2/+3 = CH1/CH2 V/div idx) · +0x04 ch1/ch2 pos… · +0x08 0x132.. +0x141 · +0x0C 0x136 · +0x10 ch_mask,0x13F,0x140 · +0x14 0x142 · +0x18 0x146 · +0x1C boot_id · +0x20 0x14E,0x154,0x155 · +0x24 0x156,0x250,0x251,brightness · +0x28 0x253 | 0xEB000000 (validity marker) · +0x2C 0x1DC · +0x30 0x1B8 · +0x34 0x1BC · +0x38 0x1C0,0x1D9,0x1C2 · +0x3C 0x1C3 · +0x40 0x1C7+(0x1C9<<16|0x1CA<<24) · +0x44 0x1CB,0x1C8 · +0x48 0x150 · +0x4C 0x130,0x131`. The 0x1B8–0x1CB words are the per-unit **calibration** (0x200001B8.. defaults 0x80808080 in RW init). ⇒ Phase 0 backup = read flash 0xD000–0xD04F (SWD, or via a tiny UART0 GET if a command exposes it; cmds 0x28–0x3B read 0x20000190+cmd = 0x1B8–0x1CB — **the calibration bytes are readable over UART0** without any patch).
+
+**Frame request (complete)**: `wave_draw_main` runs only when `GPIO_GetBit(GPIOC,5)` = 1 (frame ready); it validates magic (`AA…55` = CH1 frame, `A5…5A` = CH2 frame), converts/draws, then `GPIO_ClrBit(GPIOC,5)` → `DMA_CH_Open(0)` (0xEF94) → `TIMR_Start(TIMR4)` (0x2A060) → FPGA clocks out the next 519 words → `DMA_IRQHandler` → `TIMR_Stop(TIMR4)`, `GPIO_SetBit(GPIOC,5)`. GPIOD is input-only (no parallel command path). Flash helpers call ROM IAP `0x11000470`/`0x110004C0` (datasheet: FLASH_Erase 0x11000471, FLASH_Write 0x110004C1) and SFC reg 0x4004A00C.
+**V/div index**: mantissa table `{1,2,5}[idx % 3]` (0x44E44) × decade `idx / 3` (+1), default idx 6 → e.g. 1 V/div if base is 10 mV·10^(idx/3)… verify against the UI strings.
+
+**Phase 1 — VERIFIED with real saves (samples/ from the owner's unit, 2026-10-08)**
+- Files are exactly **927 B**; BMPs 261,174 B (480×272×16 bpp + 54). Layout confirmed: CH1[461], CH1 max, CH1 min, CH2[461], CH2 max, CH2 min, mask (3 = both on). The two "unknown" bytes per channel are **max, min** of that trace.
+- Screen geometry from the BMPs: wave area x 9–469 (461 px, **1 sample per pixel column**), y 28–268 (240 px); screen row = 268 − value. Graticule: **50 px/div horizontal** (centre/trigger at x = 239 ⇒ sample 230; 9.2 div visible), **32 px/div vertical** (= 256 ADC codes / 8 div ⇒ the 8-bit ADC spans exactly 8 divisions, centre code 128 ⇒ value 120).
+- Calibration check: generator square wave on CH2 (1 V/div ×10): period 50.5 px @1 ms/div and 25.2 px @2 ms/div ⇒ **1.00 kHz** ✓; amplitude 73→166 = 93 px = 2.9 div ⇒ 2.9 V displayed vs 3.0 V set (−3%, within generator/probe tolerance). The owner confirmed: generator 1 kHz, 3.0 V, CH2 via a ×10 probe with the scope set to ×10 — so the volts path (ADC code → px → div → V/div × probe) is verified end to end. **Phase 1 complete.**
+- Not in the file: timebase, V/div, probe factor, channel zero positions — all visible in the matching BMP (status bar + marker arrows: pos = 268 − arrow_y). `tools/bin2csv.py` takes `--tb --vdiv1 --vdiv2 --pos1 --pos2` and writes CSV (+`--plot`).
+- The owner's samples: 1/2 = flat lines (CH1 10 mV ×1, CH2 200 mV ×10, 500 ns/div); 3 = 1 kHz square on CH2 @1 ms/div (CH2 1 V ×10); 4 = same @2 ms/div.
+
+Implication for Phase 1 (historical note): the `.bin` is a 2-channel screen trace, not a sample-buffer dump, so the decoder is trivial but lossy (8-bit vertical, 461 points). Still worth doing for the quick win; the real data path is the FPGA readout for Phase 3.
+
+## PCB test points (from EEVblog photos, saved in `reference/pcb/`; no teardown needed yet)
+Main board is marked **V0.0** (csuhi17's unit; note the two hardware batches). Visible, silkscreen-labelled:
+- **7-pin JST-style connector (top side, left edge, below the JTAG header): `BUZZ_CHK · 3V3 · GND · 5V · TX · RX · 3V3_EN`** — a UART brought out to a connector, almost certainly **UART0 (factory jig / the 921600 protocol)**. Photo: `top_mainboard_csuhi17_attach2187100.jpg`, zoom `top_headers_jtag_uart_zoom.png`.
+- **6-pin header `GND · TMS · TCK · TDO · TDI · 3V3`** right above it — FPGA JTAG (EG4S20).
+- **4 pads `GND · DIO · CLK · 3V3`** at the bottom edge next to the "V0.0" mark — MCU **SWD** (SWM34S SWDIO/SWCLK). Zoom: `top_swd_pads_zoom.png`.
+- **`TX ◯◯ RX` pads on the bottom side immediately below the MCU** (UniSoft's photo, `bottom_mcu_unisoft_attach2205142.jpg`, zoom `bottom_mcu_txrx_zoom.png`) — probably the same UART0 routed to pads; also `A3V3`, `A2V5`, `1V2`, `3V3`, `5V` test points nearby.
+- DMM sub-board (`dmm_board_upper_attach2187112.jpg`) has its own MCU (marking unreadable, "STC…"-like) with a 6-pin `VPP VDD GND M0 M1 M3` programming header and pads `TX2 / RX2 / V33 / GND2` → the DMM board talks to the main MCU over **UART2** (matches the firmware: 5A A5 BCD frames). So "UART2 = DMM" is confirmed; the FPGA is not on UART2.
+- **Practical test for UART0 (no soldering):** connect a 3.3 V USB-UART adapter RX to the `TX` pin of the 7-pin connector (or the TX pad under the MCU), GND to GND, open a terminal at **921600 8N1**, power the scope on: the app sends a burst of `55 xx …` / `AA 21 …` setting notifications at boot. If bytes arrive, that's UART0 and the GET/SET protocol is usable as-is.
+
+## Firmware version comparison (2026-10-08)
+- Downloaded to `downloads/`: `2C53P_Firmware_V1.10.zip` (sha256 `3a209ffb…d1c7`, APP `2C53P_APP_V1.10_250327.bin` 305,792 B, sha256 `0aab2731…8a74`) and `2C53P_Firmware_V1.8_NEW.zip` (`30e0d620…5ed3`, APP `2C53P_APP_V1.8_240611.bin` 305,536 B, `3daed7a1…b393`). Extracted under `downloads/fw_V1.10/` and `downloads/fw_V1.8_NEW/`.
+- **FPGA bitstream is byte-identical in all three packages** (`2C53P_FPGA_V2.2_240625.bin`, sha256 `b929b728…6dcf`). Only the APP changes.
+- All three APPs share the layout (base 0xE000, SP 0x2000B2C0, Reset 0xE1BD, same RW/ZI sizes, same USB MSC descriptors).
+- **Unchanged since V1.8 (identical prologues/bodies):** `save_simple_wave_bin` (V1.8 @0x3EBA8, V1.10 @0x3ECA0, V1.14 @0x3F6C8), `uart0_cmd_responder` (0x231B0 / 0x23130 / 0x23178), `fpga_dma_init` (0x35290 / 0x35388 / 0x35DB0), `DMA_IRQHandler` (0xF014 / 0xF014 / 0xEFA8). ⇒ the `.bin` format, the UART0 protocol and the FPGA data path apply to every shipped firmware.
+- `tools/fndiff.py OLD NEW [--show]` — masked function-level diff (branch/literal immediates ignored). V1.10→V1.14: 318/333 functions identical; changed: `wave_draw_main` 0x2F170, measurement 0x26850, main task 0x14E70, 0xEFD8, 0x2842C (PWM init), 0x28A04 (SPI init), 0x11398 (GPIOB IRQ), plus a few library/data false positives (0x404B0, 0x41888, 0x418A8, 0x43A9C, 0x44706, 0x57A7E). V1.8→V1.10: 313/332 identical. Matches the changelog (trigger/measurement/DMM UI only).
+- Ghidra project also holds `2C53P_APP_V1.8_240611.bin` and `2C53P_APP_V1.10_250327.bin` (imported with `Setup2C53P` only, no labels) for Version Tracking if needed.
+
+## Unknowns to resolve
+1. Exact Synwit part number and its memory map, plus whether SWD pads are exposed or readout-protected.
+2. Whether the **bootloader** (0x0–0xDFFF) has its own USB recovery mode. This decides how risky firmware patching is. Get it by dumping over SWD, or find out how FNIRSI's update is triggered: does the app reboot into the bootloader, or does the bootloader scan `P:/Upgrade` at power-on?
+3. The `.bin` waveform save format (needs sample files from the device: save a known signal, e.g. the built-in generator looped into CH1).
+4. The MCU↔FPGA interface (bus, register map, how sample buffers are read). This is the core of live streaming.
+5. How settings are held in RAM (timebase, V/div, trigger), to expose them as commands.
+
+## Suggested plan
+**Phase 0 — safety:** keep pristine copies of V1.14/V1.10/V1.8 zips. Before flashing anything, find out whether a calibration area exists and back it up (the 2C53T stores per-unit calibration in internal flash, and OpenScope warns that it cannot be regenerated).
+
+**Phase 1 — offline decoder (low risk, quick win):**
+- The owner saves 2–3 waveforms of known signals (e.g. 1 kHz 1 V sine, square, DC) and notes the timebase/V/div used.
+- Reverse the `.bin` header and sample layout by comparing files. Cross-reference the function that writes `Screenshot simple file/%d.bin` in Ghidra.
+- Deliver a `2c53p_bin2csv.py` that outputs time/volts CSV and a matplotlib plot.
+
+**Phase 2 — static RE in Ghidra:**
+- Load the APP .bin as ARM Cortex (Thumb, little-endian) at base **0xE000**. Add RAM 0x20000000 (≥0x10000) and fill 0x20000000–0x2000027F from `rw_init_0x20000000.bin`. Add a peripheral block at 0x40000000.
+- Run auto-analysis; locate the USB MSC class, FatFs, the waveform save routine, the FPGA read routine (loops pulling bytes from one peripheral data register into a buffer) and the settings struct.
+- Diff V1.8 → V1.14 to anchor the trigger and measurement code (per the changelog).
+
+**Phase 3 — live interface (choose one):**
+- **A. Firmware patch (preferred end state):** change the USB config to a composite MSC + CDC-ACM, or swap in CDC-only behind a menu toggle. Hook the main loop or a timer to stream the latest capture buffer, and parse simple text commands (`TB 1ms`, `VDIV1 1V`, `TRIG ...`, `GEN SINE 1k`) by writing the settings struct and calling the existing "apply settings" functions. Code caves: the free space after 0x4B4C0 up to the flash end. Hook by patching BL targets.
+- **B. Hardware tap (no firmware risk):** sniff UART0/UART2, or the MCU↔FPGA bus, with a logic analyzer. This could give live data via a small USB-UART bridge, but control would still need firmware help.
+- **C. Full open replacement firmware** (OpenScope-style) — only if A proves impractical. This is the largest effort.
+
+## References
+- EEVblog 2C53P thread (teardown photos, Anlogic FPGA, MTX2088 ADC): https://www.eevblog.com/forum/testgear/new-handheld-touch-dso-fnirsi-2c53p-claimed-50mhz250msps/
+- OpenScope-2C53T (sister model, structure/approach reference only): https://github.com/DavidClawson/OpenScope-2C53T
+- EEVblog OpenScope thread: https://www.eevblog.com/forum/testgear/open-source-replacement-firmware-for-the-fnirsi-2c53t-(at32f403a-rev-eng)/
+- 1013D open firmware (earlier FNIRSI RE, different MCU): pecostm32/FNIRSI_1013D_Firmware on GitHub
+- FNIRSI downloads: https://www.fnirsi.com/pages/manuals-firmwares (2C53P manual PDF is on the same CDN: `2C53P-_Manual.pdf`)
+
+## Constraints / preferences for the session
+- Keep explanations brief; lead with results.
+- Don't flash anything to the device without the owner's explicit go-ahead and a stated recovery path.

@@ -1,0 +1,23 @@
+menu "Scope bridge"
+
+config BRIDGE_WIFI_SSID
+    string "WiFi SSID"
+    default "myssid"
+
+config BRIDGE_WIFI_PASSWORD
+    string "WiFi password"
+    default "mypassword"
+
+config BRIDGE_TCP_PORT
+    int "TCP port for the transparent CDC bridge"
+    default 7001
+
+config BRIDGE_USB_VID
+    hex "USB VID to open (0 = any CDC-ACM device)"
+    default 0
+
+config BRIDGE_USB_PID
+    hex "USB PID to open (0 = any)"
+    default 0
+
+endmenu

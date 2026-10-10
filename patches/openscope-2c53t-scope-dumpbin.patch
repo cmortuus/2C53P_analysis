@@ -1,0 +1,161 @@
+diff --git a/firmware/src/drivers/fpga.c b/firmware/src/drivers/fpga.c
+index 00816fa..891485e 100644
+--- a/firmware/src/drivers/fpga.c
++++ b/firmware/src/drivers/fpga.c
+@@ -4203,10 +4203,12 @@ bool fpga_acq_pause(void)
+      * trigger-mode edge wait (≤FPGA_NORMAL_TRIG_WAIT_MS) + two 1026-byte
+      * reads + 10 ms. Queue task: one acquisition (≤ a few ms) or the 100 ms
+      * bounded queue wait. 1 s is comfortable margin for both. */
+-    for (int i = 0; i < 100; i++) {
++    /* 1 ms poll (was 10 ms): the ack latency sets the scope-dumpbin streaming
++     * rate, and a 10 ms poll alone cost ~1/3 of each record (2026-10-10). */
++    for (int i = 0; i < 1000; i++) {
+         if (acq_pause_ack)
+             return true;
+-        vTaskDelay(pdMS_TO_TICKS(10));
++        vTaskDelay(pdMS_TO_TICKS(1));
+     }
+     acq_pause_req = false;      /* don't leave a half-armed request behind */
+     return false;
+diff --git a/firmware/src/drivers/usb_debug.c b/firmware/src/drivers/usb_debug.c
+index dd5d5fa..4bf5e1c 100644
+--- a/firmware/src/drivers/usb_debug.c
++++ b/firmware/src/drivers/usb_debug.c
+@@ -193,6 +193,28 @@ static void usb_send_str(const char *str)
+     usb_send_bytes((const uint8_t *)str, strlen(str));
+ }
+ 
++/* Bulk variant for scope_dumpbin: one usb_vcp_send_data() per buffer. The AT32
++ * USB ISR (usbd_int.c, usbd_eptn_handler) chains the 64-byte packets of a
++ * multi-packet transfer itself and only raises g_tx_completed at the end, so
++ * 1 KB leaves in a few ms instead of 16 tick-paced packets (~30 ms). The
++ * buffer must stay valid until the next send waits on g_tx_completed. */
++static void usb_send_bulk(const uint8_t *data, uint16_t len)
++{
++#if DEBUG_SHELL_RTT_ONLY
++    usb_send_bytes(data, len);
++#else
++    if (!usb_debug_connected()) return;
++    cdc_struct_type *pcdc = (cdc_struct_type *)usb_core_dev.class_handler->pdata;
++    uint32_t timeout = 1000;
++    while (!pcdc->g_tx_completed && --timeout) {
++        if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
++            vTaskDelay(1);
++    }
++    if (!timeout) return;
++    usb_vcp_send_data(&usb_core_dev, (uint8_t *)data, len);
++#endif
++}
++
+ int usb_debug_printf(const char *fmt, ...)
+ {
+     char buf[256];
+@@ -2156,6 +2178,99 @@ static void cmd_screen_dumpbin(const char *args)
+     usb_send_str("\r\nSCREENBIN END\r\n");
+ }
+ 
++/* scope dumpbin — one-shot binary dump of the latest published capture record
++ * (both channels, FPGA_ADC_BUF_SIZE samples each) plus the settings a host needs
++ * to put it in volts and seconds. Same transport convention as screen dumpbin:
++ * one header line, raw bytes, "SCOPEBIN END". A host streams by repeating the
++ * command (~30 Hz is fine on CDC); nothing here blocks the shell.
++ *
++ * Tearing: RAM is too tight for a 2 KB private copy, so the record is sent
++ * from the live buffers with the acquisition task PARKED (fpga_acq_pause) for
++ * the CRC + send, then resumed. The trailer repeats the generation
++ * (`SCOPEBIN END gen=`); header gen == trailer gen proves no commit landed.
++ * Cost: acquisition stalls for the send (a few ms per record).
++ *
++ * Header fields (all decimal unless 0x-prefixed):
++ *   gen      generation of the record (host can skip repeats)
++ *   n        samples per channel (= FPGA_ADC_BUF_SIZE)
++ *   ordered  1 = record is time-ordered with the hardware trigger at index 512
++ *   ready    1 = at least one real acquisition has published (else demo data)
++ *   tb       timebase code (SPI reg 0x01, as shown by the UI)
++ *   rate_hz  sample rate in samples/s (0 when the code is uncalibrated)
++ *   en1/en2  channel enabled flags; cpl1/cpl2 coupling_t; prb1/prb2 probe_t
++ *   rng1/rng2 frontend range idx; vpc1/vpc2 volts per ADC count at the probe
++ *            tip (0 when the range is uncalibrated); pos1/pos2 vertical offset px
++ *   tmode/tedge/tsrc/tlvl trigger_mode_t / trigger_edge_t / trigger_source_t /
++ *            level (pixel offset from centre, see scope_state.h)
++ *   len      bytes that follow (2 * n); crc32 over them (same CRC as SCREENBIN)
++ */
++static void cmd_scope_dumpbin(const char *args)
++{
++    (void)args;
++    const volatile uint8_t *b1 = fpga_get_ch1_buf();
++    const volatile uint8_t *b2 = fpga_get_ch2_buf();
++    if (b1 == NULL || b2 == NULL) {
++        usb_send_str("ERR: fpga not initialized\r\n");
++        return;
++    }
++
++    /* Park the acquisition task for the duration of the send: on hardware it
++     * publishes a new record every ~25-30 ms, faster than 2 KB leaves over CDC,
++     * so sending from the live buffers tore every record (bench, 2026-10-10).
++     * The park point is between commits, so the generation is stable (even)
++     * once this returns true. Every exit path below must call fpga_acq_resume(). */
++    if (!fpga_acq_pause()) {
++        usb_send_str("ERR: acq task did not park, try again\r\n");
++        return;
++    }
++    uint32_t gen = fpga_acq_frame_generation();
++    const uint8_t *scope_dump_ch1 = (const uint8_t *)b1;
++    const uint8_t *scope_dump_ch2 = (const uint8_t *)b2;
++
++    const scope_state_t *ss = scope_state_get();
++    uint8_t tb = ss->timebase_idx;
++    /* Integer units on the wire: the image links with newlib-nano, whose printf
++     * has no float support (and %llu is not guaranteed). rate_hz = sample rate
++     * in samples/s (<= 250e6 fits 32 bits), vpcN_nv = nanovolts per ADC count
++     * at the probe tip. 0 = unknown/uncalibrated. */
++    float rate = scope_timebase_sample_rate(tb);
++    float vpc1 = scope_cal_volts_per_count(1, ss->ch1.vdiv_idx);
++    float vpc2 = scope_cal_volts_per_count(2, ss->ch2.vdiv_idx);
++    unsigned long rate_hz = (rate > 0.0f) ? (unsigned long)(rate + 0.5f) : 0UL;
++    unsigned long vpc1_nv = (vpc1 > 0.0f) ? (unsigned long)(vpc1 * 1e9f + 0.5f) : 0UL;
++    unsigned long vpc2_nv = (vpc2 > 0.0f) ? (unsigned long)(vpc2 * 1e9f + 0.5f) : 0UL;
++    uint32_t len = 2U * FPGA_ADC_BUF_SIZE;
++    uint32_t crc = crc32_update(0, scope_dump_ch1, FPGA_ADC_BUF_SIZE);
++    crc = crc32_update(crc, scope_dump_ch2, FPGA_ADC_BUF_SIZE);
++
++    /* Two printf calls: the printf buffer is 256 bytes and this header is ~200. */
++    usb_debug_printf("SCOPEBIN gen=%lu n=%u ordered=%u ready=%u tb=0x%02X rate_hz=%lu "
++                     "en1=%u en2=%u cpl1=%u cpl2=%u prb1=%u prb2=%u ",
++                     (unsigned long)gen, (unsigned)FPGA_ADC_BUF_SIZE,
++                     fpga_acq_record_time_ordered() ? 1U : 0U,
++                     fpga_data_ready() ? 1U : 0U, (unsigned)tb, rate_hz,
++                     ss->ch1.enabled ? 1U : 0U, ss->ch2.enabled ? 1U : 0U,
++                     (unsigned)ss->ch1.coupling, (unsigned)ss->ch2.coupling,
++                     (unsigned)ss->ch1.probe, (unsigned)ss->ch2.probe);
++    usb_debug_printf("rng1=%u rng2=%u vpc1_nv=%lu vpc2_nv=%lu pos1=%d pos2=%d "
++                     "tmode=%u tedge=%u tsrc=%u tlvl=%d len=%lu crc32=%08lX\r\n",
++                     (unsigned)ss->ch1.vdiv_idx, (unsigned)ss->ch2.vdiv_idx,
++                     vpc1_nv, vpc2_nv,
++                     (int)ss->ch1.position, (int)ss->ch2.position,
++                     (unsigned)ss->trigger.mode, (unsigned)ss->trigger.edge,
++                     (unsigned)ss->trigger.source, (int)ss->trigger.level,
++                     (unsigned long)len, (unsigned long)crc);
++
++    usb_send_bulk(scope_dump_ch1, (uint16_t)FPGA_ADC_BUF_SIZE);
++    usb_send_bulk(scope_dump_ch2, (uint16_t)FPGA_ADC_BUF_SIZE);
++    /* usb_debug_printf below waits for g_tx_completed before touching the
++     * endpoint, so the second buffer has fully left before acq resumes... */
++    usb_send_bytes((const uint8_t *)"\r\n", 2);
++    uint32_t gen_end = fpga_acq_frame_generation();
++    fpga_acq_resume();
++    usb_debug_printf("SCOPEBIN END gen=%lu\r\n", (unsigned long)gen_end);
++}
++
+ static void cmd_screen_shadow(const char *args)
+ {
+     if (args == NULL || *args == '\0') {
+@@ -7892,6 +8007,8 @@ static const shell_cmd_t shell_cmds[] = {
+           "screen dump [shadow] [x y w h]  Dump text indexed4 LCD shadow\r\n"),
+     CMD_A("screen dumpbin", cmd_screen_dumpbin, 0,
+           "screen dumpbin [x y w h]        Binary indexed4 LCD shadow dump\r\n"),
++    CMD_A("scope dumpbin", cmd_scope_dumpbin, 0,
++          "scope dumpbin                   Binary dump of latest capture (CH1+CH2, header has scale)\r\n"),
+     CMD_A("screen shadow", cmd_screen_shadow, 0,
+           "screen shadow page [y]          Clear full-screen shadow capture\r\n"),
+     CMD_A("fpga cmd", cmd_fpga_cmd, SC_NEEDARGS,

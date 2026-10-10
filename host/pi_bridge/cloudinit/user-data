@@ -1,0 +1,24 @@
+#cloud-config
+hostname: scope-pi
+manage_etc_hosts: true
+users:
+  - name: pi
+    groups: [adm, dialout, plugdev, sudo, users, netdev]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ3tko+CHPu1kzEP6QG+i2xowdXQokeF0SnQLwZkT60g c@Mac-Studio.localdomain
+ssh_pwauth: false
+package_update: false
+timezone: America/New_York
+runcmd:
+  - [ systemctl, enable, --now, ssh ]
+  # --- self-diagnostic: dump WiFi/network state onto the FAT boot partition so it can be read on a Mac ---
+  - [ sh, -c, "sleep 75; D=/boot/firmware/diag; mkdir -p $D; date > $D/00-date.txt; uptime >> $D/00-date.txt" ]
+  - [ sh, -c, "D=/boot/firmware/diag; nmcli -t dev status > $D/10-nm-devices.txt 2>&1; nmcli -f all con show > $D/11-nm-connections.txt 2>&1; nmcli -f all dev show wlan0 > $D/12-nm-wlan0.txt 2>&1" ]
+  - [ sh, -c, "D=/boot/firmware/diag; nmcli dev wifi list > $D/20-wifi-scan.txt 2>&1; iw dev > $D/21-iw-dev.txt 2>&1; iw reg get > $D/22-iw-reg.txt 2>&1; rfkill list > $D/23-rfkill.txt 2>&1" ]
+  - [ sh, -c, "D=/boot/firmware/diag; journalctl -b -u NetworkManager -u wpa_supplicant --no-pager > $D/30-journal-nm-wpa.txt 2>&1; journalctl -b --no-pager | grep -i -E 'brcm|cfg80211|wlan0|dwc2|g_ether|usb0' > $D/31-journal-wifi-usb.txt 2>&1" ]
+  - [ sh, -c, "D=/boot/firmware/diag; ls -l /etc/netplan > $D/40-netplan-ls.txt 2>&1; cat /etc/netplan/*.yaml 2>/dev/null | sed -E 's/(password|psk).*/\\1: <hidden>/' > $D/41-netplan.txt; ls -l /run/NetworkManager/system-connections /etc/NetworkManager/system-connections > $D/42-nm-conn-files.txt 2>&1" ]
+  - [ sh, -c, "D=/boot/firmware/diag; ip -br addr > $D/50-ip.txt 2>&1; ip route >> $D/50-ip.txt 2>&1; cloud-init status --long > $D/60-cloud-init.txt 2>&1; cp /var/log/cloud-init-output.log $D/61-cloud-init-output.log 2>/dev/null; sync" ]
+  - [ sh, -c, "D=/boot/firmware/diag; lsusb > $D/70-lsusb.txt 2>&1; ip -br link > $D/71-ip-link.txt 2>&1; dmesg | grep -i -E 'usb|dwc2|eth|asix|r815|cdc_|smsc|lan78' > $D/72-dmesg-usb-eth.txt 2>&1; cat /proc/device-tree/model > $D/73-model.txt 2>&1; vcgencmd get_throttled > $D/74-throttled.txt 2>&1; sync" ]
