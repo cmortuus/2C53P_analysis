@@ -1,0 +1,830 @@
+diff --git a/firmware/Makefile b/firmware/Makefile
+index 415adbe..5b379cc 100644
+--- a/firmware/Makefile
++++ b/firmware/Makefile
+@@ -33,6 +33,7 @@ FEATURES ?= FFT
+ C_SOURCES  = src/main.c
+ C_SOURCES += src/drivers/lcd.c
+ C_SOURCES += src/ui/status_bar.c
++C_SOURCES += src/ui/scope_topbar.c
+ C_SOURCES += src/ui/scope_ui.c
+ C_SOURCES += src/ui/meter_ui.c
+ C_SOURCES += src/ui/softkey.c
+diff --git a/firmware/src/drivers/fpga.c b/firmware/src/drivers/fpga.c
+index 00816fa..891485e 100644
+--- a/firmware/src/drivers/fpga.c
++++ b/firmware/src/drivers/fpga.c
+@@ -4203,10 +4203,12 @@ bool fpga_acq_pause(void)
+      * trigger-mode edge wait (≤FPGA_NORMAL_TRIG_WAIT_MS) + two 1026-byte
+      * reads + 10 ms. Queue task: one acquisition (≤ a few ms) or the 100 ms
+      * bounded queue wait. 1 s is comfortable margin for both. */
+-    for (int i = 0; i < 100; i++) {
++    /* 1 ms poll (was 10 ms): the ack latency sets the scope-dumpbin streaming
++     * rate, and a 10 ms poll alone cost ~1/3 of each record (2026-10-10). */
++    for (int i = 0; i < 1000; i++) {
+         if (acq_pause_ack)
+             return true;
+-        vTaskDelay(pdMS_TO_TICKS(10));
++        vTaskDelay(pdMS_TO_TICKS(1));
+     }
+     acq_pause_req = false;      /* don't leave a half-armed request behind */
+     return false;
+diff --git a/firmware/src/drivers/usb_debug.c b/firmware/src/drivers/usb_debug.c
+index dd5d5fa..4bf5e1c 100644
+--- a/firmware/src/drivers/usb_debug.c
++++ b/firmware/src/drivers/usb_debug.c
+@@ -193,6 +193,28 @@ static void usb_send_str(const char *str)
+     usb_send_bytes((const uint8_t *)str, strlen(str));
+ }
+ 
++/* Bulk variant for scope_dumpbin: one usb_vcp_send_data() per buffer. The AT32
++ * USB ISR (usbd_int.c, usbd_eptn_handler) chains the 64-byte packets of a
++ * multi-packet transfer itself and only raises g_tx_completed at the end, so
++ * 1 KB leaves in a few ms instead of 16 tick-paced packets (~30 ms). The
++ * buffer must stay valid until the next send waits on g_tx_completed. */
++static void usb_send_bulk(const uint8_t *data, uint16_t len)
++{
++#if DEBUG_SHELL_RTT_ONLY
++    usb_send_bytes(data, len);
++#else
++    if (!usb_debug_connected()) return;
++    cdc_struct_type *pcdc = (cdc_struct_type *)usb_core_dev.class_handler->pdata;
++    uint32_t timeout = 1000;
++    while (!pcdc->g_tx_completed && --timeout) {
++        if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
++            vTaskDelay(1);
++    }
++    if (!timeout) return;
++    usb_vcp_send_data(&usb_core_dev, (uint8_t *)data, len);
++#endif
++}
++
+ int usb_debug_printf(const char *fmt, ...)
+ {
+     char buf[256];
+@@ -2156,6 +2178,99 @@ static void cmd_screen_dumpbin(const char *args)
+     usb_send_str("\r\nSCREENBIN END\r\n");
+ }
+ 
++/* scope dumpbin — one-shot binary dump of the latest published capture record
++ * (both channels, FPGA_ADC_BUF_SIZE samples each) plus the settings a host needs
++ * to put it in volts and seconds. Same transport convention as screen dumpbin:
++ * one header line, raw bytes, "SCOPEBIN END". A host streams by repeating the
++ * command (~30 Hz is fine on CDC); nothing here blocks the shell.
++ *
++ * Tearing: RAM is too tight for a 2 KB private copy, so the record is sent
++ * from the live buffers with the acquisition task PARKED (fpga_acq_pause) for
++ * the CRC + send, then resumed. The trailer repeats the generation
++ * (`SCOPEBIN END gen=`); header gen == trailer gen proves no commit landed.
++ * Cost: acquisition stalls for the send (a few ms per record).
++ *
++ * Header fields (all decimal unless 0x-prefixed):
++ *   gen      generation of the record (host can skip repeats)
++ *   n        samples per channel (= FPGA_ADC_BUF_SIZE)
++ *   ordered  1 = record is time-ordered with the hardware trigger at index 512
++ *   ready    1 = at least one real acquisition has published (else demo data)
++ *   tb       timebase code (SPI reg 0x01, as shown by the UI)
++ *   rate_hz  sample rate in samples/s (0 when the code is uncalibrated)
++ *   en1/en2  channel enabled flags; cpl1/cpl2 coupling_t; prb1/prb2 probe_t
++ *   rng1/rng2 frontend range idx; vpc1/vpc2 volts per ADC count at the probe
++ *            tip (0 when the range is uncalibrated); pos1/pos2 vertical offset px
++ *   tmode/tedge/tsrc/tlvl trigger_mode_t / trigger_edge_t / trigger_source_t /
++ *            level (pixel offset from centre, see scope_state.h)
++ *   len      bytes that follow (2 * n); crc32 over them (same CRC as SCREENBIN)
++ */
++static void cmd_scope_dumpbin(const char *args)
++{
++    (void)args;
++    const volatile uint8_t *b1 = fpga_get_ch1_buf();
++    const volatile uint8_t *b2 = fpga_get_ch2_buf();
++    if (b1 == NULL || b2 == NULL) {
++        usb_send_str("ERR: fpga not initialized\r\n");
++        return;
++    }
++
++    /* Park the acquisition task for the duration of the send: on hardware it
++     * publishes a new record every ~25-30 ms, faster than 2 KB leaves over CDC,
++     * so sending from the live buffers tore every record (bench, 2026-10-10).
++     * The park point is between commits, so the generation is stable (even)
++     * once this returns true. Every exit path below must call fpga_acq_resume(). */
++    if (!fpga_acq_pause()) {
++        usb_send_str("ERR: acq task did not park, try again\r\n");
++        return;
++    }
++    uint32_t gen = fpga_acq_frame_generation();
++    const uint8_t *scope_dump_ch1 = (const uint8_t *)b1;
++    const uint8_t *scope_dump_ch2 = (const uint8_t *)b2;
++
++    const scope_state_t *ss = scope_state_get();
++    uint8_t tb = ss->timebase_idx;
++    /* Integer units on the wire: the image links with newlib-nano, whose printf
++     * has no float support (and %llu is not guaranteed). rate_hz = sample rate
++     * in samples/s (<= 250e6 fits 32 bits), vpcN_nv = nanovolts per ADC count
++     * at the probe tip. 0 = unknown/uncalibrated. */
++    float rate = scope_timebase_sample_rate(tb);
++    float vpc1 = scope_cal_volts_per_count(1, ss->ch1.vdiv_idx);
++    float vpc2 = scope_cal_volts_per_count(2, ss->ch2.vdiv_idx);
++    unsigned long rate_hz = (rate > 0.0f) ? (unsigned long)(rate + 0.5f) : 0UL;
++    unsigned long vpc1_nv = (vpc1 > 0.0f) ? (unsigned long)(vpc1 * 1e9f + 0.5f) : 0UL;
++    unsigned long vpc2_nv = (vpc2 > 0.0f) ? (unsigned long)(vpc2 * 1e9f + 0.5f) : 0UL;
++    uint32_t len = 2U * FPGA_ADC_BUF_SIZE;
++    uint32_t crc = crc32_update(0, scope_dump_ch1, FPGA_ADC_BUF_SIZE);
++    crc = crc32_update(crc, scope_dump_ch2, FPGA_ADC_BUF_SIZE);
++
++    /* Two printf calls: the printf buffer is 256 bytes and this header is ~200. */
++    usb_debug_printf("SCOPEBIN gen=%lu n=%u ordered=%u ready=%u tb=0x%02X rate_hz=%lu "
++                     "en1=%u en2=%u cpl1=%u cpl2=%u prb1=%u prb2=%u ",
++                     (unsigned long)gen, (unsigned)FPGA_ADC_BUF_SIZE,
++                     fpga_acq_record_time_ordered() ? 1U : 0U,
++                     fpga_data_ready() ? 1U : 0U, (unsigned)tb, rate_hz,
++                     ss->ch1.enabled ? 1U : 0U, ss->ch2.enabled ? 1U : 0U,
++                     (unsigned)ss->ch1.coupling, (unsigned)ss->ch2.coupling,
++                     (unsigned)ss->ch1.probe, (unsigned)ss->ch2.probe);
++    usb_debug_printf("rng1=%u rng2=%u vpc1_nv=%lu vpc2_nv=%lu pos1=%d pos2=%d "
++                     "tmode=%u tedge=%u tsrc=%u tlvl=%d len=%lu crc32=%08lX\r\n",
++                     (unsigned)ss->ch1.vdiv_idx, (unsigned)ss->ch2.vdiv_idx,
++                     vpc1_nv, vpc2_nv,
++                     (int)ss->ch1.position, (int)ss->ch2.position,
++                     (unsigned)ss->trigger.mode, (unsigned)ss->trigger.edge,
++                     (unsigned)ss->trigger.source, (int)ss->trigger.level,
++                     (unsigned long)len, (unsigned long)crc);
++
++    usb_send_bulk(scope_dump_ch1, (uint16_t)FPGA_ADC_BUF_SIZE);
++    usb_send_bulk(scope_dump_ch2, (uint16_t)FPGA_ADC_BUF_SIZE);
++    /* usb_debug_printf below waits for g_tx_completed before touching the
++     * endpoint, so the second buffer has fully left before acq resumes... */
++    usb_send_bytes((const uint8_t *)"\r\n", 2);
++    uint32_t gen_end = fpga_acq_frame_generation();
++    fpga_acq_resume();
++    usb_debug_printf("SCOPEBIN END gen=%lu\r\n", (unsigned long)gen_end);
++}
++
+ static void cmd_screen_shadow(const char *args)
+ {
+     if (args == NULL || *args == '\0') {
+@@ -7892,6 +8007,8 @@ static const shell_cmd_t shell_cmds[] = {
+           "screen dump [shadow] [x y w h]  Dump text indexed4 LCD shadow\r\n"),
+     CMD_A("screen dumpbin", cmd_screen_dumpbin, 0,
+           "screen dumpbin [x y w h]        Binary indexed4 LCD shadow dump\r\n"),
++    CMD_A("scope dumpbin", cmd_scope_dumpbin, 0,
++          "scope dumpbin                   Binary dump of latest capture (CH1+CH2, header has scale)\r\n"),
+     CMD_A("screen shadow", cmd_screen_shadow, 0,
+           "screen shadow page [y]          Clear full-screen shadow capture\r\n"),
+     CMD_A("fpga cmd", cmd_fpga_cmd, SC_NEEDARGS,
+diff --git a/firmware/src/main.c b/firmware/src/main.c
+index 33b2db6..4b978fc 100644
+--- a/firmware/src/main.c
++++ b/firmware/src/main.c
+@@ -293,11 +293,13 @@ static uint32_t info_bar_epoch(void)
+     if (current_mode == MODE_OSCILLOSCOPE) {
+         const scope_state_t *s = scope_state_get();
+         h = redraw_epoch_mix(h, (uint32_t)scope_view);
+-        h = redraw_epoch_mix(h, (uint32_t)s->trigger.mode | ((uint32_t)s->timebase_idx << 8));
++        h = redraw_epoch_mix(h, (uint32_t)s->trigger.mode | ((uint32_t)s->timebase_idx << 8)
++                                | ((uint32_t)s->trigger.edge << 16) | ((uint32_t)s->trigger.source << 20)
++                                | ((uint32_t)s->running << 24) | ((uint32_t)active_channel << 28));
+         h = redraw_epoch_mix(h, (uint32_t)s->ch1.enabled | ((uint32_t)s->ch1.vdiv_idx << 1)
+-                                | ((uint32_t)s->ch1.coupling << 8));
++                                | ((uint32_t)s->ch1.coupling << 8) | ((uint32_t)s->ch1.probe << 12));
+         h = redraw_epoch_mix(h, (uint32_t)s->ch2.enabled | ((uint32_t)s->ch2.vdiv_idx << 1)
+-                                | ((uint32_t)s->ch2.coupling << 8));
++                                | ((uint32_t)s->ch2.coupling << 8) | ((uint32_t)s->ch2.probe << 12));
+ #ifdef FEATURE_FFT
+         const fft_config_t *cfg = fft_get_config();
+         if (cfg)
+@@ -970,7 +972,7 @@ int main(void)
+     wdt_counter_reload();
+ 
+     /* Initialize theme system */
+-    theme_init(THEME_DARK_BLUE);
++    theme_init(THEME_FNIRSI);   /* stock-look reskin is the default (2026-10-10) */
+ 
+     /* Initialize oscilloscope state */
+     scope_state_init(scope_state_get());
+diff --git a/firmware/src/ui/scope_topbar.c b/firmware/src/ui/scope_topbar.c
+new file mode 100644
+index 0000000..c05c3c3
+--- /dev/null
++++ b/firmware/src/ui/scope_topbar.c
+@@ -0,0 +1,186 @@
++/*
++ * scope_topbar.c — FNIRSI-style status bar for the oscilloscope screen.
++ *
++ * Reference: the stock FNIRSI 2C53P scope screen (480x272). Scaled to the
++ * 2C53T's 320x240 with the same reading order:
++ *
++ *   [CH1] 617mV X1 DC  [CH2] 2.8V X10 DC  [H 641us]  Auto ⎍1  [battery]
++ *
++ * Slot widths come from font_small's advance table ("617mV" = 36 px,
++ * "X10" = 19 px, "DC" = 15 px, "Auto" = 26 px, "CH1" = 21 px) — every text
++ * field is drawn with font_draw_string_box so it is clipped to its slot and
++ * repainted in place without blanking.
++ */
++#include "ui.h"
++#include "lcd.h"
++#include "font.h"
++#include "theme.h"
++#include "scope_state.h"
++#include "scope_cal.h"
++#include "scope_timebase.h"
++#include "battery.h"
++#include "scope_topbar.h"
++#include <stdio.h>
++#include <stdbool.h>
++
++#define BAR_H    SCOPE_TOPBAR_HEIGHT
++#define TXT_Y    3                 /* 12-px glyphs centred in the 18-px bar */
++
++#define CHIP_W   25
++#define VDIV_X   27                /* offsets inside a channel block */
++#define VDIV_W   39
++#define PROBE_X  68
++#define PROBE_W  19
++#define CPL_X    89
++#define CPL_W    16
++#define BLOCK_W  105
++
++#define CH1_X    0
++#define CH2_X    108
++#define H_X      216
++#define H_W      44
++#define TRIG_X   262
++#define TRIG_W   40
++#define BAT_X    304
++#define BAT_W    16
++
++static const char *cpl_short[COUPLING_COUNT] = { "DC", "AC", "GD" };
++
++static void outline(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t c)
++{
++    lcd_fill_rect(x, y, w, 1, c);
++    lcd_fill_rect(x, (uint16_t)(y + h - 1), w, 1, c);
++    lcd_fill_rect(x, y, 1, h, c);
++    lcd_fill_rect((uint16_t)(x + w - 1), y, 1, h, c);
++}
++
++/* Channel chip: the active channel (the one the buttons adjust) is a filled
++ * box with a dark label, the other an outlined box with a coloured label. */
++static void chip(uint16_t x, const char *label, uint16_t color, bool active,
++                 const theme_t *th)
++{
++    if (active) {
++        lcd_fill_rect(x, 1, CHIP_W, BAR_H - 2, color);
++        font_draw_string_box(x, TXT_Y, CHIP_W, label, 0x0000, color,
++                             &font_small, FONT_ALIGN_CENTER);
++    } else {
++        lcd_fill_rect(x, 1, CHIP_W, BAR_H - 2, th->status_bar_bg);
++        outline(x, 1, CHIP_W, BAR_H - 2, color);
++        font_draw_string_box((uint16_t)(x + 1), TXT_Y, CHIP_W - 2, label, color,
++                             th->status_bar_bg, &font_small, FONT_ALIGN_CENTER);
++    }
++}
++
++static void channel_block(uint16_t x, uint8_t ch, const channel_state_t *cs,
++                          bool active, const theme_t *th)
++{
++    const uint16_t color = (ch == 1u) ? th->ch1 : th->ch2;
++    const uint16_t fg = cs->enabled ? color : th->text_secondary;
++    char v[12];
++
++    chip(x, (ch == 1u) ? "CH1" : "CH2", cs->enabled ? color : th->text_secondary,
++         active, th);
++    scope_cal_range_label(ch, cs->vdiv_idx, v, sizeof(v));
++    font_draw_string_box((uint16_t)(x + VDIV_X), TXT_Y, VDIV_W, v, fg,
++                         th->status_bar_bg, &font_small, FONT_ALIGN_LEFT);
++    font_draw_string_box((uint16_t)(x + PROBE_X), TXT_Y, PROBE_W,
++                         probe_labels[cs->probe], fg, th->status_bar_bg,
++                         &font_small, FONT_ALIGN_LEFT);
++    font_draw_string_box((uint16_t)(x + CPL_X), TXT_Y, CPL_W,
++                         cpl_short[cs->coupling], fg, th->status_bar_bg,
++                         &font_small, FONT_ALIGN_LEFT);
++}
++
++static void h_block(const scope_state_t *ss, const theme_t *th)
++{
++    char tb[12];
++
++    /* Green-outlined timebase chip (stock draws a clock glyph + "H" here; at
++     * 320 px the label alone fills the box: "2.56ms" is 39 px). */
++    lcd_fill_rect(H_X, 1, H_W, BAR_H - 2, th->status_bar_bg);
++    outline(H_X, 1, H_W, BAR_H - 2, th->success);
++    scope_timebase_label(ss->timebase_idx, tb, sizeof(tb));
++    font_draw_string_box(H_X + 2, TXT_Y, H_W - 4, tb, th->text_primary,
++                         th->status_bar_bg, &font_small, FONT_ALIGN_CENTER);
++}
++
++/* 5x7 edge glyph: a step with a foot and a head, rising or falling. */
++static void edge_glyph(uint16_t x, uint16_t y, bool rising, uint16_t c)
++{
++    if (rising) {
++        lcd_fill_rect(x, (uint16_t)(y + 6), 3, 1, c);        /* low foot, left */
++        lcd_fill_rect((uint16_t)(x + 2), y, 1, 7, c);        /* the edge */
++        lcd_fill_rect((uint16_t)(x + 2), y, 3, 1, c);        /* high head, right */
++    } else {
++        lcd_fill_rect(x, y, 3, 1, c);
++        lcd_fill_rect((uint16_t)(x + 2), y, 1, 7, c);
++        lcd_fill_rect((uint16_t)(x + 2), (uint16_t)(y + 6), 3, 1, c);
++    }
++}
++
++static void trig_block(const scope_state_t *ss, const theme_t *th)
++{
++    const char *mode;
++    uint16_t c;
++
++    if (!ss->running) {
++        mode = "STOP"; c = th->warning;
++    } else {
++        mode = (ss->trigger.mode == TRIG_AUTO)   ? "Auto" :
++               (ss->trigger.mode == TRIG_NORMAL) ? "Norm" : "Sngl";
++        c = th->highlight;
++    }
++    lcd_fill_rect(TRIG_X, 1, TRIG_W, BAR_H - 2, th->status_bar_bg);
++    uint16_t w = font_draw_string_box(TRIG_X, TXT_Y, 31, mode, c, th->status_bar_bg,
++                                      &font_small, FONT_ALIGN_LEFT);
++    const uint16_t sc = (ss->trigger.source == TRIG_SRC_CH1) ? th->ch1 : th->ch2;
++    uint16_t ax = (uint16_t)(TRIG_X + w + 2);
++    if (ax + 11 > TRIG_X + TRIG_W)
++        ax = (uint16_t)(TRIG_X + TRIG_W - 11);
++    edge_glyph(ax, TXT_Y + 2, ss->trigger.edge == TRIG_RISING, sc);
++    font_draw_string_box((uint16_t)(ax + 6), TXT_Y, 5,
++                         (ss->trigger.source == TRIG_SRC_CH1) ? "1" : "2", sc,
++                         th->status_bar_bg, &font_small, FONT_ALIGN_LEFT);
++}
++
++void scope_topbar_draw_battery(void)
++{
++    const theme_t *th = theme_get();
++    const uint8_t pct = battery_percent();
++    uint16_t col;
++
++    if (battery_is_critical())
++        col = (uptime_seconds & 1u) ? th->warning : th->status_bar_bg;   /* blink */
++    else if (battery_is_charging())
++        col = th->success;
++    else
++        col = (pct <= 15u) ? th->warning : (pct <= 30u) ? 0xFE00 : th->success;
++
++    /* 13x8 body + 2x4 nub, fill proportional to charge (full while charging). */
++    lcd_fill_rect(BAT_X, 1, BAT_W, BAR_H - 2, th->status_bar_bg);
++    outline(BAT_X, 5, 13, 8, th->text_primary);
++    lcd_fill_rect(BAT_X + 13, 7, 2, 4, th->text_primary);
++    uint16_t fw = battery_is_charging() ? 11u : (uint16_t)((11u * pct + 50u) / 100u);
++    if (fw > 11u) fw = 11u;
++    if (fw)
++        lcd_fill_rect(BAT_X + 1, 6, fw, 6, col);
++    if (battery_is_charging()) {
++        /* small dark bolt on the green fill: two offset 2x2 blocks */
++        lcd_fill_rect(BAT_X + 6, 6, 2, 2, th->status_bar_bg);
++        lcd_fill_rect(BAT_X + 5, 8, 2, 2, th->status_bar_bg);
++        lcd_fill_rect(BAT_X + 6, 10, 2, 2, th->status_bar_bg);
++    }
++}
++
++void scope_topbar_draw(void)
++{
++    const theme_t *th = theme_get();
++    const scope_state_t *ss = scope_state_get();
++
++    lcd_fill_rect(0, 0, LCD_WIDTH, BAR_H, th->status_bar_bg);
++    channel_block(CH1_X, 1u, &ss->ch1, active_channel == 0u, th);
++    channel_block(CH2_X, 2u, &ss->ch2, active_channel == 1u, th);
++    h_block(ss, th);
++    trig_block(ss, th);
++    scope_topbar_draw_battery();
++}
+diff --git a/firmware/src/ui/scope_topbar.h b/firmware/src/ui/scope_topbar.h
+new file mode 100644
+index 0000000..539ebc3
+--- /dev/null
++++ b/firmware/src/ui/scope_topbar.h
+@@ -0,0 +1,26 @@
++/*
++ * scope_topbar.h — FNIRSI-style status bar for the oscilloscope screen.
++ *
++ * One 18-px bar across the top carries everything the stock FNIRSI UI shows
++ * there: a filled chip per channel (CH1 cyan, CH2 blue) followed by that
++ * channel's volts/div, probe factor and coupling, a green "H" chip with the
++ * timebase, the trigger mode + edge + source in orange, and a battery icon.
++ * The bottom info bar is not drawn in the time-domain scope view any more;
++ * the graticule runs to the bottom of the screen instead.
++ *
++ * Geometry (x slots, font_small advances): see scope_topbar.c.
++ */
++#ifndef SCOPE_TOPBAR_H
++#define SCOPE_TOPBAR_H
++
++#include <stdint.h>
++
++#define SCOPE_TOPBAR_HEIGHT  18
++
++/* Full repaint of the bar (background, chips, H, trigger, battery). */
++void scope_topbar_draw(void);
++
++/* Battery icon only (called once a second by draw_status_bar). */
++void scope_topbar_draw_battery(void);
++
++#endif /* SCOPE_TOPBAR_H */
+diff --git a/firmware/src/ui/scope_ui.c b/firmware/src/ui/scope_ui.c
+index 35b4903..c27e5eb 100644
+--- a/firmware/src/ui/scope_ui.c
++++ b/firmware/src/ui/scope_ui.c
+@@ -43,7 +43,9 @@
+  * ═══════════════════════════════════════════════════════════════════ */
+ 
+ #define SCOPE_TOP       18      /* Below status bar */
+-#define SCOPE_BOT       (LCD_HEIGHT - 16)  /* Above info bar */
++#define SCOPE_BOT       (LCD_HEIGHT - 6)   /* Full-height graticule: 8 rows of GRID_ROW px (reskin 2026-10-10) */
++#define GRID_COL        32                 /* 10 divisions across 320 px */
++#define GRID_ROW        27                 /* 8 divisions in 216 px */
+ #define SCOPE_H         (SCOPE_BOT - SCOPE_TOP)
+ #define SCOPE_MID_Y     (SCOPE_TOP + SCOPE_H / 2)
+ #ifdef SCOPE_DEBUG_OVERLAY
+@@ -184,27 +186,39 @@ bool scope_popup_active(void)
+  * Grid
+  * ═══════════════════════════════════════════════════════════════════ */
+ 
++/* FNIRSI-style graticule, ONE rule shared by the full redraw and the live
++ * compositor (which re-plots the grid arithmetically): 10 x 8 divisions, a dot
++ * every 4 px on the division lines and the frame, the centre cross dotted every
++ * 2 px with 3-px tick marks at every 1/5 division. Returns true and sets *c when
++ * (x, y) is a grid pixel. */
++static inline bool scope_grid_pixel(uint16_t x, uint16_t y, uint16_t *c,
++                                    const theme_t *th)
++{
++    const uint16_t dy = (uint16_t)(y - SCOPE_TOP);
++    const uint16_t cx = LCD_WIDTH / 2;
++
++    if (y == SCOPE_MID_Y && (x & 1u) == 0u)            { *c = th->grid_center; return true; }
++    if (x == cx && (dy & 1u) == 0u)                     { *c = th->grid_center; return true; }
++    if (y + 2 >= SCOPE_MID_Y && y <= SCOPE_MID_Y + 2 && ((x * 5u) % GRID_COL) < 5u)
++                                                        { *c = th->grid_center; return true; }
++    if (x + 2 >= cx && x <= cx + 2 && ((dy * 5u) % GRID_ROW) < 5u)
++                                                        { *c = th->grid_center; return true; }
++    if (((x % GRID_COL) == 0u || x == LCD_WIDTH - 1) && (dy & 3u) == 0u)
++                                                        { *c = th->grid; return true; }
++    if (((dy % GRID_ROW) == 0u || y == SCOPE_BOT - 1) && (x & 3u) == 0u)
++                                                        { *c = th->grid; return true; }
++    return false;
++}
++
+ void draw_scope_grid(void)
+ {
+     const theme_t *th = theme_get();
+-    uint16_t x, y;
++    uint16_t c;
+ 
+-    /* Vertical grid lines (dotted) */
+-    for (x = 0; x < LCD_WIDTH; x += 32) {
+-        for (y = SCOPE_TOP; y < SCOPE_BOT; y += 2)
+-            lcd_set_pixel(x, y, th->grid);
+-    }
+-    /* Horizontal grid lines (dotted) */
+-    for (y = SCOPE_TOP; y < SCOPE_BOT; y += 26) {
+-        for (x = 0; x < LCD_WIDTH; x += 2)
+-            lcd_set_pixel(x, y, th->grid);
+-    }
+-
+-    /* Center crosshair (solid) */
+-    for (x = 0; x < LCD_WIDTH; x++)
+-        lcd_set_pixel(x, SCOPE_MID_Y, th->grid_center);
+-    for (y = SCOPE_TOP; y < SCOPE_BOT; y++)
+-        lcd_set_pixel(LCD_WIDTH / 2, y, th->grid_center);
++    for (uint16_t y = SCOPE_TOP; y < SCOPE_BOT; y++)
++        for (uint16_t x = 0; x < LCD_WIDTH; x++)
++            if (scope_grid_pixel(x, y, &c, th))
++                lcd_set_pixel(x, y, c);
+ }
+ 
+ /* ═══════════════════════════════════════════════════════════════════
+@@ -220,41 +234,20 @@ static void draw_trigger_indicator(const scope_state_t *ss, const theme_t *th,
+     if (trig_y < SCOPE_TOP + 2) trig_y = SCOPE_TOP + 2;
+     if (trig_y > SCOPE_BOT - 3) trig_y = SCOPE_BOT - 3;
+ 
+-    /* Right-edge arrow: small triangle pointing left */
+-    uint16_t ax = LCD_WIDTH - 1;
+-    lcd_set_pixel(ax,     (uint16_t)trig_y, th->trigger);
+-    lcd_set_pixel(ax - 1, (uint16_t)trig_y, th->trigger);
+-    lcd_set_pixel(ax - 2, (uint16_t)trig_y, th->trigger);
+-    lcd_set_pixel(ax - 3, (uint16_t)trig_y, th->trigger);
+-    lcd_set_pixel(ax - 4, (uint16_t)trig_y, th->trigger);
+-    lcd_set_pixel(ax - 1, (uint16_t)(trig_y - 1), th->trigger);
+-    lcd_set_pixel(ax - 2, (uint16_t)(trig_y - 2), th->trigger);
+-    lcd_set_pixel(ax - 1, (uint16_t)(trig_y + 1), th->trigger);
+-    lcd_set_pixel(ax - 2, (uint16_t)(trig_y + 2), th->trigger);
+-
+-    /* Dotted horizontal line at trigger level; denser while UP/DOWN are
+-     * adjusting it, so the user can see which control the arrows own. */
+-    for (uint16_t x = 0; x < LCD_WIDTH - 6; x += (scope_trig_level_focus ? 2u : 4u))
+-        lcd_set_pixel(x, (uint16_t)trig_y, th->trigger);
+-
+-    /* Trigger edge indicator (small arrow next to the trigger arrow) */
+-    if (ss->trigger.edge == TRIG_RISING) {
+-        /* Up arrow: rising edge */
+-        lcd_set_pixel(ax - 6, (uint16_t)(trig_y + 2), th->trigger);
+-        lcd_set_pixel(ax - 6, (uint16_t)(trig_y + 1), th->trigger);
+-        lcd_set_pixel(ax - 6, (uint16_t)trig_y,       th->trigger);
+-        lcd_set_pixel(ax - 6, (uint16_t)(trig_y - 1), th->trigger);
+-        lcd_set_pixel(ax - 7, (uint16_t)trig_y,       th->trigger);
+-        lcd_set_pixel(ax - 5, (uint16_t)trig_y,       th->trigger);
+-    } else {
+-        /* Down arrow: falling edge */
+-        lcd_set_pixel(ax - 6, (uint16_t)(trig_y - 2), th->trigger);
+-        lcd_set_pixel(ax - 6, (uint16_t)(trig_y - 1), th->trigger);
+-        lcd_set_pixel(ax - 6, (uint16_t)trig_y,       th->trigger);
+-        lcd_set_pixel(ax - 6, (uint16_t)(trig_y + 1), th->trigger);
+-        lcd_set_pixel(ax - 7, (uint16_t)trig_y,       th->trigger);
+-        lcd_set_pixel(ax - 5, (uint16_t)trig_y,       th->trigger);
++    /* Right-edge marker: filled triangle pointing left, 5 px deep (FNIRSI style). */
++    for (int r = -4; r <= 4; r++) {
++        int w = 5 - (r < 0 ? -r : r);
++        if (w > 0)
++            lcd_fill_rect((uint16_t)(LCD_WIDTH - w), (uint16_t)(trig_y + r), (uint16_t)w, 1, th->trigger);
+     }
++
++    /* Level line only while UP/DOWN are adjusting it (stock shows just the marker). */
++    if (scope_trig_level_focus)
++        for (uint16_t x = 0; x < LCD_WIDTH - 6; x += 2u)
++            lcd_set_pixel(x, (uint16_t)trig_y, th->trigger);
++    (void)ss;
++    return;
++
+ }
+ 
+ /* ═══════════════════════════════════════════════════════════════════
+@@ -266,35 +259,21 @@ static void draw_ground_markers(const scope_state_t *ss, const theme_t *th)
+     /* CH1 ground marker — small right-pointing arrow with "1" */
+     if (ss->ch1.enabled) {
+         int16_t ch1_y = SCOPE_MID_Y - ss->ch1.position;
+-        if (ch1_y >= SCOPE_TOP + 2 && ch1_y <= SCOPE_BOT - 3) {
+-            lcd_set_pixel(0, (uint16_t)ch1_y, th->ch1);
+-            lcd_set_pixel(1, (uint16_t)ch1_y, th->ch1);
+-            lcd_set_pixel(2, (uint16_t)ch1_y, th->ch1);
+-            lcd_set_pixel(3, (uint16_t)ch1_y, th->ch1);
+-            lcd_set_pixel(1, (uint16_t)(ch1_y - 1), th->ch1);
+-            lcd_set_pixel(2, (uint16_t)(ch1_y - 2), th->ch1);
+-            lcd_set_pixel(1, (uint16_t)(ch1_y + 1), th->ch1);
+-            lcd_set_pixel(2, (uint16_t)(ch1_y + 2), th->ch1);
+-            font_draw_string(5, (uint16_t)(ch1_y - 5), "1",
+-                             th->ch1, th->ch1, &font_small);
+-        }
++        if (ch1_y >= SCOPE_TOP + 4 && ch1_y <= SCOPE_BOT - 5)
++            for (int r = -4; r <= 4; r++) {
++                int w = 5 - (r < 0 ? -r : r);
++                lcd_fill_rect(0, (uint16_t)(ch1_y + r), (uint16_t)w, 1, th->ch1);
++            }
+     }
+ 
+     /* CH2 ground marker */
+     if (ss->ch2.enabled) {
+         int16_t ch2_y = SCOPE_MID_Y - ss->ch2.position;
+-        if (ch2_y >= SCOPE_TOP + 2 && ch2_y <= SCOPE_BOT - 3) {
+-            lcd_set_pixel(0, (uint16_t)ch2_y, th->ch2);
+-            lcd_set_pixel(1, (uint16_t)ch2_y, th->ch2);
+-            lcd_set_pixel(2, (uint16_t)ch2_y, th->ch2);
+-            lcd_set_pixel(3, (uint16_t)ch2_y, th->ch2);
+-            lcd_set_pixel(1, (uint16_t)(ch2_y - 1), th->ch2);
+-            lcd_set_pixel(2, (uint16_t)(ch2_y - 2), th->ch2);
+-            lcd_set_pixel(1, (uint16_t)(ch2_y + 1), th->ch2);
+-            lcd_set_pixel(2, (uint16_t)(ch2_y + 2), th->ch2);
+-            font_draw_string(5, (uint16_t)(ch2_y - 5), "2",
+-                             th->ch2, th->ch2, &font_small);
+-        }
++        if (ch2_y >= SCOPE_TOP + 4 && ch2_y <= SCOPE_BOT - 5)
++            for (int r = -4; r <= 4; r++) {
++                int w = 5 - (r < 0 ? -r : r);
++                lcd_fill_rect(0, (uint16_t)(ch2_y + r), (uint16_t)w, 1, th->ch2);
++            }
+     }
+ }
+ 
+@@ -302,6 +281,7 @@ static void draw_ground_markers(const scope_state_t *ss, const theme_t *th)
+  * Trigger status badge
+  * ═══════════════════════════════════════════════════════════════════ */
+ 
++#if 0 /* reskin 2026-10-10: trigger mode / STOP live in the top bar (scope_topbar.c) */
+ static void draw_trigger_status(const scope_state_t *ss, const theme_t *th)
+ {
+     const char *label;
+@@ -345,6 +325,7 @@ static void draw_run_stop(const scope_state_t *ss, const theme_t *th)
+                                 th->text_primary, th->warning, &font_small);
+     }
+ }
++#endif
+ 
+ /* ═══════════════════════════════════════════════════════════════════
+  * Measurement badges
+@@ -482,11 +463,12 @@ static void fmt_volts(char *b, size_t n, float v)
+  *
+  * The compile-time check below is what keeps the volts/div label honest.
+  * SCOPE_CAL_COUNTS_PER_DIV is a claim about THIS renderer's geometry — the
+- * 26-pixel grid pitch against a 206-pixel plot showing 256 counts. If either
++ * GRID_ROW-pixel grid pitch (27 since the 2026-10-10 reskin) against a SCOPE_H-pixel
++ * plot (216) showing 256 counts = exactly 32 counts per division. If either
+  * changes, the label silently starts meaning something else, so make that a
+  * build failure instead.
+  */
+-_Static_assert((26 * 256 + SCOPE_H / 2) / SCOPE_H == (int)SCOPE_CAL_COUNTS_PER_DIV,
++_Static_assert((GRID_ROW * 256 + SCOPE_H / 2) / SCOPE_H == (int)SCOPE_CAL_COUNTS_PER_DIV,
+                "grid pitch no longer matches SCOPE_CAL_COUNTS_PER_DIV — "
+                "the volts/div labels in the status bar would be wrong");
+ 
+@@ -2294,11 +2276,7 @@ void draw_scope_screen(uint32_t frame)
+     /* Layer 7: Cursor lines */
+     draw_cursors();
+ 
+-    /* Layer 8: Trigger status badge */
+-    draw_trigger_status(ss, th);
+-
+-    /* Layer 9: Run/Stop */
+-    draw_run_stop(ss, th);
++    /* Layers 8/9 (trigger status badge, STOP badge) moved to the top bar. */
+ 
+     /* Layer 10: Measurement badges */
+     draw_measurement_badges(ss, th);
+@@ -2306,12 +2284,9 @@ void draw_scope_screen(uint32_t frame)
+     /* Layer 11: Quick-change popup (on top of everything) */
+     draw_popup(th);
+ 
+-    /* Active channel indicator (top-left) */
+-    const char *ch_label = (active_channel == 0) ? "CH1" : "CH2";
+-    uint16_t ch_color = (active_channel == 0) ? th->ch1 : th->ch2;
+-    font_draw_string(4, SCOPE_TOP + 2, ch_label, ch_color, ch_color, &font_small);
++    /* Active channel is shown by the filled chip in the top bar. */
+ 
+-#ifndef EMULATOR_BUILD
++#if !defined(EMULATOR_BUILD) && defined(SCOPE_SPI3_OVERLAY)
+     /* SPI3 acquisition diagnostic — small text overlay top-center.
+      * Shows probing status so we can see FPGA data flow without serial. */
+     {
+@@ -2430,7 +2405,7 @@ void draw_scope_live_frame(void)
+     int16_t trig_y = trigger_marker_y(ss, (ss->trigger.source == TRIG_SRC_CH2) ? &a2 : &a1);
+     if (trig_y < SCOPE_TOP + 2) trig_y = SCOPE_TOP + 2;
+     if (trig_y > SCOPE_BOT - 3) trig_y = SCOPE_BOT - 3;
+-    const uint16_t trig_step = scope_trig_level_focus ? 1u : 3u;   /* dot mask */
++    const uint16_t trig_step = 1u;   /* dot mask; the level line is drawn only while adjusting (reskin) */
+ 
+     int16_t p1 = 0, p2 = 0;  /* previous column's y — vertical continuity */
+ 
+@@ -2517,13 +2492,10 @@ void draw_scope_live_frame(void)
+             else if ((int16_t)y == bl1 || (int16_t)y == bh1 ||
+                      (int16_t)y == bl2 || (int16_t)y == bh2)
+                 c = th->text_secondary;
+-            else if ((int16_t)y == trig_y && (x & trig_step) == 0 && x < LCD_WIDTH - 6)
++            else if (scope_trig_level_focus && (int16_t)y == trig_y && (x & trig_step) == 0 && x < LCD_WIDTH - 6)
+                 c = th->trigger;
+-            else if (y == SCOPE_MID_Y || x == LCD_WIDTH / 2)
+-                c = th->grid_center;
+-            else if (((x & 31u) == 0 && (y & 1u) == 0) ||
+-                     (((y - SCOPE_TOP) % 26u) == 0 && (x & 1u) == 0))
+-                c = th->grid;
++            else if (scope_grid_pixel(x, y, &c, th))
++                ;                                   /* graticule, shared rule */
+             else
+                 c = th->background;
+             lcd_write_data(c);
+diff --git a/firmware/src/ui/status_bar.c b/firmware/src/ui/status_bar.c
+index 4a9ecad..3e3006c 100644
+--- a/firmware/src/ui/status_bar.c
++++ b/firmware/src/ui/status_bar.c
+@@ -10,6 +10,7 @@
+ #include "scope_cal.h"
+ #include "scope_timebase.h"
+ #include "battery.h"
++#include "scope_topbar.h"
+ #include "at32f403a_407.h"
+ #include <stdio.h>
+ 
+@@ -17,10 +18,25 @@
+ static uint8_t status_bar_drawn = 0;
+ 
+ /* Draw the top status bar */
++static void battery_critical_shutdown(const theme_t *th);
++
+ void draw_status_bar(void)
+ {
+     const theme_t *th = theme_get();
+ 
++    /* Scope screen: the FNIRSI-style bar (scope_topbar.c) owns the whole strip.
++     * Full repaint on invalidate, battery icon only on the 1 s tick. */
++    if (current_mode == MODE_OSCILLOSCOPE) {
++        if (!status_bar_drawn) {
++            scope_topbar_draw();
++            status_bar_drawn = 1;
++        } else {
++            scope_topbar_draw_battery();
++        }
++        battery_critical_shutdown(th);
++        return;
++    }
++
+     /* Full clear only on first draw or mode change */
+     if (!status_bar_drawn) {
+         lcd_fill_rect(0, 0, LCD_WIDTH, 16, th->status_bar_bg);
+@@ -58,7 +74,12 @@ void draw_status_bar(void)
+         }
+     }
+ 
+-    /* Auto-shutdown at critical battery — protect the LiPo cell */
++    battery_critical_shutdown(th);
++}
++
++/* Auto-shutdown at critical battery — protect the LiPo cell */
++static void battery_critical_shutdown(const theme_t *th)
++{
+     if (battery_is_critical()) {
+         static uint8_t shutdown_timer = 0;
+         shutdown_timer++;
+@@ -91,6 +112,17 @@ void draw_info_bar(void)
+         meter_softkeys_draw();
+         return;
+     }
++    /* Scope time view: no bottom bar — the graticule runs to the bottom and the
++     * channel/timebase/trigger readouts live in the top bar (reskin 2026-10-10). */
++    if (current_mode == MODE_OSCILLOSCOPE
++#ifdef FEATURE_FFT
++        && scope_view == SCOPE_VIEW_TIME
++#endif
++       ) {
++        scope_topbar_draw();
++        lcd_fill_rect(0, LCD_HEIGHT - 6, LCD_WIDTH, 6, th->background);
++        return;
++    }
+     lcd_fill_rect(0, LCD_HEIGHT - 16, LCD_WIDTH, 16, th->status_bar_bg);
+ 
+     uint16_t ib = th->status_bar_bg;
+diff --git a/firmware/src/ui/theme.c b/firmware/src/ui/theme.c
+index 39f81d4..8b229a8 100644
+--- a/firmware/src/ui/theme.c
++++ b/firmware/src/ui/theme.c
+@@ -10,6 +10,24 @@
+ static theme_id_t current_theme_id;
+ 
+ static const theme_t themes[THEME_COUNT] = {
++    /* THEME_FNIRSI — colours sampled from a stock 2C53P screenshot
++     * (samples/bmp/1.png in the fnirsi-2c53-remote repo, 2026-10-10). */
++    {
++        .background      = 0x0000, /* black */
++        .grid            = 0x7449, /* olive dots (112,136,72) */
++        .grid_center     = 0x7449, /* centre cross: same olive, denser + ticks */
++        .ch1             = 0x3F5F, /* cyan chip + trace */
++        .ch2             = 0x0A9F, /* blue chip + trace */
++        .trigger         = 0xFD40, /* orange marker */
++        .text_primary    = 0xFFFF, /* white */
++        .text_secondary  = 0x8410, /* gray */
++        .status_bar_bg   = 0x10C2, /* near-black olive bar */
++        .menu_selected_bg = 0x2945,/* selected blue-gray */
++        .highlight       = 0xFD40, /* orange (trigger text) */
++        .warning         = 0xF800, /* red */
++        .success         = 0x0FC2, /* FNIRSI green (H chip, battery) */
++        .name            = "FNIRSI",
++    },
+     /* THEME_DARK_BLUE — original FNIRSI default */
+     {
+         .background      = 0x0000, /* black */
+@@ -83,14 +101,14 @@ static const theme_t themes[THEME_COUNT] = {
+ void theme_init(theme_id_t id)
+ {
+     if (id >= THEME_COUNT)
+-        id = THEME_DARK_BLUE;
++        id = THEME_FNIRSI;
+     current_theme_id = id;
+ }
+ 
+ void theme_set(theme_id_t id)
+ {
+     if (id >= THEME_COUNT)
+-        id = THEME_DARK_BLUE;
++        id = THEME_FNIRSI;
+     current_theme_id = id;
+ }
+ 
+diff --git a/firmware/src/ui/theme.h b/firmware/src/ui/theme.h
+index 669e6c4..3260b61 100644
+--- a/firmware/src/ui/theme.h
++++ b/firmware/src/ui/theme.h
+@@ -11,7 +11,10 @@
+ #include <stdint.h>
+ 
+ typedef enum {
+-    THEME_DARK_BLUE = 0,    /* Current default */
++    THEME_FNIRSI = 0,       /* Default (reskin 2026-10-10): stock FNIRSI look — olive graticule,
++                             * cyan/blue chips, orange trigger. Index 0 on purpose: the settings
++                             * store persists the theme index, and units that never chose one hold 0. */
++    THEME_DARK_BLUE,        /* OpenScope's original default */
+     THEME_CLASSIC_GREEN,    /* Tektronix-style green on black */
+     THEME_HIGH_CONTRAST,    /* White background, dark traces */
+     THEME_NIGHT_RED,        /* Red on black for dark environments */
+diff --git a/firmware/src/util/settings_store.c b/firmware/src/util/settings_store.c
+index 7de06db..a6e4a6a 100644
+--- a/firmware/src/util/settings_store.c
++++ b/firmware/src/util/settings_store.c
+@@ -124,7 +124,7 @@ void settings_store_apply(const device_config_t *cfg)
+                                                       TRIG_SRC_CH1);
+     ss->trigger.level   = clamp_level(cfg->scope_trigger_level);
+ 
+-    theme_set((theme_id_t)clamp_idx(cfg->theme, THEME_COUNT, THEME_DARK_BLUE));
++    theme_set((theme_id_t)clamp_idx(cfg->theme, THEME_COUNT, THEME_FNIRSI));
+ 
+     math_enabled = (cfg->math_enabled != 0u);
+     math_op      = clamp_idx(cfg->math_op, MATH_COUNT, 0);

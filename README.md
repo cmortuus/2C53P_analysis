@@ -18,7 +18,7 @@ Start with [`HANDOFF.md`](HANDOFF.md) (status, decisions, every finding) and
 | `host/t_scope.py` | 2C53T streamer/CLI (USB or `--tcp scope-pi.local:7001`): CSV, plot, set commands |
 | `host/t_calcheck.py` | calibration sweep against a known generator signal via the viewer API |
 | `host/t_calbackup.py` | reads the 2C53T calibration page over the shell and verifies its CRC |
-| `patches/openscope-2c53t-scope-dumpbin.patch` | firmware change (GPL-3, applies to OpenScope-2C53T commit 2eae008) |
+| `patches/openscope-2c53t-dumpbin+ui-fnirsi.patch` | firmware changes (GPL-3, apply to OpenScope-2C53T commit 2eae008): `scope dumpbin` streaming + stock-FNIRSI-look UI reskin. `openscope-2c53t-scope-dumpbin.patch` = streaming only |
 | `firmware_builds/` | the exact images flashed (GPL-3 binaries; source = upstream commit + patch) |
 | `cal_backup_2c53t/` | this unit's factory calibration page backup (restore before any return) |
 | `tools/`, `tools/ghidra/` | 2C53P static-analysis helpers (Ghidra headless scripts, xref/diff tools, `.bin` decoder) |

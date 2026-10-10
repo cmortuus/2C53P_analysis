@@ -7,8 +7,8 @@
 <style>
   :root {
     --bg: #000; --panel: #111418; --panel2: #1a1e24; --line: #2a3038; --text: #e6e9ee; --dim: #8a93a0;
-    --ch1: #ffd21f; --ch2: #22d3ee; --accent: #3b82f6; --run: #22c55e; --stop: #ef4444; --warn: #f59e0b;
-    --grid: rgba(150,160,175,.32); --grid-strong: rgba(170,180,195,.55);
+    --ch1: #38e8f8; --ch2: #4a8cff; --accent: #3b82f6; --run: #22c55e; --stop: #ef4444; --warn: #f8a800;
+    --grid: rgba(112,136,72,.75); --grid-strong: rgba(140,170,90,.9);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--text);
@@ -26,7 +26,7 @@
   .chip.ch2 .tag { background: var(--ch2); } .chip.ch2 .val { color: var(--ch2); }
   .chip.off { opacity: .45; }
   .chip.h .tag { background: #3a414b; color: #fff; }
-  .chip.trig .val { color: #ffb020; }
+  .chip.trig .val { color: #f8a800; }
   .spacer { flex: 1; }
   .pill { height: 30px; min-width: 64px; border-radius: 15px; border: 0; font-weight: 700; color: #fff; cursor: pointer; padding: 0 14px; }
   .pill.run { background: var(--run); } .pill.stop { background: var(--stop); }
@@ -67,7 +67,7 @@
       <div class="chip ch1" id="chip1"><span class="tag">CH1</span><span class="val" id="s1">—</span></div>
       <div class="chip ch2" id="chip2"><span class="tag">CH2</span><span class="val" id="s2">—</span></div>
       <div class="chip h"><span class="tag">H</span><span class="val" id="sh">—</span></div>
-      <div class="chip trig"><span class="tag" style="background:#ffb020">T</span><span class="val" id="st">—</span></div>
+      <div class="chip trig"><span class="tag" style="background:#f8a800">T</span><span class="val" id="st">—</span></div>
       <div class="spacer"></div>
       <div class="link"><span class="dot" id="dot"></span><span id="fps">offline</span></div>
       <button class="pill run" id="runbtn">RUN</button>
@@ -193,17 +193,17 @@ const DIVX = 10, DIVY = 8;
 function grid() {
   const W = cv.width, H = cv.height, dx = W / DIVX, dy = H / DIVY;
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-  ctx.strokeStyle = 'rgba(150,160,175,.30)'; ctx.lineWidth = 1; ctx.setLineDash([2, 6]);
+  ctx.strokeStyle = 'rgba(112,136,72,.8)'; ctx.lineWidth = 1; ctx.setLineDash([2, 6]);
   ctx.beginPath();
   for (let i = 1; i < DIVX; i++) { ctx.moveTo(i * dx + .5, 0); ctx.lineTo(i * dx + .5, H); }
   for (let j = 1; j < DIVY; j++) { ctx.moveTo(0, j * dy + .5); ctx.lineTo(W, j * dy + .5); }
   ctx.stroke(); ctx.setLineDash([]);
-  ctx.strokeStyle = 'rgba(170,180,195,.55)'; ctx.beginPath();
+  ctx.strokeStyle = 'rgba(140,170,90,.9)'; ctx.setLineDash([2, 2]); ctx.beginPath();
   ctx.moveTo(W / 2 + .5, 0); ctx.lineTo(W / 2 + .5, H); ctx.moveTo(0, H / 2 + .5); ctx.lineTo(W, H / 2 + .5);
   for (let i = 0; i <= DIVX * 5; i++) { const x = i * dx / 5 + .5; ctx.moveTo(x, H / 2 - 4); ctx.lineTo(x, H / 2 + 4); }
   for (let j = 0; j <= DIVY * 5; j++) { const y = j * dy / 5 + .5; ctx.moveTo(W / 2 - 4, y); ctx.lineTo(W / 2 + 4, y); }
-  ctx.stroke();
-  ctx.strokeStyle = '#3a414b'; ctx.strokeRect(.5, .5, W - 1, H - 1);
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.strokeStyle = 'rgba(112,136,72,.8)'; ctx.setLineDash([2, 6]); ctx.strokeRect(.5, .5, W - 1, H - 1); ctx.setLineDash([]);
 }
 function trace(bytes, color, spd) {
   const W = cv.width, H = cv.height, n = bytes.length;
@@ -224,7 +224,7 @@ function draw() {
   const H = cv.height, W = cv.width;
   for (const [c, on] of [[COL.ch1, frame.hdr.en1], [COL.ch2, frame.hdr.en2]]) if (on) {
     ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(0, H / 2 - 7); ctx.lineTo(10, H / 2); ctx.lineTo(0, H / 2 + 7); ctx.fill(); }
-  if (frame.hdr.ordered) { ctx.fillStyle = '#ffb020'; ctx.beginPath(); ctx.moveTo(W / 2 - 7, 0); ctx.lineTo(W / 2 + 7, 0); ctx.lineTo(W / 2, 10); ctx.fill(); }
+  if (frame.hdr.ordered) { ctx.fillStyle = '#f8a800'; ctx.beginPath(); ctx.moveTo(W / 2 - 7, 0); ctx.lineTo(W / 2 + 7, 0); ctx.lineTo(W / 2, 10); ctx.fill(); }
   const sdiv = frame.rate ? spd / frame.rate : null;
   $('ov').textContent = (frame.rate ? (frame.rate / 1e3).toFixed(1) + ' kS/s · ' : '') + (frame.hdr.ordered ? 'triggered' : 'free-run') +
     ' · gen ' + frame.hdr.gen + (frame.hdr.ready ? '' : ' · DEMO (no real samples yet)');
