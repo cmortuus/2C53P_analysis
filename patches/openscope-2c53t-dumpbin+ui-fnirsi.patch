@@ -453,7 +453,7 @@ index 0000000..539ebc3
 +
 +#endif /* SCOPE_TOPBAR_H */
 diff --git a/firmware/src/ui/scope_ui.c b/firmware/src/ui/scope_ui.c
-index 35b4903..42e5b0a 100644
+index 35b4903..d520802 100644
 --- a/firmware/src/ui/scope_ui.c
 +++ b/firmware/src/ui/scope_ui.c
 @@ -43,7 +43,9 @@
@@ -499,8 +499,7 @@ index 35b4903..42e5b0a 100644
  {
      const theme_t *th = theme_get();
 -    uint16_t x, y;
-+    uint16_t c;
- 
+-
 -    /* Vertical grid lines (dotted) */
 -    for (x = 0; x < LCD_WIDTH; x += 32) {
 -        for (y = SCOPE_TOP; y < SCOPE_BOT; y += 2)
@@ -511,7 +510,8 @@ index 35b4903..42e5b0a 100644
 -        for (x = 0; x < LCD_WIDTH; x += 2)
 -            lcd_set_pixel(x, y, th->grid);
 -    }
--
++    uint16_t c;
+ 
 -    /* Center crosshair (solid) */
 -    for (x = 0; x < LCD_WIDTH; x++)
 -        lcd_set_pixel(x, SCOPE_MID_Y, th->grid_center);
@@ -749,7 +749,7 @@ index 35b4903..42e5b0a 100644
      int     h, span;
      uint8_t mn;
  } autofit_t;
-@@ -896,17 +841,35 @@ static void autofit_prep(autofit_t *a, const volatile uint8_t *buf,
+@@ -896,17 +841,37 @@ static void autofit_prep(autofit_t *a, const volatile uint8_t *buf,
      int h = (int)(y_bot - y_top) - 3;       /* usable height, small margin */
      if (h < 4) h = 4;
  
@@ -780,7 +780,9 @@ index 35b4903..42e5b0a 100644
 +            a->mn     = 0;
 +            a->span   = 256;
 +            a->h      = (int)(y_bot - y_top);
-+            a->y_base = y_bot;
++            /* code 128 on the band centre, shifted by the channel's position
++             * (positive = up), exactly as draw_channel_fixed() does */
++            a->y_base = (int16_t)(y_bot - (mask_ch == 1 ? ss->ch2.position : ss->ch1.position));
 +        }
 +    }
  }
@@ -792,7 +794,16 @@ index 35b4903..42e5b0a 100644
      if (yy < a->y_top) yy = a->y_top;
      if (yy >= a->y_bot) yy = a->y_bot - 1;
      return (int16_t)yy;
-@@ -1105,6 +1068,7 @@ static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
+@@ -1006,7 +971,7 @@ static int16_t trigger_marker_y_full(const scope_state_t *ss)
+     const bool c1 = ss->ch1.enabled, c2 = ss->ch2.enabled;
+     const volatile uint8_t *src = src2 ? b2 : b1;
+     uint16_t toff = scope_soft_trigger_offset(ss, src);
+-    autofit_t a = { false, 0, 0, 0, 8, 0 };
++    autofit_t a = { false, 0, 0, 0, 0, 8, 0 };
+     if (c1 && c2)
+         autofit_prep(&a, src + toff, src2 ? (int16_t)(SCOPE_MID_Y + 1) : (int16_t)SCOPE_TOP,
+                                      src2 ? (int16_t)SCOPE_BOT : (int16_t)(SCOPE_MID_Y - 1),
+@@ -1105,6 +1070,7 @@ static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
      const uint16_t fail_c = theme_get()->warning;
      const uint16_t bnd_c  = theme_get()->text_secondary;
      int16_t prev_y = -1;
@@ -800,7 +811,7 @@ index 35b4903..42e5b0a 100644
      for (uint16_t x = 0; x < n; x++) {
          int16_t y = autofit_y(&a, buf[x]);
          uint16_t cc = mask_px_fail(mask_ch, x) ? fail_c : color;
-@@ -1117,9 +1081,13 @@ static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
+@@ -1117,9 +1083,13 @@ static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
          if (prev_y >= 0) {                  /* connect prev..cur vertically */
              int16_t a = prev_y < y ? prev_y : y;
              int16_t b = prev_y < y ? y : prev_y;
@@ -814,7 +825,14 @@ index 35b4903..42e5b0a 100644
              lcd_set_pixel(x, (uint16_t)y, cc);
          }
          prev_y = y;
-@@ -1155,6 +1123,7 @@ static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
+@@ -1152,9 +1122,14 @@ static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
+ {
+     uint16_t n = (LCD_WIDTH < 512u) ? (uint16_t)LCD_WIDTH : 512u;
+     int16_t  y_mid = (int16_t)((y_top + y_bot) / 2);
++    {   /* vertical position (reskin): positive moves the trace up, like the marker */
++        const scope_state_t *ps = scope_state_get();
++        y_mid = (int16_t)(y_mid - (mask_ch == 1 ? ps->ch2.position : ps->ch1.position));
++    }
      const uint16_t fail_c = theme_get()->warning;
  
      int16_t prev_y = -1;
@@ -822,7 +840,7 @@ index 35b4903..42e5b0a 100644
      for (uint16_t x = 0; x < n; x++) {
          int yy = (int)y_mid - ((int)buf[x] - (int)center) * SCOPE_H / 256;
          if (yy < y_top)   yy = y_top;
-@@ -1174,9 +1143,13 @@ static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
+@@ -1174,9 +1149,13 @@ static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
          if (prev_y >= 0) {
              int16_t a = prev_y < y ? prev_y : y;
              int16_t b = prev_y < y ? y : prev_y;
@@ -836,7 +854,42 @@ index 35b4903..42e5b0a 100644
              lcd_set_pixel(x, (uint16_t)y, cc);
          }
          prev_y = y;
-@@ -2294,11 +2267,7 @@ void draw_scope_screen(uint32_t frame)
+@@ -1389,21 +1368,25 @@ void draw_demo_waveform(uint32_t frame)
+ 
+         /* Whatever transform each band ends up drawn with is recorded for the
+          * cursor readout — see vband_note(). */
+-        if (c1 && c2) {
++        /* Reskin: in true-scale mode both channels share the full grid (stock
++         * behaviour), each shifted by its own vertical position; the top/bottom
++         * split is autofit-only. */
++        if (c1 && c2 && !ss->true_scale) {
+             vband_note(0u, 1u, ss->ch1.vdiv_idx, SCOPE_TOP, SCOPE_MID_Y - 1,
+                        fx1 ? draw_channel_fixed(b1, th->ch1, SCOPE_TOP, SCOPE_MID_Y - 1, 128u, 0)
+                            : draw_channel_autofit(b1, th->ch1, SCOPE_TOP, SCOPE_MID_Y - 1, 0));
+             vband_note(1u, 2u, ss->ch2.vdiv_idx, SCOPE_MID_Y + 1, SCOPE_BOT,
+                        fx2 ? draw_channel_fixed(b2, th->ch2, SCOPE_MID_Y + 1, SCOPE_BOT, 128u, 1)
+                            : draw_channel_autofit(b2, th->ch2, SCOPE_MID_Y + 1, SCOPE_BOT, 1));
+-        } else if (c1) {
+-            vband_note(0u, 1u, ss->ch1.vdiv_idx, SCOPE_TOP, SCOPE_BOT,
+-                       fx1 ? draw_channel_fixed(b1, th->ch1, SCOPE_TOP, SCOPE_BOT, 128u, 0)
+-                           : draw_channel_autofit(b1, th->ch1, SCOPE_TOP, SCOPE_BOT, 0));
+-        } else if (c2) {
+-            vband_note(0u, 2u, ss->ch2.vdiv_idx, SCOPE_TOP, SCOPE_BOT,
+-                       fx2 ? draw_channel_fixed(b2, th->ch2, SCOPE_TOP, SCOPE_BOT, 128u, 1)
+-                           : draw_channel_autofit(b2, th->ch2, SCOPE_TOP, SCOPE_BOT, 1));
++        } else {
++            if (c1)
++                vband_note(0u, 1u, ss->ch1.vdiv_idx, SCOPE_TOP, SCOPE_BOT,
++                           fx1 ? draw_channel_fixed(b1, th->ch1, SCOPE_TOP, SCOPE_BOT, 128u, 0)
++                               : draw_channel_autofit(b1, th->ch1, SCOPE_TOP, SCOPE_BOT, 0));
++            if (c2)
++                vband_note(c1 ? 1u : 0u, 2u, ss->ch2.vdiv_idx, SCOPE_TOP, SCOPE_BOT,
++                           fx2 ? draw_channel_fixed(b2, th->ch2, SCOPE_TOP, SCOPE_BOT, 128u, 1)
++                               : draw_channel_autofit(b2, th->ch2, SCOPE_TOP, SCOPE_BOT, 1));
+         }
+         return;
+     }
+@@ -2294,11 +2277,7 @@ void draw_scope_screen(uint32_t frame)
      /* Layer 7: Cursor lines */
      draw_cursors();
  
@@ -849,7 +902,7 @@ index 35b4903..42e5b0a 100644
  
      /* Layer 10: Measurement badges */
      draw_measurement_badges(ss, th);
-@@ -2306,12 +2275,9 @@ void draw_scope_screen(uint32_t frame)
+@@ -2306,12 +2285,9 @@ void draw_scope_screen(uint32_t frame)
      /* Layer 11: Quick-change popup (on top of everything) */
      draw_popup(th);
  
@@ -864,7 +917,7 @@ index 35b4903..42e5b0a 100644
      /* SPI3 acquisition diagnostic — small text overlay top-center.
       * Shows probing status so we can see FPGA data flow without serial. */
      {
-@@ -2396,7 +2362,7 @@ void draw_scope_live_frame(void)
+@@ -2396,7 +2372,7 @@ void draw_scope_live_frame(void)
       * That was the second occlusion bug in a row here: first the debug strip
       * painted over the badges, then moving the badges up put them inside the
       * live band. Anchor to the badges and both cases are covered. */
@@ -873,7 +926,29 @@ index 35b4903..42e5b0a 100644
      const uint16_t band_h = band_bot - SCOPE_TOP;
      (void)band_h;
  
-@@ -2430,7 +2396,7 @@ void draw_scope_live_frame(void)
+@@ -2414,15 +2390,14 @@ void draw_scope_live_frame(void)
+     const bool en1 = ss->ch1.enabled;
+     const bool en2 = ss->ch2.enabled;
+ 
+-    autofit_t a1 = { false, 0, 0, 0, 8, 0 };
+-    autofit_t a2 = { false, 0, 0, 0, 8, 0 };
+-    if (en1 && en2) {
++    autofit_t a1 = { false, 0, 0, 0, 0, 8, 0 };
++    autofit_t a2 = { false, 0, 0, 0, 0, 8, 0 };
++    if (en1 && en2 && !ss->true_scale) {          /* autofit-only split (see full path) */
+         autofit_prep(&a1, b1, SCOPE_TOP, SCOPE_MID_Y - 1, 0);
+         autofit_prep(&a2, b2, SCOPE_MID_Y + 1, SCOPE_BOT, 1);
+-    } else if (en1) {
+-        autofit_prep(&a1, b1, SCOPE_TOP, SCOPE_BOT, 0);
+-    } else if (en2) {
+-        autofit_prep(&a2, b2, SCOPE_TOP, SCOPE_BOT, 1);
++    } else {
++        if (en1) autofit_prep(&a1, b1, SCOPE_TOP, SCOPE_BOT, 0);
++        if (en2) autofit_prep(&a2, b2, SCOPE_TOP, SCOPE_BOT, 1);
+     }
+ 
+     /* Trigger dotted line, placed exactly as the full path places it: on the
+@@ -2430,7 +2405,7 @@ void draw_scope_live_frame(void)
      int16_t trig_y = trigger_marker_y(ss, (ss->trigger.source == TRIG_SRC_CH2) ? &a2 : &a1);
      if (trig_y < SCOPE_TOP + 2) trig_y = SCOPE_TOP + 2;
      if (trig_y > SCOPE_BOT - 3) trig_y = SCOPE_BOT - 3;
@@ -882,7 +957,7 @@ index 35b4903..42e5b0a 100644
  
      int16_t p1 = 0, p2 = 0;  /* previous column's y — vertical continuity */
  
-@@ -2466,6 +2432,8 @@ void draw_scope_live_frame(void)
+@@ -2466,6 +2441,8 @@ void draw_scope_live_frame(void)
          uint16_t mstrip = mask_strip_color((int)x, th, &mdot);
          uint16_t tc1 = mask_px_fail(0, (int)x) ? th->warning : th->ch1;
          uint16_t tc2 = mask_px_fail(1, (int)x) ? th->warning : th->ch2;
@@ -891,7 +966,7 @@ index 35b4903..42e5b0a 100644
          /* Mask bounds (dotted, every other column), through each band's own
           * autofit -- the one transform, as everywhere else. -1 = none. */
          int16_t bl1 = -1, bh1 = -1, bl2 = -1, bh2 = -1;
-@@ -2514,16 +2482,17 @@ void draw_scope_live_frame(void)
+@@ -2514,16 +2491,17 @@ void draw_scope_live_frame(void)
                  c = tc2;
              else if (a1.on && (int16_t)y >= lo1 && (int16_t)y <= hi1)
                  c = tc1;
