@@ -33,7 +33,12 @@ Installs `python3-serial` + `mtools`, copies to `/opt/scope`, enables `scope-ser
 (replaces the old `scope-bridge` socat unit). Logs: `journalctl -u scope-server -f`.
 
 ## Flashing firmware from the Pi
-The scope's USB is on the Pi, so the IAP flash runs there (mtools present, passwordless sudo):
+**No hands needed (proven 2026-10-10):** `sudo bash /home/pi/remote_flash.sh <image.bin>` stages the
+image over the shell (`fwload`, CRC-checked, ~95 s) and installs it (`fwswap b`, RAM installer +
+system reset), then re-authorises the USB device and restarts the viewer. Only run it FROM a
+firmware that OpenScope's `scripts/test_ramfunc_isolated.py --check-bin` reports ok.
+
+**Fallback (needs someone at the scope):** IAP flash with the scope in upgrade mode:
 ```bash
 scp firmware_builds/<image>.bin third_party/OpenScope-2C53T/scripts/iap_flash.py pi@scope-pi.local:
 ssh pi@scope-pi.local 'sudo systemctl stop scope-server'

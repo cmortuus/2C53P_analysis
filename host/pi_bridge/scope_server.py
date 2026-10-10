@@ -15,7 +15,7 @@ Owns the scope's USB CDC shell and serves:
 
 Only the standard library + pyserial. Run:  python3 scope_server.py [--http 8080] [--tcp 7001]
 """
-import argparse, base64, glob, json, math, os, re, socket, socketserver, threading, time, zlib
+import argparse, base64, glob, json, math, os, re, socket, socketserver, subprocess, threading, time, zlib
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 import serial
@@ -79,10 +79,20 @@ class Scope:
             self.ser.write(b"\r")
             self._read_until_prompt(1.0)
             log("connected", port)
+            self.open_failures = 0
             return True
         except (serial.SerialException, OSError) as e:
             log("open failed:", e)
             self.ser = None
+            # After the scope resets (firmware install, pinhole reset) the Pi's cdc_acm can
+            # keep a stale port: opens succeed but every write times out. Re-authorising the
+            # USB device re-enumerates it; proven to clear the state (2026-10-10).
+            self.open_failures = getattr(self, "open_failures", 0) + 1
+            if "timeout" in str(e).lower() and self.open_failures % 3 == 0:
+                log("re-authorising USB device 1-1")
+                subprocess.call(["sudo", "sh", "-c",
+                                 "D=$(readlink -f /sys/bus/usb/devices/1-1); echo 0 > $D/authorized; sleep 2; echo 1 > $D/authorized"],
+                                timeout=20)
             return False
 
     def drop(self, why):
