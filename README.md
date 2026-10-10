@@ -21,7 +21,7 @@ Start with [`HANDOFF.md`](HANDOFF.md) (status, decisions, every finding) and
 | `patches/openscope-2c53t-scope-dumpbin.patch` | firmware change (GPL-3, applies to OpenScope-2C53T commit 2eae008) |
 | `firmware_builds/` | the exact images flashed (GPL-3 binaries; source = upstream commit + patch) |
 | `cal_backup_2c53t/` | this unit's factory calibration page backup (restore before any return) |
-| `tools/`, `ghidra/*.java` | 2C53P static-analysis helpers (Ghidra headless scripts, xref/diff tools, `.bin` decoder) |
+| `tools/`, `tools/ghidra/` | 2C53P static-analysis helpers (Ghidra headless scripts, xref/diff tools, `.bin` decoder) |
 | `host/fnirsi_uart0.py`, `host/pi_server.py`, `host/client.py` | 2C53P UART0 factory-protocol tools (unused since the 2C53T pivot) |
 | `esp32_bridge/` | optional ESP32-S3 USB-host↔WiFi transparent bridge (ESP-IDF; built, untested on hardware) |
 | `samples/` | saved waveforms/screens from both scopes |

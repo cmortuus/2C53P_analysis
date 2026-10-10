@@ -5,10 +5,7 @@ samples/pi_logs/
 # --- third-party / downloaded / generated (rebuild from HANDOFF.md instructions) ---
 downloads/
 third_party/
-ghidra/*
-!ghidra/*.java
-!ghidra/*.sh
-!ghidra/README*
+/ghidra/
 .venv/
 __pycache__/
 *.pyc
