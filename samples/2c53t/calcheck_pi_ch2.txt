@@ -1,0 +1,16 @@
+
+Horizontal (freq 1000 Hz expected)
+code   s/div        tier       meas Hz      err %      n
+0x0D   0.000259     provisional 999.68       -0.03      7
+0x0E   0.000641     measured   998.6        -0.14      7
+0x0F   0.00128      measured   1000.2       +0.02      7
+0x10   0.00256      measured   1000.2       +0.02      7
+
+Vertical CH2 (Vpp 3.3 expected, probe x1)
+rng   V/div        tier         meas Vpp     err %      clipped
+8     7.16         provisional  3.293        -0.21      
+7     2.68         measured     3.083        -6.56      
+6     1.33         measured     3.07         -6.97      
+5     0.671        measured     2.218        -32.80     YES
+
+restored timebase 0x0E, CH2 range 5

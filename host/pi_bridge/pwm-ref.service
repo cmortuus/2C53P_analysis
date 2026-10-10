@@ -5,8 +5,9 @@ After=sysinit.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'C=/sys/class/pwm/pwmchip0; [ -d $C/pwm0 ] || echo 0 > $C/export; sleep 0.3; echo 0 > $C/pwm0/duty_cycle; echo 1000000 > $C/pwm0/period; echo 500000 > $C/pwm0/duty_cycle; echo 1 > $C/pwm0/enable'
+ExecStart=/bin/sh -c 'pinctrl set 18 a5 2>/dev/null; C=/sys/class/pwm/pwmchip0; [ -d $C/pwm0 ] || echo 0 > $C/export; sleep 0.3; echo 0 > $C/pwm0/duty_cycle; echo 1000000 > $C/pwm0/period; echo 500000 > $C/pwm0/duty_cycle; echo 1 > $C/pwm0/enable'
 ExecStop=/bin/sh -c 'echo 0 > /sys/class/pwm/pwmchip0/pwm0/enable'
+# pinctrl: GPIO18 must be in ALT5 (PWM0); a `pinctrl set 18 op` for a DC-level test leaves it a plain output
 
 [Install]
 WantedBy=multi-user.target
