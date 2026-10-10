@@ -1,0 +1,12 @@
+[Unit]
+Description=1 kHz 50% hardware PWM reference on GPIO18 (header pin 12) for scope calibration
+After=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'C=/sys/class/pwm/pwmchip0; [ -d $C/pwm0 ] || echo 0 > $C/export; sleep 0.3; echo 0 > $C/pwm0/duty_cycle; echo 1000000 > $C/pwm0/period; echo 500000 > $C/pwm0/duty_cycle; echo 1 > $C/pwm0/enable'
+ExecStop=/bin/sh -c 'echo 0 > /sys/class/pwm/pwmchip0/pwm0/enable'
+
+[Install]
+WantedBy=multi-user.target

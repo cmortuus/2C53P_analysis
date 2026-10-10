@@ -8,11 +8,13 @@ apt-get update -qq && apt-get install -y -qq python3-serial mtools
 install -d /opt/scope/web
 install -m 644 "$HERE/scope_server.py" /opt/scope/
 install -m 644 "$HERE/web/index.html" /opt/scope/web/
-install -m 644 "$HERE/scope-server.service" /etc/systemd/system/
+install -m 644 "$HERE/scope-server.service" "$HERE/pwm-ref.service" /etc/systemd/system/
+grep -q "dtoverlay=pwm,pin=18" /boot/firmware/config.txt || printf "\n# hardware PWM reference on GPIO18 for calibration checks\ndtoverlay=pwm,pin=18,func=2\n" >> /boot/firmware/config.txt
 usermod -aG dialout pi 2>/dev/null || true
 systemctl disable --now scope-bridge 2>/dev/null || true
 systemctl daemon-reload
 systemctl enable --now scope-server
+systemctl enable --now pwm-ref 2>/dev/null || echo "pwm-ref: needs the dtoverlay (reboot once)"
 systemctl restart scope-server
 sleep 2
 systemctl --no-pager status scope-server | head -5
