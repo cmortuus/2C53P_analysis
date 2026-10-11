@@ -116,6 +116,8 @@
         <button class="b" id="png">Save PNG</button>
         <button class="b" id="csv">Save CSV</button>
         <button class="b" id="shot" style="grid-column: 1 / -1">Device screen</button>
+        <button class="b" id="autoset" title="scope AUTO button">Autoset</button>
+        <button class="b" id="center" title="fpga scope center: servo the offset DAC so 0 V sits on the centre line">Centre baseline</button>
       </div>
       <div class="hint">Device screen = the scope's own LCD, fetched over the shell (16-colour copy; the olive grid shows gray). The trigger is parked in Single for the capture and restored.</div>
     </div>
@@ -189,6 +191,8 @@ function setRunBtn() { const b = $('runbtn'); b.textContent = running ? 'RUN' : 
 $('runbtn').onclick = async () => { running = !running; setRunBtn(); await api('/api/run', { run: running }); };
 $('csv').onclick = () => { location.href = '/api/frame.csv'; };
 $('shot').onclick = () => { window.open('/api/screen.png?scale=2&t=' + Date.now(), '_blank'); };
+$('autoset').onclick = () => sh('btn auto');
+$('center').onclick = () => sh('fpga scope center');
 $('png').onclick = () => { const a = document.createElement('a'); a.download = 'scope_' + new Date().toISOString().replace(/[:.]/g, '-') + '.png'; a.href = cv.toDataURL('image/png'); a.click(); };
 
 // ---------- drawing ----------
