@@ -82,6 +82,10 @@
       <span class="link" id="scrublabel" style="padding:0; min-width:120px; text-align:right"></span>
     </div>
     <div class="link" id="curread" style="padding:6px 2px 0; display:none"></div>
+    <div class="screen" id="specbox" style="display:none; margin-top:8px">
+      <canvas id="spec" width="1000" height="300" style="aspect-ratio: 10 / 3"></canvas>
+      <div class="overlay" id="specov"></div>
+    </div>
   </div>
 
   <div class="side">
@@ -116,6 +120,7 @@
       </div>
       <div class="row" style="margin-top:8px"><label>V cursors on</label><select id="curCh"><option value="1">CH1</option><option value="2">CH2</option></select></div>
       <div class="row"><label>Persist</label><div class="toggles"><label><input type="checkbox" id="persist"> trails</label></div></div>
+      <div class="row"><label>Spectrum</label><div class="toggles"><label><input type="checkbox" id="specon"> FFT of <select id="specCh" style="width:auto;height:24px;padding:0 4px"><option value="1">CH1</option><option value="2" selected>CH2</option></select></label></div></div>
       <div class="hint">Drag cursors on the screen. Space = RUN/STOP; when stopped, scrub the last 300 frames.</div>
     </div>
 
@@ -216,6 +221,50 @@ function scrubLabel() { const i = +$('scrub').value, n = hist.length; const f = 
 $('scrub').oninput = () => { const f = hist[+$('scrub').value]; if (f) { frame = f; scrubLabel(); updateStatus(f); draw(); } };
 document.addEventListener('keydown', e => { if (e.code === 'Space' && !/INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) { e.preventDefault(); setRunning(!running); } });
 $('persist').onchange = () => draw();
+$('specon').onchange = () => { $('specbox').style.display = $('specon').checked ? 'block' : 'none'; draw(); };
+$('specCh').onchange = () => draw();
+// ---------- spectrum (1024-point radix-2 FFT, Hann window, dB) ----------
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; } }
+  for (let len = 2; len <= n; len <<= 1) { const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) { let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) { const a = i + k, b = a + len / 2;
+        const tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+        const ncr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = ncr; } } }
+}
+function drawSpectrum() {
+  if (!$('specon').checked || !frame || !info) return;
+  const sc = $('spec'), c = sc.getContext('2d'), W = sc.width, H = sc.height;
+  const ch = $('specCh').value, bytes = ch === '1' ? frame.b1 : frame.b2, vpc = ch === '1' ? frame.vpc1 : frame.vpc2, col = ch === '1' ? COL.ch1 : COL.ch2;
+  const n = 1024, re = new Float64Array(n), im = new Float64Array(n);
+  let mean = 0; for (let i = 0; i < n; i++) mean += bytes[i]; mean /= n;
+  for (let i = 0; i < n; i++) re[i] = (bytes[i] - mean) * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (n - 1)));
+  fft(re, im);
+  const bins = n / 2, mag = new Float64Array(bins); let peak = 1, pv = -1;
+  for (let k = 1; k < bins; k++) { mag[k] = Math.hypot(re[k], im[k]) * 4 / n; if (mag[k] > pv) { pv = mag[k]; peak = k; } }
+  const ref = vpc ? 1 / vpc : 1;                       // dB re 1 V (calibrated) or re 1 count
+  const db = k => 20 * Math.log10(Math.max(mag[k] / ref, 1e-6));
+  const top = 10, bot = -80;                            // dB window
+  c.fillStyle = '#000'; c.fillRect(0, 0, W, H);
+  c.strokeStyle = 'rgba(112,136,72,.8)'; c.setLineDash([2, 6]); c.beginPath();
+  for (let i = 1; i < 10; i++) { c.moveTo(i * W / 10 + .5, 0); c.lineTo(i * W / 10 + .5, H); }
+  for (let j = 1; j < 9; j++) { c.moveTo(0, j * H / 9 + .5); c.lineTo(W, j * H / 9 + .5); }
+  c.stroke(); c.setLineDash([]);
+  c.strokeStyle = col; c.lineWidth = 1.5; c.beginPath();
+  for (let k = 1; k < bins; k++) { const x = k / bins * W, y = (top - db(k)) / (top - bot) * H; k === 1 ? c.moveTo(x, y) : c.lineTo(x, y); }
+  c.stroke();
+  const fs = frame.rate || 0, fpk = fs ? peak * fs / n : null;
+  c.fillStyle = '#f8a800'; c.font = '20px sans-serif';
+  if (pv > 0) { const x = peak / bins * W, y = (top - db(peak)) / (top - bot) * H; c.beginPath(); c.moveTo(x, y - 14); c.lineTo(x - 6, y - 24); c.lineTo(x + 6, y - 24); c.fill();
+    c.fillText((fpk ? fmtF(fpk) : 'bin ' + peak) + '  ' + db(peak).toFixed(1) + (vpc ? ' dBV' : ' dBc'), Math.min(x + 10, W - 220), Math.max(y - 30, 22)); }
+  c.fillStyle = '#8a93a0'; c.font = '18px sans-serif';
+  for (let i = 0; i <= 10; i += 2) { const f = fs ? i / 10 * fs / 2 : null; c.fillText(f != null ? fmtF(f) : i * 10 + '%', i * W / 10 + 4, H - 6); }
+  c.fillText(top + ' dB', 4, 20); c.fillText(bot + ' dB', 4, H - 24);
+  $('specov').textContent = `CH${ch} spectrum · Hann · ${fs ? (fs / 1e3).toFixed(1) + ' kS/s, ' + fmtF(fs / n) + '/bin' : 'uncal timebase'}`;
+}
 // ---------- cursors ----------
 $('curT').onclick = () => { cur.t = cur.t ? null : [0.35, 0.65]; $('curT').style.borderColor = cur.t ? '#f8a800' : ''; draw(); };
 $('curV').onclick = () => { cur.v = cur.v ? null : [0.35, 0.65]; $('curV').style.borderColor = cur.v ? '#f8a800' : ''; draw(); };
@@ -292,6 +341,7 @@ function draw() {
     ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(0, H / 2 - 7); ctx.lineTo(10, H / 2); ctx.lineTo(0, H / 2 + 7); ctx.fill(); }
   if (frame.hdr.ordered) { ctx.fillStyle = '#f8a800'; ctx.beginPath(); ctx.moveTo(W / 2 - 7, 0); ctx.lineTo(W / 2 + 7, 0); ctx.lineTo(W / 2, 10); ctx.fill(); }
   drawCursors(spd);
+  drawSpectrum();
   const sdiv = frame.rate ? spd / frame.rate : null;
   $('ov').textContent = (frame.rate ? (frame.rate / 1e3).toFixed(1) + ' kS/s · ' : '') + (frame.hdr.ordered ? 'triggered' : 'free-run') +
     ' · gen ' + frame.hdr.gen + (frame.hdr.ready ? '' : ' · DEMO (no real samples yet)');
