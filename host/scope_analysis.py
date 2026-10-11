@@ -104,9 +104,10 @@ def frequency(raw, rate, p=None):
     return (rate / per) if (per and rate) else None
 
 
-def transition_time(raw, pos, rising, mn, mx):
-    """10%-90% time in samples around an edge at `pos`, or None if unresolved."""
-    lo_t, hi_t = mn + 0.1 * (mx - mn), mn + 0.9 * (mx - mn)
+def transition_time(raw, pos, rising, base, top):
+    """10%-90% time in samples around an edge at `pos`, or None if unresolved.
+    base/top are the flat levels (medians), so overshoot spikes do not stretch the window."""
+    lo_t, hi_t = base + 0.1 * (top - base), base + 0.9 * (top - base)
     i = int(pos)
     a = b = None
     for k in range(max(1, i - 40), min(len(raw) - 1, i + 41)):
@@ -131,7 +132,10 @@ def pulse_metrics(raw, rate, p=None):
     rises, falls, mean = edges(raw, p.hyst, p.min_span)
     if len(rises) < 2 and len(falls) < 2:
         return None
-    mn, mx = min(raw), max(raw)
+    mean_c = sum(raw) / len(raw)
+    above = sorted(x for x in raw if x > mean_c) or [mean_c]
+    below = sorted(x for x in raw if x <= mean_c) or [mean_c]
+    top, base = above[len(above) // 2], below[len(below) // 2]
     highs, lows = [], []
     for r in rises:
         f = next((f for f in falls if f > r), None)
@@ -144,8 +148,8 @@ def pulse_metrics(raw, rate, p=None):
 
     def med(v):
         return statistics.median(v) if v else None
-    rt = [t for t in (transition_time(raw, r, True, mn, mx) for r in rises[:50]) if t]
-    ft = [t for t in (transition_time(raw, f, False, mn, mx) for f in falls[:50]) if t]
+    rt = [t for t in (transition_time(raw, r, True, base, top) for r in rises[:50]) if t]
+    ft = [t for t in (transition_time(raw, f, False, base, top) for f in falls[:50]) if t]
     glitches = 0
     for w, ref in ((highs, med(highs)), (lows, med(lows))):
         if ref:
@@ -276,10 +280,19 @@ def analyze_records(recs, p=None):
         d["shape"] = "flat (DC level %s)" % fmt(d["mean"], unit)
     elif d["freq_hz"]:
         mn, mx = min(raw), max(raw)
-        lo_t, hi_t = mn + span * 0.15, mx - span * 0.15
+        mean_c = lv["mean_counts"]
+        above = sorted(x for x in raw if x > mean_c) or [mean_c]
+        below = sorted(x for x in raw if x <= mean_c) or [mean_c]
+        top_c, base_c = above[len(above) // 2], below[len(below) // 2]
+        lvl_span = max(top_c - base_c, 1)
+        lo_t, hi_t = base_c + lvl_span * 0.15, top_c - lvl_span * 0.15
         near_ext = sum(1 for x in raw if x <= lo_t or x >= hi_t) / len(raw)
         rms_c = (lv["vrms_ac"] / vpc) if cal else lv["vrms_ac"]
-        crest = max(mx - lv["mean_counts"], lv["mean_counts"] - mn) / max(rms_c, 1e-9)
+        crest = max(top_c - mean_c, mean_c - base_c) / max(rms_c, 1e-9)
+        over = max(mx - top_c, base_c - mn) / lvl_span
+        d["overshoot"] = over
+        if over > 0.15:
+            d["flags"].append("overshoot/ringing %.0f%% of the step: fast edges into the probe's capacitance or a real ringing source" % (over * 100))
         duty = d["duty"] if d["duty"] is not None else 0.5
         if near_ext > p.square_extreme_frac:
             d["shape"] = "square/pulse" if abs(duty - 0.5) < 0.08 else "pulse (duty %.0f%%)" % (duty * 100)
