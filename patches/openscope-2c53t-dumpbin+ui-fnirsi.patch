@@ -348,7 +348,7 @@ index fd4a766..be1d01d 100644
  
 diff --git a/firmware/src/ui/scope_topbar.c b/firmware/src/ui/scope_topbar.c
 new file mode 100644
-index 0000000..1442fa3
+index 0000000..0477f6f
 --- /dev/null
 +++ b/firmware/src/ui/scope_topbar.c
 @@ -0,0 +1,195 @@
@@ -382,11 +382,11 @@ index 0000000..1442fa3
 +
 +#define CHIP_W   25
 +#define VDIV_X   27                /* offsets inside a channel block */
-+#define VDIV_W   39
-+#define PROBE_X  68
++#define VDIV_W   37
++#define PROBE_X  66
 +#define PROBE_W  19
-+#define CPL_X    89
-+#define CPL_W    16
++#define CPL_X    87
++#define CPL_W    18
 +#define BLOCK_W  105
 +
 +#define CH1_X    0
