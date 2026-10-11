@@ -82,8 +82,11 @@ time, which is how a sagging rail or an intermittent contact shows up.
 - **Probe switch:** the scope only knows the probe factor from its own setting (`prb1/prb2` in
   `status`). If the owner's probe is physically at ×10 and the scope says ×1, every voltage is 10× low.
   Ask which position the switch is in; set the scope to match (`btn` menus, or ask him).
-- **Timebase:** all codes within 0.2 % (verified). Records are 1024 samples; `describe` says the
-  record length in seconds. Frequencies above ~fs/8 are refused rather than guessed.
+- **Timebase:** codes 0x08–0x14 verified against the Pi's crystal (5 MS/s … 500 S/s, all within
+  0.2 %); 0x07 (12.5 MS/s) and 0x06 (25 MS/s) are provisional; 0x05 and faster are not usable
+  (records are not uniform-rate). Records are 1024 samples; `describe` says the record length in
+  seconds. Frequencies above ~fs/8 are refused rather than guessed. At 5 MS/s an edge is resolved
+  to 0.4 µs, which covers stepper step pulses, spindle PWM and most switching noise.
 - **Flags** in `describe`: clipped / no signal / low resolution / uncalibrated / frequency unstable
   (= intermittent contact or jitter) / ~60 Hz mains pickup (= a floating probe, missing ground clip).
 - **Free-run vs triggered:** most records are free-run (the plot says so); the time axis is still

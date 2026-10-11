@@ -198,7 +198,10 @@ def autoset(ch, info, verbose=True):
                 f0 = d["freq_hz"]; break
     if f0:
         want_rate = f0 * 1024 / 10.0
-        t = min(tbs, key=lambda t: abs(math.log(t["rate"] / want_rate)))
+        # prefer measured codes; a provisional one only if no measured code is within 3x
+        def dist(t):
+            return abs(math.log(t["rate"] / want_rate)) + (0.0 if t["tier"].startswith("measured") else math.log(3.0))
+        t = min(tbs, key=dist)
         cmd("fpga scope timebase 0x%02X" % t["code"])
         say("autoset: timebase 0x%02X (%s, %s/div) for %s" % (t["code"], fmt_rate(t["rate"]), fmt_t(t["s_per_div"]), fmt_f(f0)))
     else:
@@ -341,7 +344,7 @@ def main():
             if fr:
                 tbs = sorted(info["timebases"], key=lambda t: -t["rate"])
                 want = max(fr) * 1024 / 10.0
-                t = min(tbs, key=lambda t: abs(math.log(t["rate"] / want)))
+                t = min(tbs, key=lambda t: abs(math.log(t["rate"] / want)) + (0.0 if t["tier"].startswith("measured") else math.log(3.0)))
                 cmd("fpga scope timebase 0x%02X" % t["code"])
                 fs = frames(3, settle=0.6)
                 descs = {c: analyze(fs, c, info) for c in chans}
@@ -366,7 +369,7 @@ def main():
                 if fr:
                     tbs = sorted(info["timebases"], key=lambda t: -t["rate"])
                     want = max(fr) * 1024 / 10.0
-                    t = min(tbs, key=lambda t: abs(math.log(t["rate"] / want)))
+                    t = min(tbs, key=lambda t: abs(math.log(t["rate"] / want)) + (0.0 if t["tier"].startswith("measured") else math.log(3.0)))
                     cmd("fpga scope timebase 0x%02X" % t["code"])
         fs = frames(5, settle=0.6)
         descs = {ch: analyze(fs, ch, info) for ch in chans}

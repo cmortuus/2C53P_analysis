@@ -81,9 +81,14 @@ def calib_gain(ch, rng):
 
 def calib_zero(ch, rng):
     return float(CALIB["zero"].get(str(ch), {}).get(str(rng), 0.0))
-TIMEBASE_RATE = {0x0D: 123662.7, 0x0E: 49930.1, 0x0F: 24979.1, 0x10: 12490.0,
+# 0x0D..0x14 from OpenScope (bench unit #1); 0x06..0x0C measured here against the Pi's PWM
+# (host/t_tbsweep.py, 2026-10-11): the 1-2-5 ladder continues, records are coherent down to
+# 0x08. 0x05 and faster are NOT uniform-rate records and are deliberately absent.
+TIMEBASE_RATE = {0x06: 25250000.0, 0x07: 12559464.0,
+                 0x08: 5001639.0, 0x09: 2500316.0, 0x0A: 1250142.0, 0x0B: 499995.0, 0x0C: 249873.0,
+                 0x0D: 123662.7, 0x0E: 49930.1, 0x0F: 24979.1, 0x10: 12490.0,
                  0x11: 4990.8, 0x12: 2494.9, 0x13: 1250.4, 0x14: 500.2}
-TIMEBASE_TIER = {0x0D: "provisional"}                      # others in the dict: "measured"
+TIMEBASE_TIER = {0x06: "provisional", 0x07: "provisional"}   # others: "measured" (0x0D re-measured 2026-10-11)
 SAMPLES_PER_DIV = 32                                        # firmware renderer convention
 COUNTS_PER_DIV = 32
 MV_PER_COUNT = {1: [0, 0, 0, 0, 14.08, 21.83, 42.95, 88.42, 279.05, 352.17],
