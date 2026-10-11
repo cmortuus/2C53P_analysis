@@ -9,6 +9,7 @@ Owns the scope's USB CDC shell and serves:
            GET  /api/frame.json   latest frame          GET /api/frame.csv  latest frame as CSV
            GET  /api/screen.png   the device's own LCD (screen dumpbin), ?scale=1..4&hold=1|0
            GET/POST /api/log       measurement logger (POST {action: start|stop|clear}); GET /api/log.csv
+           GET/POST /api/calib     per-unit gain/zero per (ch, range), persisted in calib.json
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -31,6 +32,42 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 # 2026-10-10): every "measured" OpenScope code was within 0.2 %, the provisional 0x0D read
 # 1.05 % slow -> it is the round 125 kS/s. Overrides replace the firmware's rate_hz when set.
 RATE_OVERRIDE = {0x0D: 124960.0}
+
+# Per-unit vertical calibration, persisted next to the server (calib.json):
+#   {"gain": {"2": {"6": 1.062}}, "zero": {"2": {"6": 16.4}}}
+#   gain multiplies the firmware's volts-per-count for (channel, range);
+#   zero is the ADC count the input reads with the probe on ground, minus 128,
+#   subtracted before scaling. Written by POST /api/calib (scopectl zero/gain).
+CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
+CALIB = {"gain": {}, "zero": {}}
+
+
+def calib_load():
+    global CALIB
+    try:
+        with open(CALIB_PATH) as f:
+            d = json.load(f)
+        CALIB = {"gain": d.get("gain", {}), "zero": d.get("zero", {})}
+        log("calibration loaded:", CALIB)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log("calibration file ignored:", e)
+
+
+def calib_save():
+    tmp = CALIB_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(CALIB, f, indent=1)
+    os.replace(tmp, CALIB_PATH)
+
+
+def calib_gain(ch, rng):
+    return float(CALIB["gain"].get(str(ch), {}).get(str(rng), 1.0))
+
+
+def calib_zero(ch, rng):
+    return float(CALIB["zero"].get(str(ch), {}).get(str(rng), 0.0))
 TIMEBASE_RATE = {0x0D: 123662.7, 0x0E: 49930.1, 0x0F: 24979.1, 0x10: 12490.0,
                  0x11: 4990.8, 0x12: 2494.9, 0x13: 1250.4, 0x14: 500.2}
 TIMEBASE_TIER = {0x0D: "provisional"}                      # others in the dict: "measured"
@@ -257,7 +294,7 @@ def png_rgb(w, h, rows, scale=1):
             + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
 
 
-def measure(raw, vpc, rate):
+def measure(raw, vpc, rate, zero_counts=0.0):
     """Basic measurements on one channel. Volts when vpc>0, else ADC counts."""
     n = len(raw)
     if n == 0:
@@ -267,7 +304,7 @@ def measure(raw, vpc, rate):
     var = sum((x - mean) ** 2 for x in raw) / n
     unit = "V" if vpc else "cnt"
     s = vpc if vpc else 1.0
-    zero = 128 if vpc else 0
+    zero = (128 + zero_counts) if vpc else 0
     # Top/base = median of the samples above/below the mean: a square wave's flat levels,
     # immune to noise peaks and overshoot (max-min over-reads by 2-3 counts on coarse ranges).
     above = sorted(x for x in raw if x > mean) or [mean]
@@ -370,10 +407,13 @@ class Hub:
             times = [t for t in times if now - t < 3.0] + [now]
             self.fps = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else 0.0
             rate = RATE_OVERRIDE.get(h.get("tb")) or h.get("rate_hz") or TIMEBASE_RATE.get(h.get("tb"), 0)
-            vpc1, vpc2 = h.get("vpc1_nv", 0) / 1e9, h.get("vpc2_nv", 0) / 1e9
+            vpc1 = h.get("vpc1_nv", 0) / 1e9 * calib_gain(1, h.get("rng1"))
+            vpc2 = h.get("vpc2_nv", 0) / 1e9 * calib_gain(2, h.get("rng2"))
+            z1, z2 = calib_zero(1, h.get("rng1")), calib_zero(2, h.get("rng2"))
             fr = {"seq": self.seq + 1, "t": now, "hdr": h, "rate": rate, "vpc1": vpc1, "vpc2": vpc2,
                   "ch1": base64.b64encode(c1).decode(), "ch2": base64.b64encode(c2).decode(),
-                  "meas": {"ch1": measure(c1, vpc1, rate), "ch2": measure(c2, vpc2, rate)},
+                  "zero1": z1, "zero2": z2,
+                  "meas": {"ch1": measure(c1, vpc1, rate, z1), "ch2": measure(c2, vpc2, rate, z2)},
                   "fps": round(self.fps, 1), "errors": self.errors}
             if self.logging:
                 m1, m2 = fr["meas"]["ch1"], fr["meas"]["ch2"]
@@ -427,11 +467,13 @@ def make_http_handler(hub):
                     "timebases": [{"code": c, "rate": RATE_OVERRIDE.get(c, r), "tier": TIMEBASE_TIER.get(c, "measured"),
                                    "s_per_div": SAMPLES_PER_DIV / RATE_OVERRIDE.get(c, r)} for c, r in sorted(TIMEBASE_RATE.items(), reverse=True)],
                     "mv_per_count": MV_PER_COUNT, "range_tier": RANGE_TIER,
-                    "counts_per_div": COUNTS_PER_DIV, "samples_per_div": SAMPLES_PER_DIV,
+                    "counts_per_div": COUNTS_PER_DIV, "samples_per_div": SAMPLES_PER_DIV, "calib": CALIB,
                     "status": hub.status, "port": scope.port, "run": hub.run})
             if p == "/api/frame.json":
                 hub.last_interest = time.time()
                 return self._send(200, hub.latest or {})
+            if p == "/api/calib":
+                return self._send(200, CALIB)
             if p == "/api/log":
                 return self._send(200, {"logging": hub.logging, "rows": len(hub.log_rows),
                                         "since": hub.log_started})
@@ -521,6 +563,21 @@ def make_http_handler(hub):
                 req = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if self.path == "/api/calib":
+                # {"ch": 2, "rng": 6, "gain": 1.062} and/or {"ch": 2, "rng": 6, "zero": 16.4}; "clear": true
+                try:
+                    ch, rng = str(int(req["ch"])), str(int(req["rng"]))
+                except (KeyError, ValueError):
+                    return self._send(400, {"error": "need ch and rng"})
+                if req.get("clear"):
+                    CALIB["gain"].get(ch, {}).pop(rng, None)
+                    CALIB["zero"].get(ch, {}).pop(rng, None)
+                if "gain" in req:
+                    CALIB["gain"].setdefault(ch, {})[rng] = float(req["gain"])
+                if "zero" in req:
+                    CALIB["zero"].setdefault(ch, {})[rng] = float(req["zero"])
+                calib_save()
+                return self._send(200, CALIB)
             if self.path == "/api/log":
                 a = req.get("action")
                 if a == "start":
@@ -582,6 +639,7 @@ class ThreadingTCP(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def main():
+    calib_load()
     ap = argparse.ArgumentParser()
     ap.add_argument("--http", type=int, default=8080)
     ap.add_argument("--tcp", type=int, default=7001)

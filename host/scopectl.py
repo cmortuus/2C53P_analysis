@@ -74,6 +74,77 @@ def ch_fields(f, ch):
             "cpl": CPL[h["cpl%d" % ch]], "probe": 10 if h["prb%d" % ch] else 1, "meas": f["meas"]["ch%d" % ch]}
 
 
+# ------------------------------------------------------------------ pulse metrics
+def edges(raw, hyst=0.15):
+    """Rising and falling mean-level crossings (sub-sample), with hysteresis."""
+    mn, mx = min(raw), max(raw)
+    span = mx - mn
+    if span < 6:
+        return [], [], None
+    mean = sum(raw) / len(raw)
+    hi, lo = mean + hyst * span, mean - hyst * span
+    rises, falls = [], []
+    state = raw[0] > mean
+    for i in range(1, len(raw)):
+        x = raw[i]
+        if state and x < lo:
+            state = False
+            j = i
+            while j > 0 and raw[j - 1] < mean: j -= 1
+            falls.append(j - 1 + (mean - raw[j - 1]) / (raw[j] - raw[j - 1]) if j > 0 and raw[j] != raw[j - 1] else float(j))
+        elif not state and x > hi:
+            state = True
+            j = i
+            while j > 0 and raw[j - 1] > mean: j -= 1
+            rises.append(j - 1 + (mean - raw[j - 1]) / (raw[j] - raw[j - 1]) if j > 0 and raw[j] != raw[j - 1] else float(j))
+    return rises, falls, mean
+
+
+def transition_time(raw, pos, rising, mn, mx):
+    """10%-90% time (in samples) around an edge at `pos`, or None if unresolved."""
+    lo_t, hi_t = mn + 0.1 * (mx - mn), mn + 0.9 * (mx - mn)
+    i = int(pos)
+    a = b = None
+    for k in range(max(1, i - 40), min(len(raw) - 1, i + 41)):
+        y0, y1 = raw[k - 1], raw[k]
+        if rising:
+            if a is None and y0 < lo_t <= y1: a = k - 1 + (lo_t - y0) / (y1 - y0)
+            if a is not None and y0 < hi_t <= y1: b = k - 1 + (hi_t - y0) / (y1 - y0); break
+        else:
+            if a is None and y0 > hi_t >= y1: a = k - 1 + (hi_t - y0) / (y1 - y0)
+            if a is not None and y0 > lo_t >= y1: b = k - 1 + (lo_t - y0) / (y1 - y0); break
+    return (b - a) if (a is not None and b is not None and b > a) else None
+
+
+def pulse_metrics(raw, rate):
+    rises, falls, mean = edges(raw)
+    if len(rises) < 2 and len(falls) < 2:
+        return None
+    mn, mx = min(raw), max(raw)
+    highs, lows = [], []
+    for r in rises:
+        f = next((f for f in falls if f > r), None)
+        if f is not None: highs.append(f - r)
+    for f in falls:
+        r = next((r for r in rises if r > f), None)
+        if r is not None: lows.append(r - f)
+    def med(v): return statistics.median(v) if v else None
+    rt = [t for t in (transition_time(raw, r, True, mn, mx) for r in rises[:50]) if t]
+    ft = [t for t in (transition_time(raw, f, False, mn, mx) for f in falls[:50]) if t]
+    glitches = 0
+    for w, ref in ((highs, med(highs)), (lows, med(lows))):
+        if ref:
+            glitches += sum(1 for x in w if x < 0.2 * ref)
+    per = (1.0 / rate) if rate else None
+    out = {"rising_edges": len(rises), "falling_edges": len(falls),
+           "high_s": med(highs) * per if (per and highs) else None, "low_s": med(lows) * per if (per and lows) else None,
+           "high_samples": med(highs), "low_samples": med(lows),
+           "rise_s": med(rt) * per if (per and rt) else None, "fall_s": med(ft) * per if (per and ft) else None,
+           "rise_samples": med(rt), "fall_samples": med(ft), "glitches": glitches,
+           "edge_resolution_s": (2 * per) if per else None}
+    return out
+
+
 # ------------------------------------------------------------------ analysis
 def analyze(fs, ch, info):
     """Combine several frames of one channel into a description dict."""
@@ -101,8 +172,12 @@ def analyze(fs, ch, info):
         "amp_top_base": amp, "vpp": m["vpp"], "mean": m["vavg"], "rms_ac": m["vrms_ac"],
         "top": m["vtop"], "base": m["vbase"], "freq_hz": statistics.median(freqs) if freqs else None,
         "duty": m.get("duty"), "span_counts": span_counts, "clipped": bool(m["clipped"]),
-        "flags": [], "shape": None, "summary": "",
+        "flags": [], "shape": None, "summary": "", "pulse": pulse_metrics(raw, rate),
+        "zero_counts": fs[-1].get("zero%d" % ch, 0.0), "gain": (info.get("calib", {}).get("gain", {}).get(str(ch), {}).get(str(c["rng"]), 1.0)),
     }
+    pm = d["pulse"]
+    if pm and pm["glitches"]:
+        d["flags"].append("%d runt pulse(s) shorter than 20%% of the normal width: glitches or contact bounce" % pm["glitches"])
     # ---- flags
     if not c["en"]:
         d["flags"].append("channel disabled")
@@ -151,8 +226,19 @@ def analyze(fs, ch, info):
         parts.append("%s" % fmt_f(d["freq_hz"]))
     parts.append("amplitude %s (top %s, base %s)" % (fmt(amp, unit), fmt(d["top"], unit), fmt(d["base"], unit)))
     parts.append("mean %s" % fmt(d["mean"], unit))
+    if d["pulse"] and d["pulse"]["high_s"] and d["freq_hz"]:
+        pm = d["pulse"]
+        tt = []
+        for nm, v, samp in (("rise", pm["rise_s"], pm["rise_samples"]), ("fall", pm["fall_s"], pm["fall_samples"])):
+            if v is None or (samp is not None and samp < 2):
+                tt.append("%s <%s (unresolved at this rate)" % (nm, fmt_t(pm["edge_resolution_s"])))
+            else:
+                tt.append("%s %s" % (nm, fmt_t(v)))
+        parts.append("high %s / low %s, %s" % (fmt_t(pm["high_s"]), fmt_t(pm["low_s"]), ", ".join(tt)))
     parts.append("probe x%d %s, range %d%s, %s/div" % (c["probe"], c["cpl"], c["rng"],
                  "" if cal else " (uncal)", fmt(d["vdiv"], "V") if cal else "--"))
+    if d["zero_counts"] or d["gain"] != 1.0:
+        parts.append("unit cal applied (gain x%.3f, zero %+.1f cnt)" % (d["gain"], d["zero_counts"]))
     d["summary"] = "; ".join(parts) + ("  FLAGS: " + " | ".join(d["flags"]) if d["flags"] else "")
     return d
 
@@ -248,6 +334,35 @@ def autoset(ch, info, verbose=True):
     return analyze(frames(3, settle=0.6), ch, info)
 
 
+# ------------------------------------------------------------------ two-channel timing
+def timing(fs, info):
+    """Delay/phase between CH1 and CH2 rising edges when both carry the same frequency."""
+    f = fs[-1]
+    rate = f["rate"]
+    if not rate:
+        return None
+    r1, _, _ = edges(f["b1"]); r2, _, _ = edges(f["b2"])
+    if len(r1) < 2 or len(r2) < 2:
+        return None
+    p1 = statistics.median(b - a for a, b in zip(r1, r1[1:]))
+    p2 = statistics.median(b - a for a, b in zip(r2, r2[1:]))
+    if abs(p1 - p2) / max(p1, p2) > 0.03:
+        return {"same_freq": False, "f1": rate / p1, "f2": rate / p2}
+    ds = []
+    for a in r1:
+        cands = [b - a for b in r2 if -p1 / 2 <= b - a < p1 / 2]
+        if cands:
+            ds.append(min(cands, key=abs))
+    if not ds:
+        return None
+    d = statistics.median(ds)
+    phase = d / p1 * 360.0
+    out = {"same_freq": True, "period_s": p1 / rate, "delay_s": d / rate, "phase_deg": phase, "n": len(ds)}
+    if 60 < abs(phase) < 120:
+        out["quadrature"] = "CH2 %s CH1 by ~90 deg (%s)" % ("lags" if phase > 0 else "leads", "A->B order" if phase > 0 else "B->A order")
+    return out
+
+
 # ------------------------------------------------------------------ plotting
 def plot(fs, chans, info, path, descs):
     import matplotlib
@@ -262,7 +377,8 @@ def plot(fs, chans, info, path, descs):
     fig, axes = plt.subplots(len(chans), 1, figsize=(11, 3.2 * len(chans)), sharex=True, squeeze=False)
     for ax, ch in zip(axes[:, 0], chans):
         c = ch_fields(f, ch)
-        vals = [(b - 128) * c["vpc"] for b in c["raw"]] if c["vpc"] else list(c["raw"])
+        z = f.get("zero%d" % ch, 0.0) or 0.0
+        vals = [(b - 128 - z) * c["vpc"] for b in c["raw"]] if c["vpc"] else list(c["raw"])
         ax.plot(xs, vals, color="#1fb4d8" if ch == 1 else "#2458e8", lw=1)
         ax.set_ylabel("CH%d (%s)" % (ch, "V" if c["vpc"] else "ADC counts"))
         ax.grid(True, alpha=.3)
@@ -291,7 +407,10 @@ def main():
     p = sub.add_parser("describe"); p.add_argument("--ch", default="both"); p.add_argument("--png"); p.add_argument("--frames", type=int, default=5); p.add_argument("--json", action="store_true")
     p = sub.add_parser("set"); p.add_argument("line")
     p = sub.add_parser("screen"); p.add_argument("out"); p.add_argument("--scale", type=int, default=2)
-    p = sub.add_parser("log"); p.add_argument("action", choices=["start", "stop", "status", "csv", "clear"]); p.add_argument("out", nargs="?")
+    p = sub.add_parser("log"); p.add_argument("action", choices=["start", "stop", "status", "csv", "clear"]); p.add_argument("out", nargs="?"); p.add_argument("--summary", action="store_true")
+    p = sub.add_parser("zero", help="probe tip on GROUND: store this channel/range's zero offset on the Pi"); p.add_argument("--ch", type=int, required=True)
+    p = sub.add_parser("gain", help="known amplitude applied: store this channel/range's gain correction"); p.add_argument("--ch", type=int, required=True); p.add_argument("--expected", type=float, required=True, help="true top-base amplitude in volts")
+    p = sub.add_parser("calib"); p.add_argument("action", choices=["show", "clear"]); p.add_argument("--ch", type=int); p.add_argument("--rng", type=int)
     a = ap.parse_args()
     URL = a.url
     info = api("/api/info")
@@ -337,11 +456,19 @@ def main():
         chans = [1, 2] if a.ch == "both" else [int(a.ch)]
         fs = frames(a.frames)
         descs = {ch: analyze(fs, ch, info) for ch in chans}
+        tm = timing(fs, info) if len(chans) == 2 else None
         if a.json:
-            print(json.dumps(descs, indent=1, default=str))
+            print(json.dumps({"channels": descs, "timing": tm}, indent=1, default=str))
         else:
             for ch in chans:
                 print(descs[ch]["summary"])
+            if tm:
+                if tm.get("same_freq"):
+                    print("CH1->CH2 timing: CH2 rising edge %s after CH1's (%.0f deg of a %s period, n=%d)%s" % (
+                        fmt_t(tm["delay_s"]), tm["phase_deg"], fmt_t(tm["period_s"]), tm["n"],
+                        ("  " + tm["quadrature"]) if tm.get("quadrature") else ""))
+                else:
+                    print("CH1->CH2 timing: different frequencies (%s vs %s)" % (fmt_f(tm["f1"]), fmt_f(tm["f2"])))
         if a.png:
             plot(fs, chans, info, a.png, descs); print("plot:", a.png)
         return
@@ -355,6 +482,42 @@ def main():
         open(a.out, "wb").write(data); print("saved", a.out, len(data), "bytes")
         return
 
+    if a.cmd == "zero":
+        fs = frames(5)
+        c = ch_fields(fs[-1], a.ch)
+        means = [sum(ch_fields(f, a.ch)["raw"]) / 1024 for f in fs]
+        spans = [max(ch_fields(f, a.ch)["raw"]) - min(ch_fields(f, a.ch)["raw"]) for f in fs]
+        if max(spans) > 12:
+            raise SystemExit("zero: the input is not quiet (%d counts of swing) -- put the tip on ground first" % max(spans))
+        z = statistics.median(means) - 128.0
+        api("/api/calib", {"ch": a.ch, "rng": c["rng"], "zero": z})
+        print("CH%d range %d: zero offset %+.1f counts (%s) stored on the Pi" % (a.ch, c["rng"], z, fmt(z * c["vpc"], "V") if c["vpc"] else "uncal"))
+        return
+
+    if a.cmd == "gain":
+        fs = frames(5)
+        c = ch_fields(fs[-1], a.ch)
+        if not c["vpc"]:
+            raise SystemExit("gain: range %d is uncalibrated in the firmware; nothing to correct" % c["rng"])
+        amps = [ch_fields(f, a.ch)["meas"]["vamp"] for f in fs]
+        amp = statistics.median(amps)
+        if amp <= 0 or any(ch_fields(f, a.ch)["meas"]["clipped"] for f in fs):
+            raise SystemExit("gain: signal clipped or absent (amp %s)" % fmt(amp, "V"))
+        old = info.get("calib", {}).get("gain", {}).get(str(a.ch), {}).get(str(c["rng"]), 1.0)
+        new = old * a.expected / amp
+        api("/api/calib", {"ch": a.ch, "rng": c["rng"], "gain": new})
+        print("CH%d range %d: measured %s for expected %s -> gain x%.4f (was x%.4f) stored on the Pi" % (a.ch, c["rng"], fmt(amp, "V"), fmt(a.expected, "V"), new, old))
+        return
+
+    if a.cmd == "calib":
+        if a.action == "clear":
+            if a.ch is None or a.rng is None:
+                raise SystemExit("calib clear needs --ch and --rng")
+            print(api("/api/calib", {"ch": a.ch, "rng": a.rng, "clear": True}))
+        else:
+            print(json.dumps(api("/api/calib"), indent=1))
+        return
+
     if a.cmd == "log":
         if a.action in ("start", "stop", "clear"):
             print(api("/api/log", {"action": a.action}))
@@ -364,6 +527,17 @@ def main():
             data = api("/api/log.csv", timeout=120)
             out = a.out or time.strftime("scope_log_%Y%m%d_%H%M%S.csv")
             open(out, "wb").write(data); print("saved", out, len(data), "bytes")
+            if a.summary:
+                import csv, io
+                rows = list(csv.DictReader(io.StringIO(data.decode())))
+                if not rows:
+                    print("(empty log)"); return
+                print("%d rows, %s .. %s" % (len(rows), rows[0]["t_iso"], rows[-1]["t_iso"]))
+                for col in ("ch1_amp", "ch1_mean", "ch1_rms_ac", "ch1_freq", "ch2_amp", "ch2_mean", "ch2_rms_ac", "ch2_freq"):
+                    vals = [(float(r[col]), r["t_iso"]) for r in rows if r[col] not in ("", None)]
+                    if not vals: continue
+                    lo, hi = min(vals), max(vals)
+                    print("  %-11s mean %-10.4g min %-10.4g at %s   max %-10.4g at %s" % (col, sum(v for v, _ in vals) / len(vals), lo[0], lo[1][11:], hi[0], hi[1][11:]))
 
 
 if __name__ == "__main__":

@@ -15,8 +15,14 @@ $P host/scopectl.py describe --png /tmp/d.png    # both channels: shape, freq, l
 $P host/scopectl.py describe --ch 1 --json       # machine-readable
 $P host/scopectl.py set "fpga scope timebase 0x10"   # any allow-listed shell command
 $P host/scopectl.py screen /tmp/lcd.png          # the device's own LCD
-$P host/scopectl.py log start | stop | csv out.csv   # long recordings (1 row per frame, hours)
+$P host/scopectl.py log start | stop | csv out.csv [--summary]   # long recordings (1 row per frame, hours)
+$P host/scopectl.py zero --ch 2                  # tip on GROUND first: stores this range's zero offset on the Pi
+$P host/scopectl.py gain --ch 2 --expected 3.3   # a known amplitude applied: stores this range's gain
+$P host/scopectl.py calib show | clear --ch 2 --rng 6
 ```
+`describe` also reports, for pulse trains: high/low widths, 10–90 % rise/fall (or "unresolved" when the
+edge is under 2 samples), runt-pulse count (glitches, contact bounce); and with both channels on the
+same frequency the CH1→CH2 delay/phase, flagging ~90° as quadrature (encoder A/B order).
 Always read the plot (Read tool on the PNG). The text summary is good, the plot catches what
 the summary cannot (glitches, ringing, asymmetry, a probe that is half-connected).
 
@@ -31,10 +37,13 @@ Workflow that works:
 - **Ranges:** 0–3 are uncalibrated on this unit (OpenScope has no gain for them) — counts only.
   Ranges 4 and 8/9 are "provisional" (±10 %). Ranges 5–7 are measured: CH1 within ~2 %,
   **CH2 reads ~6 % low** on ranges 6/7 (sweep 2026-10-10 against the Pi's 3.3 V reference).
-- **Vertical offset:** the frontend is centred by the firmware at boot only; CH2 has shown a −0.6 V
-  offset at range 6 (a 0..3.3 V square read −0.65..2.46 V). Amplitudes are right; absolute DC
-  levels can be off by that much. To pin DC: ask the owner to touch the tip to the circuit's ground
-  and `describe` — that reading is the zero error, subtract it.
+- **Per-unit calibration lives on the Pi** (`/opt/scope/calib.json`, applied to every frame, the
+  viewer, scopectl and the logger). Done 2026-10-11 for CH2 ranges 6 and 7 against the Pi's own
+  reference (zero: GPIO18 driven low; gain: the 3.3 V square): zero −16.9 counts on both ranges
+  (−0.65 V at range 6), gain ×1.062 / ×1.044. After that CH2 reads 3.30 V top, 0 V base. Other
+  ranges and CH1 are uncorrected until `zero`/`gain` are run there: to zero, ask the owner to touch the
+  tip to the circuit's ground (`zero` refuses if the input is not quiet); to set gain, apply a known
+  amplitude (the Pi square is a good one for 1–7 V/div ranges).
 - **Probe switch:** the scope only knows the probe factor from its own setting (`prb1/prb2` in
   `status`). If the owner's probe is physically at ×10 and the scope says ×1, every voltage is 10× low.
   Ask which position the switch is in; set the scope to match (`btn` menus, or ask him).

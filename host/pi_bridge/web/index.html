@@ -332,21 +332,21 @@ function grid(fade) {
   ctx.stroke(); ctx.setLineDash([]);
   ctx.strokeStyle = 'rgba(112,136,72,.8)'; ctx.setLineDash([2, 6]); ctx.strokeRect(.5, .5, W - 1, H - 1); ctx.setLineDash([]);
 }
-function trace(bytes, color, spd) {
-  const W = cv.width, H = cv.height, n = bytes.length;
+function trace(bytes, color, spd, zero) {
+  const W = cv.width, H = cv.height, n = bytes.length; zero = zero || 0;
   const span = spd * DIVX; const center = frame.hdr.ordered ? 512 : n / 2;
   let s0 = Math.max(0, Math.round(center - span / 2)), s1 = Math.min(n, Math.round(center + span / 2));
   const xs = W / (s1 - s0 - 1), ys = H / DIVY / info.counts_per_div;
   ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.lineJoin = 'round'; ctx.beginPath();
-  for (let i = s0; i < s1; i++) { const x = (i - s0) * xs, y = H / 2 - (bytes[i] - 128) * ys; i === s0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+  for (let i = s0; i < s1; i++) { const x = (i - s0) * xs, y = H / 2 - (bytes[i] - 128 - zero) * ys; i === s0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
   ctx.stroke();
 }
 function draw() {
   grid($('persist').checked && running);
   if (!frame || !info) return;
   const spd = parseFloat($('zoom').value);
-  if ($('v1').checked && frame.hdr.en1) trace(frame.b1, COL.ch1, spd);
-  if ($('v2').checked && frame.hdr.en2) trace(frame.b2, COL.ch2, spd);
+  if ($('v1').checked && frame.hdr.en1) trace(frame.b1, COL.ch1, spd, frame.zero1);
+  if ($('v2').checked && frame.hdr.en2) trace(frame.b2, COL.ch2, spd, frame.zero2);
   // markers: channel zero (left) and trigger point (top)
   const H = cv.height, W = cv.width;
   for (const [c, on] of [[COL.ch1, frame.hdr.en1], [COL.ch2, frame.hdr.en2]]) if (on) {
