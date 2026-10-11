@@ -24,7 +24,7 @@ API: `GET /api/info` (calibration tables, port, status), `GET /api/stream` (SSE,
 per event with base64 `ch1`/`ch2`), `GET /api/frame.json`, `GET /api/frame.csv`,
 `POST /api/cmd {"cmd": "..."}` (allow-list: `fpga scope …`, `btn …` except POWER, `version`,
 `status`, `settings`, `help`; **never** `mem write`, `fwload`, flash or reinit commands),
-`POST /api/run {"run": bool}`, `GET/POST /api/calib` (per-unit zero/gain), `GET/POST /api/record` + `GET /api/records[/<name>.bin|/query?from&to&every&limit]` (raw recorder, 40 GB ring in `/home/pi/records`), `GET /api/analyze?from&to&ch&…` (server-side re-evaluation), `GET /api/log*` (measurement logger), `GET /api/screen.png?scale=1..4` (the scope's own LCD via `screen dumpbin`, 16-colour copy; the "Device screen" button in the viewer).
+`POST /api/run {"run": bool}`, `GET/POST /api/calib` (per-unit zero/gain), `GET/POST /api/record` + `GET /api/records[/<name>.bin|/query?from&to&every&limit]` (raw recorder, 40 GB ring in `/home/pi/records`), `GET /api/analyze?from&to&ch&…` (server-side re-evaluation), `GET /api/events?from&to&where=…` (event search in the per-frame metrics index `<segment>.metrics.jsonl`), `GET /api/log*` (measurement logger), `GET /api/screen.png?scale=1..4` (the scope's own LCD via `screen dumpbin`, 16-colour copy; the "Device screen" button in the viewer).
 
 ## Install / update
 ```bash

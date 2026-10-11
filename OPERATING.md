@@ -49,6 +49,18 @@ $P host/scopectl.py replay --from=-10m --to=now --ch both --png /tmp/strip.png -
 $P host/scopectl.py replay --from="2026-10-11 01:08" --to="01:09" --ch 2 --server   # same, computed on the Pi
 $P host/scopectl.py records fetch --from=-1h out.json     # raw frames of a window, for anything else
 ```
+Finding things in days of recording without reading it all — a per-frame metrics index
+(amplitude, mean, AC RMS, frequency, clipped, glitches, duty, span per channel) is written next
+to each segment by the Pi (and backfilled for older segments):
+```bash
+$P host/scopectl.py find --from=-4d --where "ch2_mean<4.5"            # rail dipped below 4.5 V: when, how often, how low
+$P host/scopectl.py find --from=-1h --where "ch1_glitches>0,ch1_amp>2" # runt step pulses while the line was live
+$P host/scopectl.py watch --where "ch2_mean<4.5" --for 10m            # live: "TRIPPED at 12:03:15" the moment it happens
+```
+`find` clusters matching frames into events (gap 2 s) and prints each event's extreme sample and
+a ready-made `replay` command to look at it. Conditions: `chN_<amp|mean|rms|freq|clipped|glitches|duty|span> <op> value`,
+comma-separated (all must hold).
+
 Times: unix seconds, `-10m`/`-2h` ago, `HH:MM[:SS]` today, or `YYYY-MM-DD HH:MM[:SS]` (write
 `--from=-10m` with the `=`). The analysis code is one module (`host/scope_analysis.py`) used by the
 tool and by the Pi (`/api/analyze`), and all thresholds are `Params` fields — change them on the

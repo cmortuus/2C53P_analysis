@@ -14,6 +14,7 @@ Owns the scope's USB CDC shell and serves:
            GET  /api/records       stored segments; /api/records/<name>.bin download;
                 /api/records/query?from=&to=&every=&limit=   frames in a window (JSON, base64)
            GET  /api/analyze?from=&to=&ch=&every=&limit=&hyst=..   server-side re-evaluation (scope_analysis)
+           GET  /api/events?from=&to=&where=ch2_mean<4.5,ch1_glitches>0&gap=2   events from the per-frame metrics index
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -499,6 +500,7 @@ class Recorder:
             return {"enabled": self.enabled, "forced": self.forced, "root": self.root, "max_gb": self.max_bytes / 1e9,
                     "segments": len(self.segments), "total_mb": total / 1e6,
                     "active": dict(self.cur, active=True) if self.cur else None,
+                    "indexer_dropped": (indexer.dropped if indexer else None), "indexer_backlog": (len(indexer.q) if indexer else None),
                     "frames_total": sum(sg["frames"] for sg in self.segments)}
 
     def list(self):
@@ -523,6 +525,163 @@ class Recorder:
                 if len(out) >= limit:
                     return out
         return out
+
+
+class Indexer(threading.Thread):
+    """Best-effort per-frame metrics next to each raw segment (<seg>.metrics.jsonl):
+    t, per channel amp/mean/rms/freq/clipped/glitches/duty — computed with scope_analysis in
+    this thread so the acquisition loop never waits. Backlog beyond 300 frames is dropped
+    (the raw record is still there; `scopectl replay` recomputes anything)."""
+    FIELDS = ("amp", "mean", "rms", "freq", "clipped", "glitches", "duty", "span")
+
+    def __init__(self, recorder):
+        super().__init__(daemon=True)
+        self.recorder = recorder
+        self.q = []
+        self.cv = threading.Condition()
+        self.dropped = 0
+        self.fh = None
+        self.fh_path = None
+
+    def backfill(self):
+        """Index segments that have no metrics sidecar (recorded before the indexer existed or
+        while it was down). Own thread, paced (~200 frames/s) so live indexing and the Pi stay
+        responsive."""
+        for sg in list(self.recorder.list()):
+            if sg.get("active"):
+                continue
+            mpath = sg["path"][:-4] + ".metrics.jsonl"
+            if os.path.exists(mpath):
+                continue
+            log("indexer: backfilling", sg["name"])
+            n = 0
+            with open(mpath + ".tmp", "w") as out:
+                for t, meta, c1, c2 in Recorder.iter_file(sg["path"]):
+                    row = {"t": round(t, 3), "tb": meta["hdr"].get("tb"), "rng1": meta["hdr"].get("rng1"), "rng2": meta["hdr"].get("rng2"),
+                           "ch1": self.metrics(c1, meta["rate"], meta["vpc1"], meta.get("zero1", 0.0)),
+                           "ch2": self.metrics(c2, meta["rate"], meta["vpc2"], meta.get("zero2", 0.0))}
+                    out.write(json.dumps(row, separators=(",", ":")) + "\n")
+                    n += 1
+                    if n % 50 == 0:
+                        time.sleep(0.25)           # paced: ~200 frames/s max, own thread
+            os.replace(mpath + ".tmp", mpath)
+            log("indexer: backfilled %s (%d frames)" % (sg["name"], n))
+
+    def submit(self, seg_path, t, meta, c1, c2):
+        with self.cv:
+            if len(self.q) >= 300:
+                self.q.pop(0)
+                self.dropped += 1
+            self.q.append((seg_path, t, meta, c1, c2))
+            self.cv.notify()
+
+    @staticmethod
+    def metrics(raw, rate, vpc, zero):
+        if SA is None:
+            return None
+        lv = SA.levels(raw, vpc, zero)
+        fq = SA.frequency(raw, rate) if lv["span_counts"] >= 6 else None
+        pm = SA.pulse_metrics(raw, rate) if lv["span_counts"] >= 6 else None
+        return {"amp": round(lv["vamp"], 5), "mean": round(lv["vavg"], 5), "rms": round(lv["vrms_ac"], 5),
+                "freq": round(fq, 3) if fq else None, "clipped": int(lv["clipped"]),
+                "glitches": pm["glitches"] if pm else 0, "duty": round(pm["duty"], 4) if (pm and pm["duty"] is not None) else None,
+                "span": lv["span_counts"]}
+
+    def _backfill_thread(self):
+        try:
+            self.backfill()
+        except Exception as e:
+            log("indexer backfill:", e)
+
+    def run(self):
+        threading.Thread(target=self._backfill_thread, daemon=True).start()   # never blocks live indexing
+        while True:
+            with self.cv:
+                while not self.q:
+                    self.cv.wait()
+                seg_path, t, meta, c1, c2 = self.q.pop(0)
+            try:
+                row = {"t": round(t, 3), "tb": meta["hdr"].get("tb"), "rng1": meta["hdr"].get("rng1"), "rng2": meta["hdr"].get("rng2"),
+                       "ch1": self.metrics(c1, meta["rate"], meta["vpc1"], meta.get("zero1", 0.0)),
+                       "ch2": self.metrics(c2, meta["rate"], meta["vpc2"], meta.get("zero2", 0.0))}
+                path = seg_path[:-4] + ".metrics.jsonl"
+                if path != self.fh_path:
+                    if self.fh:
+                        self.fh.close()
+                    self.fh = open(path, "a")
+                    self.fh_path = path
+                self.fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+                if (int(t) % 2) == 0:
+                    self.fh.flush()
+            except Exception as e:
+                log("indexer:", e)
+
+
+def parse_where(expr):
+    """'ch2_mean<4.5,ch1_glitches>0' -> list of (ch, field, op, value). ops: < <= > >= == !="""
+    conds = []
+    for part in (expr or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^(ch[12])_(amp|mean|rms|freq|clipped|glitches|duty|span)\s*(<=|>=|==|!=|<|>)\s*(-?[\d.eE+-]+)$", part)
+        if not m:
+            raise ValueError("bad condition %r (use e.g. ch2_mean<4.5, ch1_glitches>0)" % part)
+        conds.append((m.group(1), m.group(2), m.group(3), float(m.group(4))))
+    return conds
+
+
+def row_matches(row, conds):
+    for ch, field, op, val in conds:
+        m = row.get(ch) or {}
+        x = m.get(field)
+        if x is None:
+            return False
+        x = float(x)
+        if not {"<": x < val, "<=": x <= val, ">": x > val, ">=": x >= val, "==": x == val, "!=": x != val}[op]:
+            return False
+    return True
+
+
+def find_events(recorder, t0, t1, conds, gap=2.0, limit_rows=200000):
+    """Scan metrics sidecars in [t0, t1]; cluster matching rows into events (new event after `gap` s)."""
+    events, scanned, matched = [], 0, 0
+    cur = None
+    for sg in recorder.list():
+        if sg["t0"] is None or sg["t0"] > t1 or (sg["t1"] or time.time()) < t0:
+            continue
+        path = sg["path"][:-4] + ".metrics.jsonl"
+        try:
+            fh = open(path)
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                t = row["t"]
+                if t < t0 or t > t1:
+                    continue
+                scanned += 1
+                if scanned > limit_rows:
+                    break
+                if not row_matches(row, conds):
+                    continue
+                matched += 1
+                if cur and t - cur["last"] <= gap:
+                    cur["last"] = t; cur["count"] += 1
+                else:
+                    cur = {"first": t, "last": t, "count": 1, "sample": row}
+                    events.append(cur)
+                # keep the most extreme sample per event for the first condition
+                if conds:
+                    ch, field, op, _ = conds[0]
+                    a = (cur["sample"].get(ch) or {}).get(field); b = (row.get(ch) or {}).get(field)
+                    if a is not None and b is not None and ((op in ("<", "<=") and b < a) or (op in (">", ">=") and b > a)):
+                        cur["sample"] = row
+    return {"scanned": scanned, "matched": matched, "events": events}
 
 
 class Hub:
@@ -591,6 +750,9 @@ class Hub:
             if recorder is not None:
                 try:
                     recorder.write(fr, c1, c2)
+                    if indexer is not None and recorder.cur:
+                        indexer.submit(recorder.cur["path"], fr["t"],
+                                       {"hdr": h, "rate": rate, "vpc1": vpc1, "vpc2": vpc2, "zero1": z1, "zero2": z2}, c1, c2)
                 except Exception as e:
                     self.errors += 1
                     self.status = "recorder: %s" % e
@@ -676,6 +838,19 @@ def make_http_handler(hub):
                 with open(sg["path"], "rb") as f:
                     data = f.read()
                 return self._send(200, data, "application/octet-stream", {"Content-Disposition": 'attachment; filename="%s"' % name})
+            if p.startswith("/api/events"):
+                q = dict(x.split("=", 1) for x in (self.path.split("?", 1)[1].split("&") if "?" in self.path else []) if "=" in x)
+                try:
+                    t0 = float(q.get("from", time.time() - 3600)); t1 = float(q.get("to", time.time()))
+                    conds = parse_where(urllib_unquote(q.get("where", "")))
+                    gap = float(q.get("gap", 2.0))
+                except ValueError as e:
+                    return self._send(400, {"error": str(e)})
+                if recorder is None:
+                    return self._send(503, {"error": "recorder disabled"})
+                res = find_events(recorder, t0, t1, conds, gap)
+                res.update({"from": t0, "to": t1, "where": q.get("where", ""), "indexer_dropped": indexer.dropped if indexer else None})
+                return self._send(200, res)
             if p.startswith("/api/analyze"):
                 if SA is None:
                     return self._send(503, {"error": "scope_analysis not available on the Pi: %s" % SA_ERR})
@@ -884,6 +1059,12 @@ class ThreadingTCP(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 recorder = None
+indexer = None
+
+
+def urllib_unquote(x):
+    import urllib.parse
+    return urllib.parse.unquote_plus(x)
 
 
 def main():
@@ -896,9 +1077,12 @@ def main():
     ap.add_argument("--max-gb", type=float, default=40.0, help="ring size for raw records (54 GB free on the Pi, 2026-10-11)")
     ap.add_argument("--record-always", type=int, default=1, help="1: keep polling+recording even with no viewer")
     a = ap.parse_args()
+    global indexer
     if a.records:
         recorder = Recorder(a.records, int(a.max_gb * 1e9))
         recorder.forced = bool(a.record_always)
+        indexer = Indexer(recorder)
+        indexer.start()
         st = recorder.status()
         log("recorder: %s, %d segments, %.1f MB, ring %.0f GB, always=%s" % (a.records, st["segments"], st["total_mb"], a.max_gb, recorder.forced))
     scope = Scope()

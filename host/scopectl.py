@@ -87,6 +87,33 @@ def analyze(fs, ch, info, p=None):
     return SA.analyze_records([rec_from_frame(f, ch, info) for f in fs], p)
 
 
+import re as _re
+
+
+def SA_parse_where(expr):
+    conds = []
+    for part in (expr or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = _re.match(r"^(ch[12])_(amp|mean|rms|freq|clipped|glitches|duty|span)\s*(<=|>=|==|!=|<|>)\s*(-?[\d.eE+-]+)$", part)
+        if not m:
+            raise SystemExit("bad condition %r (e.g. ch2_mean<4.5, ch1_glitches>0)" % part)
+        conds.append((m.group(1), m.group(2), m.group(3), float(m.group(4))))
+    return conds
+
+
+def SA_row_matches(row, conds):
+    for ch, field, op, val in conds:
+        x = (row.get(ch) or {}).get(field)
+        if x is None:
+            return False
+        x = float(x)
+        if not {"<": x < val, "<=": x <= val, ">": x > val, ">=": x >= val, "==": x == val, "!=": x != val}[op]:
+            return False
+    return True
+
+
 def parse_params(items):
     kw = {}
     for it in items or []:
@@ -248,6 +275,8 @@ def main():
     p = sub.add_parser("calib"); p.add_argument("action", choices=["show", "clear"]); p.add_argument("--ch", type=int); p.add_argument("--rng", type=int)
     p = sub.add_parser("record", help="raw recorder on the Pi (every frame, ring-limited)"); p.add_argument("action", choices=["start", "stop", "status"]); p.add_argument("--max-gb", type=float)
     p = sub.add_parser("records", help="list/fetch stored raw segments"); p.add_argument("action", choices=["list", "fetch"]); p.add_argument("--from", dest="t0"); p.add_argument("--to", dest="t1"); p.add_argument("--every", type=int, default=1); p.add_argument("--limit", type=int, default=5000); p.add_argument("out", nargs="?")
+    p = sub.add_parser("find", help="events in the recorded metrics index, e.g. --where 'ch2_mean<4.5,ch1_glitches>0'"); p.add_argument("--from", dest="t0", default="-1h"); p.add_argument("--to", dest="t1", default="now"); p.add_argument("--where", required=True); p.add_argument("--gap", type=float, default=2.0); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("watch", help="live: report the moment a condition trips, e.g. --where 'ch2_mean<4.5'"); p.add_argument("--where", required=True); p.add_argument("--for", dest="duration", default="10m"); p.add_argument("--all", action="store_true", help="print every trip, not just the first")
     p = sub.add_parser("replay", help="re-evaluate a stored time window with chosen criteria"); p.add_argument("--from", dest="t0", required=True); p.add_argument("--to", dest="t1", default="now"); p.add_argument("--ch", default="both"); p.add_argument("--every", type=int, default=1); p.add_argument("--limit", type=int, default=5000); p.add_argument("--param", action="append", help="e.g. hyst=0.1 glitch_ratio=0.3 low_res=16"); p.add_argument("--png", help="strip chart of amplitude/mean/freq over time"); p.add_argument("--csv", help="per-frame metrics"); p.add_argument("--json", action="store_true"); p.add_argument("--server", action="store_true", help="run the analysis on the Pi (/api/analyze) instead of locally")
     a = ap.parse_args()
     URL = a.url
@@ -450,6 +479,51 @@ def main():
         data = api("/api/records/query?from=%f&to=%f&every=%d&limit=%d" % (t0, t1, a.every, a.limit), timeout=300)
         out = a.out or time.strftime("scope_records_%Y%m%d_%H%M%S.json")
         open(out, "w").write(json.dumps(data)); print("saved %s: %d frames" % (out, len(data["frames"]))); return
+
+    if a.cmd == "find":
+        t0, t1 = parse_time(a.t0), parse_time(a.t1)
+        import urllib.parse
+        res = api("/api/events?from=%f&to=%f&gap=%f&where=%s" % (t0, t1, a.gap, urllib.parse.quote(a.where)), timeout=600)
+        if a.json:
+            print(json.dumps(res, indent=1)); return
+        print("%s .. %s  where %s: %d frames scanned, %d matched, %d event(s)%s" % (
+            time.strftime("%m-%d %H:%M:%S", time.localtime(t0)), time.strftime("%H:%M:%S", time.localtime(t1)), a.where,
+            res["scanned"], res["matched"], len(res["events"]), ("  (indexer dropped %d frames)" % res["indexer_dropped"]) if res.get("indexer_dropped") else ""))
+        ch = a.where.split("_")[0]
+        for ev in res["events"][:50]:
+            sm = ev["sample"].get(ch) or {}
+            print("  %s .. %s  %5d frames  extreme: amp %s mean %s freq %s glitches %s clipped %s" % (
+                time.strftime("%m-%d %H:%M:%S", time.localtime(ev["first"])), time.strftime("%H:%M:%S", time.localtime(ev["last"])), ev["count"],
+                sm.get("amp"), sm.get("mean"), sm.get("freq"), sm.get("glitches"), sm.get("clipped")))
+        if len(res["events"]) > 50:
+            print("  ... %d more" % (len(res["events"]) - 50))
+        if res["events"]:
+            print("replay one: scopectl replay --from=%.0f --to=%.0f --ch %s --png /tmp/ev.png" % (res["events"][0]["first"] - 1, res["events"][0]["last"] + 1, ch[-1]))
+        return
+
+    if a.cmd == "watch":
+        conds = SA_parse_where(a.where)
+        t_end = time.time() + (time.time() - parse_time("-" + a.duration))     # "-10m" ago -> +10 min from now
+        print("watching for %s until %s ..." % (a.where, time.strftime("%H:%M:%S", time.localtime(t_end))))
+        last_seq, tripped = None, 0
+        while time.time() < t_end:
+            f = api("/api/frame.json")
+            if not f or f.get("seq") == last_seq:
+                time.sleep(0.05); continue
+            last_seq = f["seq"]
+            row = {"t": f["t"]}
+            for ch in (1, 2):
+                m = f["meas"]["ch%d" % ch]
+                row["ch%d" % ch] = {"amp": m.get("vamp"), "mean": m.get("vavg"), "rms": m.get("vrms_ac"), "freq": m.get("freq"),
+                                    "clipped": int(bool(m.get("clipped"))), "glitches": None, "duty": m.get("duty"), "span": None}
+            if all(((row.get(c) or {}).get(fld) is not None) for c, fld, _, _ in conds) and SA_row_matches(row, conds):
+                tripped += 1
+                vals = ", ".join("%s_%s=%s" % (c, fld, (row.get(c) or {}).get(fld)) for c, fld, _, _ in conds)
+                print("TRIPPED at %s: %s" % (time.strftime("%H:%M:%S", time.localtime(f["t"])), vals))
+                if not a.all:
+                    return
+        print("not tripped" if not tripped else "%d trips" % tripped)
+        return
 
     if a.cmd == "replay":
         t0, t1 = parse_time(a.t0), parse_time(a.t1)
