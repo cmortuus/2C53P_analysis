@@ -815,6 +815,26 @@ def make_http_handler(hub):
                 return self._send(200, hub.latest or {})
             if p == "/api/calib":
                 return self._send(200, CALIB)
+            if p == "/api/health":
+                st = os.statvfs(recorder.root if recorder else "/")
+                fr = hub.latest or {}
+                try:
+                    with open("/proc/uptime") as f:
+                        up = float(f.read().split()[0])
+                except Exception:
+                    up = None
+                try:
+                    fw = scope.cmd("version", timeout=3) if scope.ser else ""
+                except Exception as e:
+                    fw = "error: %s" % e
+                rs = recorder.status() if recorder else {}
+                return self._send(200, {
+                    "time": time.time(), "pi_uptime_s": up, "load": os.getloadavg(),
+                    "disk_free_gb": st.f_bavail * st.f_frsize / 1e9, "disk_total_gb": st.f_blocks * st.f_frsize / 1e9,
+                    "scope": {"status": hub.status, "port": scope.port, "fps": fr.get("fps"), "errors": hub.errors,
+                              "last_frame_age_s": (time.time() - fr["t"]) if fr else None, "firmware": fw.strip().splitlines()[:2]},
+                    "recorder": {k: rs.get(k) for k in ("enabled", "forced", "segments", "total_mb", "frames_total", "indexer_backlog", "indexer_dropped")},
+                    "logging": hub.logging, "viewers": hub.viewers, "calib": CALIB})
             if p == "/api/record":
                 return self._send(200, recorder.status() if recorder else {"enabled": False})
             if p == "/api/records":

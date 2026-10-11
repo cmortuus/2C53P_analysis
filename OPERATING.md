@@ -8,6 +8,7 @@ and explains in plain language. The owner only connects probes.
 ## The one tool: `host/scopectl.py` (runs on the Mac, talks to the Pi's API)
 ```bash
 P=.venv/bin/python
+$P host/scopectl.py health                       # whole chain: link, fps, firmware, recorder, index, disk, Pi load -> ALL OK?
 $P host/scopectl.py status                       # link, settings, both channels at a glance
 $P host/scopectl.py wait --ch any --timeout 300  # block until a probe sees something (ask the owner to hook up, then run this)
 $P host/scopectl.py autoset --ch 2 --png /tmp/a.png   # finest non-clipping range, ~10 cycles, mid-level trigger

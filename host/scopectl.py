@@ -263,6 +263,7 @@ def main():
     ap.add_argument("--url", default=URL)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    sub.add_parser("health", help="one-shot check of the whole chain (link, fps, recorder, index, disk, load, firmware)")
     p = sub.add_parser("wait"); p.add_argument("--ch", default="any"); p.add_argument("--timeout", type=float, default=120); p.add_argument("--counts", type=int, default=12)
     p = sub.add_parser("autoset"); p.add_argument("--ch", default="1", help="1, 2 or both"); p.add_argument("--png")
     p = sub.add_parser("report"); p.add_argument("dir"); p.add_argument("--ch", default="both"); p.add_argument("--no-autoset", action="store_true"); p.add_argument("--title", default="")
@@ -296,6 +297,23 @@ def main():
                       fmt(c["meas"]["vamp"], "V" if c["vpc"] else "cnt"), fmt(c["meas"]["vavg"], "V" if c["vpc"] else "cnt"),
                       fmt_f(c["meas"]["freq"]) if c["meas"].get("freq") else "--", "  CLIPPED" if c["meas"]["clipped"] else ""))
         lg = api("/api/log"); print("logger:   %s, %d rows" % ("ON" if lg["logging"] else "off", lg["rows"]))
+        return
+
+    if a.cmd == "health":
+        h = api("/api/health")
+        sc, rc = h["scope"], h["recorder"]
+        ok = []
+        def line(label, val, good):
+            ok.append(good); print("%s %-10s %s" % ("OK " if good else "!! ", label, val))
+        line("link", "%s on %s" % (sc["status"], sc["port"]), sc["status"] == "ok")
+        line("frames", "%.1f fps, last %.1fs ago, %d errors" % (sc["fps"] or 0, sc["last_frame_age_s"] or 99, sc["errors"]), (sc["fps"] or 0) > 5 and (sc["last_frame_age_s"] or 99) < 5)
+        line("firmware", " | ".join(sc["firmware"]) if sc["firmware"] else "(no answer)", bool(sc["firmware"]))
+        line("recorder", "%s, %d segments, %.1f MB, %s frames" % ("on" if rc["enabled"] else "OFF", rc["segments"] or 0, rc["total_mb"] or 0, rc["frames_total"]), bool(rc["enabled"]))
+        line("index", "backlog %s, dropped %s" % (rc["indexer_backlog"], rc["indexer_dropped"]), (rc["indexer_backlog"] or 0) < 100)
+        line("disk", "%.1f of %.1f GB free" % (h["disk_free_gb"], h["disk_total_gb"]), h["disk_free_gb"] > 5)
+        line("pi", "load %.2f %.2f %.2f, up %.1f h, %d viewer(s), logging %s" % (*h["load"], (h["pi_uptime_s"] or 0) / 3600, h["viewers"], h["logging"]), h["load"][0] < 3.5)
+        line("calib", "gain %s zero %s" % (h["calib"]["gain"], {c: {r: round(v, 1) for r, v in d.items()} for c, d in h["calib"]["zero"].items()}), True)
+        print("ALL OK" if all(ok) else "ATTENTION NEEDED")
         return
 
     if a.cmd == "wait":
