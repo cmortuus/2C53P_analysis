@@ -483,7 +483,8 @@ class Recorder:
         if not self.enabled:
             return
         meta = {"hdr": fr["hdr"], "rate": fr["rate"], "vpc1": fr["vpc1"], "vpc2": fr["vpc2"],
-                "zero1": fr.get("zero1", 0.0), "zero2": fr.get("zero2", 0.0), "seq": fr["seq"], "n": len(c1)}
+                "zero1": fr.get("zero1", 0.0), "zero2": fr.get("zero2", 0.0), "seq": fr["seq"], "n": len(c1),
+                "seam": fr.get("seam", 0)}
         mb = json.dumps(meta, separators=(",", ":")).encode()
         rec = self.MAGIC + struct.pack("<dI", fr["t"], len(mb)) + mb + c1 + c2
         with self.lock:
@@ -745,12 +746,28 @@ class Hub:
             times = [t for t in times if now - t < 3.0] + [now]
             self.fps = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else 0.0
             rate = RATE_OVERRIDE.get(h.get("tb")) or h.get("rate_hz") or TIMEBASE_RATE.get(h.get("tb"), 0)
+            # Free-run records hold one ring-buffer seam at a random position. Rotate BOTH
+            # channels by the same amount (found on the channel with the larger swing) so the
+            # record is continuous for the viewer, the measurements and the recorder; `seam`
+            # in the frame says how far (0 = untouched; the firmware's own strobed records are
+            # already ordered).
+            seam_k = 0
+            if SA is not None and not h.get("ordered"):
+                try:
+                    pick = c1 if (max(c1) - min(c1)) >= (max(c2) - min(c2)) else c2
+                    k = SA.find_seam(pick)
+                    if k and 0 < k < len(c1) - 1:
+                        c1 = c1[k:] + c1[:k]
+                        c2 = c2[k:] + c2[:k]
+                        seam_k = k
+                except Exception:
+                    seam_k = 0
             vpc1 = h.get("vpc1_nv", 0) / 1e9 * calib_gain(1, h.get("rng1"))
             vpc2 = h.get("vpc2_nv", 0) / 1e9 * calib_gain(2, h.get("rng2"))
             z1, z2 = calib_zero(1, h.get("rng1")), calib_zero(2, h.get("rng2"))
             fr = {"seq": self.seq + 1, "t": now, "hdr": h, "rate": rate, "vpc1": vpc1, "vpc2": vpc2,
                   "ch1": base64.b64encode(c1).decode(), "ch2": base64.b64encode(c2).decode(),
-                  "zero1": z1, "zero2": z2,
+                  "zero1": z1, "zero2": z2, "seam": seam_k,
                   "meas": {"ch1": measure(c1, vpc1, rate, z1), "ch2": measure(c2, vpc2, rate, z2)},
                   "fps": round(self.fps, 1), "errors": self.errors}
             if recorder is not None:

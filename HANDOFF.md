@@ -1,5 +1,9 @@
 # FNIRSI 2C53P — read & control from a computer (handoff)
 
+## 02:40: live frames are seam-free; sigrok ready for the logic analyzer
+- The hub now rotates BOTH channels of every free-run frame by the seam found on the channel with the larger swing (`seam` field in the frame JSON and in the recorder meta; 0 = untouched/ordered), so the viewer trace, the measurements, the index and the stored records are continuous. Verified: frames report seams at random positions, measurements unchanged, step-interval jitter 0 %.
+- `sigrok-cli 0.7.2` + `sigrok-firmware-fx2lafw` installed on the Pi (apt) for the 24 MHz 8-channel analyzer the owner is ordering (needs a micro-USB OTG hub: the Pi Zero's one port holds the scope). Plan: `sigrok-cli -d fx2lafw --continuous` capture to `/home/pi/records`, decoders (uart/i2c/spi/step-dir) and the same find/replay tooling.
+
 ## NIGHT ADDITIONS (2026-10-11 02:00–02:30): r13 flashed, decoders, averaging, references, seam handling
 - **r13 FLASHED** (`…+ui-fnirsi-r13-fasttb.bin`): device knows the fast rates (label "6us/div" at 0x08, Freq chip works there). Edge check with the corrected estimator: rise < 1 sample at every code (the Pi's edges are faster than 200 ns), shape "square" at all codes 0x08–0x0C.
 - **Analysis fixes:** rise/fall 10–90 % and the shape classifier now use the flat levels (medians), not min/max — the Pi's fast edges ring (+1 V overshoot) and had turned a 100 kHz square into "triangle, rise 4.9 µs". New `overshoot` figure + flag.
