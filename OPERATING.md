@@ -77,6 +77,10 @@ time, which is how a sagging rail or an intermittent contact shows up.
 - **Ranges:** 0–3 are uncalibrated on this unit (OpenScope has no gain for them) — counts only.
   Ranges 4 and 8/9 are "provisional" (±10 %). Ranges 5–7 are measured: CH1 within ~2 %,
   **CH2 reads ~6 % low** on ranges 6/7 (sweep 2026-10-10 against the Pi's 3.3 V reference).
+- **Current state (2026-10-11):** both channels boot centred (firmware r15). CH1 calibrated on
+  ranges 6–9 to ±0.2 %, CH2 on 6–7; CH2 8/9 and ranges 4/5 of both channels still use OpenScope's
+  factory-of-another-unit gains (4 and 8/9 were off by up to 30 % on CH1). Re-run
+  `host/t_calibrate.py --ch N` whenever a probe is on the Pi reference pins.
 - **Per-unit calibration lives on the Pi** (`/opt/scope/calib.json`, applied to every frame, the
   viewer, scopectl and the logger). Done 2026-10-11 for CH2 ranges 6 and 7 against the Pi's own
   reference (zero: GPIO18 driven low; gain: the 3.3 V square): zero −16.9 counts on both ranges

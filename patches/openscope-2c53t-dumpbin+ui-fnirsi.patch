@@ -13,10 +13,39 @@ index 415adbe..e172ab8 100644
  C_SOURCES += src/ui/meter_ui.c
  C_SOURCES += src/ui/softkey.c
 diff --git a/firmware/src/drivers/fpga.c b/firmware/src/drivers/fpga.c
-index 00816fa..891485e 100644
+index 00816fa..00a4a52 100644
 --- a/firmware/src/drivers/fpga.c
 +++ b/firmware/src/drivers/fpga.c
-@@ -4203,10 +4203,12 @@ bool fpga_acq_pause(void)
+@@ -39,6 +39,19 @@
+ #include "semphr.h"
+ #include <string.h>
+ 
++/* Per-unit offset references that put 0 V at ADC mid-scale (128) on every range.
++ * OpenScope's values (2048 / 2544) were measured on bench unit #1; on the owner's unit
++ * (2026-10-11, input driven to 0 V by a Raspberry Pi GPIO, range 6, linear fit over
++ * 4 codes) CH1 needs 2748 (slope 0.120 count/code; at 2048 its 0 V sat BELOW the ADC
++ * floor of ~44 counts) and CH2 needs 2678 (slope 0.123 count/code; 2544 read 112).
++ * Override at build time for another unit: -DCH1_OFFSET_DAC_BOOT=... */
++#ifndef CH1_OFFSET_DAC_BOOT
++#define CH1_OFFSET_DAC_BOOT 2748u
++#endif
++#ifndef CH2_OFFSET_PWM_BOOT
++#define CH2_OFFSET_PWM_BOOT 2678u
++#endif
++
+ /* ═══════════════════════════════════════════════════════════════════
+  * Hardware Register Access
+  * ═══════════════════════════════════════════════════════════════════ */
+@@ -4160,7 +4173,7 @@ static void fpga_warmtest_acq_task(void *pv)
+              * capture. Rare by construction, so it does not fight the UI
+              * vertical-position control the way a per-poll re-arm would. */
+             if (++fpga.spi3_timeout_count >= 32) {
+-                scope_trigger_dac_raw(2048);
++                scope_trigger_dac_raw(CH1_OFFSET_DAC_BOOT);
+                 fpga.spi3_timeout_count = 0;
+             }
+         }
+@@ -4203,10 +4216,12 @@ bool fpga_acq_pause(void)
       * trigger-mode edge wait (≤FPGA_NORMAL_TRIG_WAIT_MS) + two 1026-byte
       * reads + 10 ms. Queue task: one acquisition (≤ a few ms) or the 100 ms
       * bounded queue wait. 1 s is comfortable margin for both. */
@@ -31,6 +60,24 @@ index 00816fa..891485e 100644
      }
      acq_pause_req = false;      /* don't leave a half-armed request behind */
      return false;
+@@ -5834,7 +5849,7 @@ void fpga_init(void)
+      * Ordering: main() ran dac_output_init() (siggen) before fpga_init(), so
+      * this write is not clobbered at boot; do NOT start siggen output in
+      * this build, it shares DAC1 and would drop the reference. */
+-    scope_trigger_dac_raw(2048);
++    scope_trigger_dac_raw(CH1_OFFSET_DAC_BOOT);
+ 
+ #if FPGA_CH2_TRIGGER
+     /* CH2 trigger reference — TMR13 CH1 PWM-DAC on PA6, the CH2 analog of the
+@@ -5853,7 +5868,7 @@ void fpga_init(void)
+      * left CH2 at mean ~65 (low, looked like "railed noise" with no signal);
+      * 2544 boots CH2 centered, mirroring CH1's fixed-arm pattern. The runtime
+      * `fpga scope center ch2` servo refines this per-range / per-unit. */
+-    scope_trigger_ch2_raw(2544);
++    scope_trigger_ch2_raw(CH2_OFFSET_PWM_BOOT);
+ #endif
+ 
+     /* Frontend relays — bench run 3 (2026-08-12, first live capture): the
 diff --git a/firmware/src/drivers/usb_debug.c b/firmware/src/drivers/usb_debug.c
 index dd5d5fa..d476285 100644
 --- a/firmware/src/drivers/usb_debug.c

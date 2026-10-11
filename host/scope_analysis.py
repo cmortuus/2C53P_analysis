@@ -40,13 +40,30 @@ class Params:
 
 
 # ------------------------------------------------------------------ basic levels
+def plateau_levels(raw, mean=None):
+    """top/base = mean of the samples in the upper/lower cluster that lie within
+    max(2 counts, 15 % of the span) of that cluster's median. Robust to edges and
+    overshoot like a median, but sub-count precise (ADC noise dithers), which matters
+    on coarse ranges where a step is only 8-16 counts tall."""
+    if mean is None:
+        mean = sum(raw) / len(raw)
+    span = max(raw) - min(raw)
+    tol = max(2.0, 0.15 * span)
+    out = []
+    for grp in (sorted(x for x in raw if x > mean), sorted(x for x in raw if x <= mean)):
+        if not grp:
+            out.append(mean); continue
+        med = grp[len(grp) // 2]
+        keep = [x for x in grp if abs(x - med) <= tol]
+        out.append(sum(keep) / len(keep))
+    return out[0], out[1]
+
+
 def levels(raw, vpc=0.0, zero=0.0):
     """top/base = medians of the samples above/below the mean; vpp = max-min; mean; AC rms."""
     n = len(raw)
     mean = sum(raw) / n
-    above = sorted(x for x in raw if x > mean) or [mean]
-    below = sorted(x for x in raw if x <= mean) or [mean]
-    top_c, base_c = above[len(above) // 2], below[len(below) // 2]
+    top_c, base_c = plateau_levels(raw, mean)
     var = sum((x - mean) ** 2 for x in raw) / n
     mn, mx = min(raw), max(raw)
     k = vpc if vpc else 1.0

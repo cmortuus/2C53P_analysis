@@ -327,9 +327,12 @@ def measure(raw, vpc, rate, zero_counts=0.0):
     zero = (128 + zero_counts) if vpc else 0
     # Top/base = median of the samples above/below the mean: a square wave's flat levels,
     # immune to noise peaks and overshoot (max-min over-reads by 2-3 counts on coarse ranges).
-    above = sorted(x for x in raw if x > mean) or [mean]
-    below = sorted(x for x in raw if x <= mean) or [mean]
-    vtop, vbase = above[len(above) // 2], below[len(below) // 2]
+    if SA is not None:
+        vtop, vbase = SA.plateau_levels(raw, mean)       # sub-count, edge/overshoot-robust
+    else:
+        above = sorted(x for x in raw if x > mean) or [mean]
+        below = sorted(x for x in raw if x <= mean) or [mean]
+        vtop, vbase = above[len(above) // 2], below[len(below) // 2]
     out = {"unit": unit, "vmax": (mx - zero) * s, "vmin": (mn - zero) * s, "vpp": (mx - mn) * s,
            "vtop": (vtop - zero) * s, "vbase": (vbase - zero) * s, "vamp": (vtop - vbase) * s,
            "vavg": (mean - zero) * s, "vrms_ac": math.sqrt(var) * s,
