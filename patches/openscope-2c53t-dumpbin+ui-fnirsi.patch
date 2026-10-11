@@ -1,13 +1,14 @@
 diff --git a/firmware/Makefile b/firmware/Makefile
-index 415adbe..0df1460 100644
+index 415adbe..e172ab8 100644
 --- a/firmware/Makefile
 +++ b/firmware/Makefile
-@@ -33,6 +33,8 @@ FEATURES ?= FFT
+@@ -33,6 +33,9 @@ FEATURES ?= FFT
  C_SOURCES  = src/main.c
  C_SOURCES += src/drivers/lcd.c
  C_SOURCES += src/ui/status_bar.c
 +C_SOURCES += src/ui/scope_topbar.c
 +C_SOURCES += src/ui/scope_freq_edges.c
++C_SOURCES += src/ui/idle_off.c
  C_SOURCES += src/ui/scope_ui.c
  C_SOURCES += src/ui/meter_ui.c
  C_SOURCES += src/ui/softkey.c
@@ -31,10 +32,19 @@ index 00816fa..891485e 100644
      acq_pause_req = false;      /* don't leave a half-armed request behind */
      return false;
 diff --git a/firmware/src/drivers/usb_debug.c b/firmware/src/drivers/usb_debug.c
-index dd5d5fa..4bf5e1c 100644
+index dd5d5fa..6d552f0 100644
 --- a/firmware/src/drivers/usb_debug.c
 +++ b/firmware/src/drivers/usb_debug.c
-@@ -193,6 +193,28 @@ static void usb_send_str(const char *str)
+@@ -39,6 +39,8 @@
+ #endif
+ #include "scope_trigger.h"
+ #include "fpga.h"
++#include "idle_off.h"
++static void cmd_idle(const char *args);   /* defined after the command table */
+ #include "lcd.h"
+ #include "meter_auto.h"
+ #include "meter_autoselect.h"
+@@ -193,6 +195,28 @@ static void usb_send_str(const char *str)
      usb_send_bytes((const uint8_t *)str, strlen(str));
  }
  
@@ -63,7 +73,7 @@ index dd5d5fa..4bf5e1c 100644
  int usb_debug_printf(const char *fmt, ...)
  {
      char buf[256];
-@@ -2156,6 +2178,99 @@ static void cmd_screen_dumpbin(const char *args)
+@@ -2156,6 +2180,99 @@ static void cmd_screen_dumpbin(const char *args)
      usb_send_str("\r\nSCREENBIN END\r\n");
  }
  
@@ -163,7 +173,16 @@ index dd5d5fa..4bf5e1c 100644
  static void cmd_screen_shadow(const char *args)
  {
      if (args == NULL || *args == '\0') {
-@@ -7892,6 +8007,8 @@ static const shell_cmd_t shell_cmds[] = {
+@@ -7833,6 +7950,8 @@ static const shell_cmd_t shell_cmds[] = {
+           "help                            Show this help\r\n"),
+     CMD_V("?", cmd_help, SC_EXACT,
+           NULL /* alias */),
++    CMD_A("idle", cmd_idle, 0,
++          "idle [off|<min>]                Auto power-off after N min without a button/shell command (default 5)\r\n"),
+     CMD_V("version", cmd_version, SC_EXACT,
+           "version                         Firmware info\r\n"),
+     CMD_V("status", cmd_status, SC_EXACT,
+@@ -7892,6 +8011,8 @@ static const shell_cmd_t shell_cmds[] = {
            "screen dump [shadow] [x y w h]  Dump text indexed4 LCD shadow\r\n"),
      CMD_A("screen dumpbin", cmd_screen_dumpbin, 0,
            "screen dumpbin [x y w h]        Binary indexed4 LCD shadow dump\r\n"),
@@ -172,11 +191,63 @@ index dd5d5fa..4bf5e1c 100644
      CMD_A("screen shadow", cmd_screen_shadow, 0,
            "screen shadow page [y]          Clear full-screen shadow capture\r\n"),
      CMD_A("fpga cmd", cmd_fpga_cmd, SC_NEEDARGS,
+@@ -8122,6 +8243,21 @@ static void cmd_help(void)
+     usb_send_str("\r\n");
+ }
+ 
++static void cmd_idle(const char *args)
++{
++    while (*args == ' ') args++;
++    if (strncmp(args, "off", 3) == 0)
++        idle_off_set_minutes(0);
++    else if (*args >= '0' && *args <= '9')
++        idle_off_set_minutes((uint16_t)atoi(args));
++    usb_debug_printf("auto power-off: %s (idle %lus, %s)\r\n",
++                     idle_off_get_minutes() ? "on" : "off", (unsigned long)idle_off_idle_seconds(),
++                     idle_off_asleep() ? "DARK SLEEP" : "awake");
++    if (idle_off_get_minutes())
++        usb_debug_printf("  after %u min without a button or shell command\r\n",
++                         (unsigned)idle_off_get_minutes());
++}
++
+ static void dispatch_command(char *line)
+ {
+     /* Strip trailing \r\n */
+@@ -8130,6 +8266,7 @@ static void dispatch_command(char *line)
+         line[--len] = '\0';
+ 
+     if (len == 0) return;
++    idle_off_touch();                          /* a connected operator counts as activity */
+ 
+     /* Longest whole-word-prefix match over the table (see table comment). */
+     const shell_cmd_t *best = NULL;
 diff --git a/firmware/src/main.c b/firmware/src/main.c
-index 33b2db6..4b978fc 100644
+index 33b2db6..4243316 100644
 --- a/firmware/src/main.c
 +++ b/firmware/src/main.c
-@@ -293,11 +293,13 @@ static uint32_t info_bar_epoch(void)
+@@ -22,6 +22,7 @@ extern void system_clock_config(void);
+ /* Include our drivers and UI */
+ #include "lcd.h"
+ #include "ui.h"
++#include "idle_off.h"
+ #include "signal_gen.h"
+ #include "watchdog.h"
+ #include "scope_state.h"
+@@ -189,6 +190,13 @@ fft_result_t fft_result;
+ static TaskHandle_t  xDisplayTaskHandle = NULL;
+ static TaskHandle_t  xInputTaskHandle   = NULL;
+ static QueueHandle_t xDisplayQueue      = NULL;
++
++void ui_request_redraw_all(void)
++{
++    uint8_t c = DCMD_REDRAW_ALL;
++    if (xDisplayQueue != NULL)
++        xQueueSend(xDisplayQueue, &c, 0);
++}
+ static QueueHandle_t xInputQueue        = NULL;
+ 
+ /* Health monitor slots (assigned in main, used in task loops) */
+@@ -293,11 +301,13 @@ static uint32_t info_bar_epoch(void)
      if (current_mode == MODE_OSCILLOSCOPE) {
          const scope_state_t *s = scope_state_get();
          h = redraw_epoch_mix(h, (uint32_t)scope_view);
@@ -193,7 +264,18 @@ index 33b2db6..4b978fc 100644
  #ifdef FEATURE_FFT
          const fft_config_t *cfg = fft_get_config();
          if (cfg)
-@@ -970,7 +972,7 @@ int main(void)
+@@ -499,6 +509,10 @@ static void vDisplayTask(void *pvParameters)
+          * which is exactly the countdown flicker this flag exists to stop.
+          * The overlay owner ends with DCMD_REDRAW_ALL, which repaints
+          * everything a dropped command would have. */
++        /* Auto power-off / dark-sleep bookkeeping (idle_off.c): runs every pass,
++         * BEFORE the modal gate, because the sleep itself holds ui_modal_active. */
++        idle_off_service();
++
+         if (xQueueReceive(xDisplayQueue, &cmd, pdMS_TO_TICKS(50)) == pdTRUE) {
+             if (ui_modal_active)
+                 cmd = DCMD_NONE_MODAL_DROP;
+@@ -970,7 +984,7 @@ int main(void)
      wdt_counter_reload();
  
      /* Initialize theme system */
@@ -202,6 +284,159 @@ index 33b2db6..4b978fc 100644
  
      /* Initialize oscilloscope state */
      scope_state_init(scope_state_get());
+diff --git a/firmware/src/tasks/input_handler.c b/firmware/src/tasks/input_handler.c
+index 974bbbf..7405abb 100644
+--- a/firmware/src/tasks/input_handler.c
++++ b/firmware/src/tasks/input_handler.c
+@@ -34,6 +34,7 @@
+ #include "meter_autoselect.h"
+ #include "at32f403a_407.h"
+ #include "button_scan.h"
++#include "idle_off.h"
+ #include "settings_store.h"
+ #include "task.h"
+ #include <stdio.h>
+@@ -349,6 +350,13 @@ static void mask_auto_key(char *pb, size_t n)
+ 
+ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
+ {
++    /* Any press is activity for the auto power-off; a press that wakes a
++     * dark-sleeping scope is swallowed (idle_off.c). */
++    const bool was_asleep = idle_off_asleep();
++    idle_off_touch();
++    if (was_asleep)
++        return DCMD_REDRAW_ALL;
++
+     scope_state_t *ss = scope_state_get();
+     uint8_t cmd = DCMD_REDRAW_ALL;
+     char pb[24];
+diff --git a/firmware/src/ui/idle_off.c b/firmware/src/ui/idle_off.c
+new file mode 100644
+index 0000000..5e0488a
+--- /dev/null
++++ b/firmware/src/ui/idle_off.c
+@@ -0,0 +1,86 @@
++/*
++ * idle_off.c — see idle_off.h.
++ */
++#include "idle_off.h"
++#include "ui.h"
++#include "lcd.h"
++#include "font.h"
++#include "theme.h"
++#include "settings_store.h"
++#include "at32f403a_407.h"
++#include "FreeRTOS.h"
++#include "task.h"
++
++static volatile uint32_t last_activity_s;     /* uptime_seconds at the last activity */
++static volatile bool     wake_req;
++static volatile bool     asleep;
++static uint16_t          timeout_min = 5;
++
++void idle_off_touch(void)
++{
++    last_activity_s = uptime_seconds;
++    if (asleep)
++        wake_req = true;
++}
++
++bool idle_off_asleep(void)
++{
++    return asleep;
++}
++
++void idle_off_set_minutes(uint16_t minutes)
++{
++    timeout_min = minutes;
++    last_activity_s = uptime_seconds;
++}
++
++uint16_t idle_off_get_minutes(void)
++{
++    return timeout_min;
++}
++
++uint32_t idle_off_idle_seconds(void)
++{
++    return uptime_seconds - last_activity_s;
++}
++
++static void wake(void)
++{
++    lcd_display_on();
++    GPIOB->scr = (1U << 8);                   /* backlight on */
++    asleep = false;
++    wake_req = false;
++    last_activity_s = uptime_seconds;
++    ui_modal_active = false;
++    ui_request_redraw_all();
++}
++
++void idle_off_service(void)
++{
++    if (asleep) {
++        if (wake_req)
++            wake();
++        return;
++    }
++    if (timeout_min == 0u || idle_off_idle_seconds() < (uint32_t)timeout_min * 60u)
++        return;
++
++    /* Same sequence as the POWER button (input_handler.c), minus the countdown. */
++    const theme_t *th = theme_get();
++    ui_modal_active = true;                   /* display task drops other draws */
++    vTaskDelay(pdMS_TO_TICKS(120));
++    lcd_fill_rect(60, 80, 200, 80, th->background);
++    font_draw_string_center(160, 100, "Auto power off", th->warning, th->background, &font_medium);
++    font_draw_string_center(160, 125, "no activity", th->text_secondary, th->background, &font_small);
++    vTaskDelay(pdMS_TO_TICKS(800));
++    (void)settings_store_flush((uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
++    GPIOC->clr = (1U << 9);                   /* release the power hold */
++    vTaskDelay(pdMS_TO_TICKS(600));
++
++    /* Still here: USB (VBUS) keeps the rail up. Dark sleep instead. */
++    GPIOC->scr = (1U << 9);                   /* re-arm the hold so a wake is a normal state */
++    GPIOB->clr = (1U << 8);                   /* backlight off */
++    lcd_display_off();
++    wake_req = false;
++    asleep = true;
++}
+diff --git a/firmware/src/ui/idle_off.h b/firmware/src/ui/idle_off.h
+new file mode 100644
+index 0000000..2d2cb5e
+--- /dev/null
++++ b/firmware/src/ui/idle_off.h
+@@ -0,0 +1,29 @@
++/*
++ * idle_off.h — auto power-off after N minutes without activity.
++ *
++ * Activity = any button press (input_handle_button) or any shell command
++ * (usb_debug dispatch_command — the Pi viewer's frame polling and every
++ * remote command count, so a connected operator keeps the scope awake).
++ *
++ * After the timeout the device runs the POWER button's own shutdown
++ * sequence (settings flush, PC9 low). On USB power VBUS keeps the rail up,
++ * so if we are still running 600 ms later we fall back to a DARK SLEEP:
++ * backlight off, panel off, display task muted; the next button press or
++ * shell command wakes it (the press itself is swallowed).
++ *
++ * Shell: `idle [off|<minutes>]`. Default 5 minutes (the owner, 2026-10-10).
++ */
++#ifndef IDLE_OFF_H
++#define IDLE_OFF_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++void     idle_off_touch(void);                /* any task: note activity / request wake */
++bool     idle_off_asleep(void);
++void     idle_off_set_minutes(uint16_t minutes);   /* 0 = disabled */
++uint16_t idle_off_get_minutes(void);
++uint32_t idle_off_idle_seconds(void);
++void     idle_off_service(void);              /* display task only, every loop pass */
++
++#endif /* IDLE_OFF_H */
 diff --git a/firmware/src/ui/scope_freq_edges.c b/firmware/src/ui/scope_freq_edges.c
 new file mode 100644
 index 0000000..8d57d23
@@ -1535,6 +1770,19 @@ index 669e6c4..3260b61 100644
      THEME_CLASSIC_GREEN,    /* Tektronix-style green on black */
      THEME_HIGH_CONTRAST,    /* White background, dark traces */
      THEME_NIGHT_RED,        /* Red on black for dark environments */
+diff --git a/firmware/src/ui/ui.h b/firmware/src/ui/ui.h
+index 20d189d..9a34043 100644
+--- a/firmware/src/ui/ui.h
++++ b/firmware/src/ui/ui.h
+@@ -117,6 +117,8 @@ extern volatile float         fuse_scan_threshold_mv; /* Pass/fail threshold in
+  * renders nothing, so an overlay drawn from another task survives. Owner
+  * must clear it and send DCMD_REDRAW_ALL to hand the screen back. */
+ extern volatile bool          ui_modal_active;
++/* Post DCMD_REDRAW_ALL to the display queue from any task (idle_off wake). */
++void ui_request_redraw_all(void);
+ 
+ /* Scope feature toggles (defined in main.c) */
+ extern volatile bool          math_enabled;
 diff --git a/firmware/src/util/settings_store.c b/firmware/src/util/settings_store.c
 index 7de06db..a6e4a6a 100644
 --- a/firmware/src/util/settings_store.c

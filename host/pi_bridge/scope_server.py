@@ -42,7 +42,8 @@ RANGE_TIER = ["none"] * 4 + ["provisional", "measured", "measured", "measured", 
 
 # Commands the web UI may send. Anything else (mem write, flash, fwload…) is refused over HTTP.
 ALLOWED = [re.compile(p) for p in (
-    r"^fpga scope (timebase|vdiv|level|trigmode|edge|graticule|softtrig|hpos|measure|freq|cal)( [\w.\-]+){0,2}$",   # not `center`: it stalls the CDC shell for seconds (link drop, 2026-10-10)
+    r"^fpga scope (timebase|vdiv|level|trigmode|edge|graticule|softtrig|hpos|measure|freq|cal)( [\w.\-]+){0,2}$",
+    r"^idle( off| \d{1,3})?$",   # not `center`: it stalls the CDC shell for seconds (link drop, 2026-10-10)
     r"^btn (ch1|ch2|move|select|trigger|prm|auto|save|menu|up|down|left|right|ok)( \d+)?$",
     r"^(version|status|settings|help)$",
 )]
@@ -328,6 +329,8 @@ class Hub:
         self.errors = 0
         self.fast_ok = True
         self.status = "starting"
+        self.last_interest = time.time()   # last viewer / frame.json / command
+        self.IDLE_STOP_S = 180
         self.logging = False            # measurement logger: one row per frame, in memory
         self.log_rows = []
         self.log_started = None
@@ -336,7 +339,15 @@ class Hub:
     def loop(self):
         times = []
         while True:
-            if not self.run or (self.viewers == 0 and not self.logging and self.latest and time.time() - self.latest["t"] < 1.0):
+            # Nobody watching and not logging: poll once a second for 3 minutes, then stop
+            # polling entirely so the scope's own auto power-off / dark sleep can kick in
+            # (every shell command counts as activity on the device). A viewer, a
+            # frame.json request or a command wakes both ends again.
+            idle = self.viewers == 0 and not self.logging
+            if idle and self.viewers == 0:
+                pass
+            if not self.run or (idle and self.latest and time.time() - self.latest["t"] < 1.0) \
+               or (idle and time.time() - self.last_interest > self.IDLE_STOP_S):
                 time.sleep(0.05)
                 continue
             try:
@@ -413,12 +424,13 @@ def make_http_handler(hub):
                     return self._send(200, f.read(), "text/html; charset=utf-8")
             if p == "/api/info":
                 return self._send(200, {
-                    "timebases": [{"code": c, "rate": r, "tier": TIMEBASE_TIER.get(c, "measured"),
-                                   "s_per_div": SAMPLES_PER_DIV / r} for c, r in sorted(TIMEBASE_RATE.items(), reverse=True)],
+                    "timebases": [{"code": c, "rate": RATE_OVERRIDE.get(c, r), "tier": TIMEBASE_TIER.get(c, "measured"),
+                                   "s_per_div": SAMPLES_PER_DIV / RATE_OVERRIDE.get(c, r)} for c, r in sorted(TIMEBASE_RATE.items(), reverse=True)],
                     "mv_per_count": MV_PER_COUNT, "range_tier": RANGE_TIER,
                     "counts_per_div": COUNTS_PER_DIV, "samples_per_div": SAMPLES_PER_DIV,
                     "status": hub.status, "port": scope.port, "run": hub.run})
             if p == "/api/frame.json":
+                hub.last_interest = time.time()
                 return self._send(200, hub.latest or {})
             if p == "/api/log":
                 return self._send(200, {"logging": hub.logging, "rows": len(hub.log_rows),
@@ -484,9 +496,11 @@ def make_http_handler(hub):
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
                 hub.viewers += 1
+                hub.last_interest = time.time()
                 last = -1
                 try:
                     while True:
+                        hub.last_interest = time.time()
                         fr = hub.wait_next(last, 5.0)
                         if fr and fr["seq"] != last:
                             last = fr["seq"]

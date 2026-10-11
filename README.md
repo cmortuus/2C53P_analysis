@@ -10,13 +10,14 @@ Two handheld FNIRSI scopes, one goal: get live waveforms and control onto a comp
 - **2C53P** (daily scope, Synwit SWM34S): fully reverse-engineered statically (saved-file format,
   FPGA data path, UART0 factory protocol, config sector) — see `HANDOFF.md`. Not modified.
 
-Start with [`HANDOFF.md`](HANDOFF.md) (status, decisions, every finding) and
-[`T_ARRIVAL_RUNBOOK.md`](T_ARRIVAL_RUNBOOK.md) (backup → flash → recovery).
+Start with [`OPERATING.md`](OPERATING.md) (how to drive the scope remotely), [`HANDOFF.md`](HANDOFF.md)
+(status, decisions, every finding) and [`T_ARRIVAL_RUNBOOK.md`](T_ARRIVAL_RUNBOOK.md) (backup → flash → recovery).
 
 ## Layout
 | Path | What |
 |------|------|
 | `host/pi_bridge/` | Pi server (`scope_server.py`), web viewer (`web/`), systemd unit, install script, cloud-init templates |
+| `host/scopectl.py` | **the operator tool**: status, wait-for-signal, autoset, describe (+plot), set, screen, log — see `OPERATING.md` |
 | `host/t_scope.py` | 2C53T streamer/CLI (USB or `--tcp scope-pi.local:7001`): CSV, plot, set commands |
 | `host/t_calcheck.py` | calibration sweep against a known generator signal via the viewer API |
 | `host/t_calbackup.py` | reads the 2C53T calibration page over the shell and verifies its CRC |
