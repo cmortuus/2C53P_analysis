@@ -37,6 +37,24 @@ Workflow that works:
    timebase too fast/slow for the feature of interest), then `describe` again.
 4. For slow things (rail sag, thermal drift, intermittent faults): `log start`, come back later.
 
+## Everything is recorded on the Pi — evaluate later with any criteria
+The Pi records **every raw frame** it receives (1024 samples × 2 channels + settings + timestamp)
+into `/home/pi/records/rec_*.bin`, hourly/64 MB segments, 40 GB ring (≈ 11 days at 20 fps), on
+by default even with nobody watching. So a measurement never has to be repeated to re-judge it:
+```bash
+$P host/scopectl.py record status | start | stop          # stop = only record while someone watches
+$P host/scopectl.py records list
+$P host/scopectl.py replay --from=-10m --to=now --ch both --png /tmp/strip.png --csv /tmp/f.csv \
+      --param glitch_ratio=0.3 --param hyst=0.1 --param low_res=16     # ANY criteria, post hoc
+$P host/scopectl.py replay --from="2026-10-11 01:08" --to="01:09" --ch 2 --server   # same, computed on the Pi
+$P host/scopectl.py records fetch --from=-1h out.json     # raw frames of a window, for anything else
+```
+Times: unix seconds, `-10m`/`-2h` ago, `HH:MM[:SS]` today, or `YYYY-MM-DD HH:MM[:SS]` (write
+`--from=-10m` with the `=`). The analysis code is one module (`host/scope_analysis.py`) used by the
+tool and by the Pi (`/api/analyze`), and all thresholds are `Params` fields — change them on the
+command line, nothing else moves. Strip charts show amplitude / mean / frequency per frame over
+time, which is how a sagging rail or an intermittent contact shows up.
+
 ## What the readings mean, and when NOT to trust them
 - **Ranges:** 0–3 are uncalibrated on this unit (OpenScope has no gain for them) — counts only.
   Ranges 4 and 8/9 are "provisional" (±10 %). Ranges 5–7 are measured: CH1 within ~2 %,

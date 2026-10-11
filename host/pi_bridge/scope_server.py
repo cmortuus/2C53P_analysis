@@ -10,6 +10,10 @@ Owns the scope's USB CDC shell and serves:
            GET  /api/screen.png   the device's own LCD (screen dumpbin), ?scale=1..4&hold=1|0
            GET/POST /api/log       measurement logger (POST {action: start|stop|clear}); GET /api/log.csv
            GET/POST /api/calib     per-unit gain/zero per (ch, range), persisted in calib.json
+           GET/POST /api/record    raw recorder status / {action: start|stop|disable, max_gb}
+           GET  /api/records       stored segments; /api/records/<name>.bin download;
+                /api/records/query?from=&to=&every=&limit=   frames in a window (JSON, base64)
+           GET  /api/analyze?from=&to=&ch=&every=&limit=&hyst=..   server-side re-evaluation (scope_analysis)
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -18,7 +22,15 @@ Owns the scope's USB CDC shell and serves:
 
 Only the standard library + pyserial. Run:  python3 scope_server.py [--http 8080] [--tcp 7001]
 """
-import argparse, base64, glob, json, math, os, re, socket, socketserver, subprocess, threading, time, zlib
+import argparse, base64, glob, json, math, os, re, socket, socketserver, struct, subprocess, threading, time, zlib
+sys_path_dir = os.path.dirname(os.path.abspath(__file__))
+import sys
+sys.path.insert(0, sys_path_dir)
+try:
+    import scope_analysis as SA          # shared with host/scopectl.py; deployed next to this file
+except Exception as _e:                  # analysis endpoints then report the import error
+    SA = None
+    SA_ERR = str(_e)
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 import serial
@@ -352,6 +364,167 @@ def measure(raw, vpc, rate, zero_counts=0.0):
     return out
 
 
+class Recorder:
+    """Raw frame recorder: every frame the hub receives is appended to a segment file so any
+    window can be re-evaluated later with different criteria (scopectl replay, /api/analyze).
+    Record: b"SR1" + <d t><I n_json> + json(hdr, rate, vpc1/2, zero1/2, seq) + ch1[1024] + ch2[1024]
+    Segments rotate hourly or at 64 MB; the oldest are deleted beyond max_bytes (ring)."""
+    MAGIC = b"SR1"
+    SEG_BYTES = 64 * 1024 * 1024
+    SEG_SECONDS = 3600
+
+    def __init__(self, root, max_bytes):
+        self.root = root
+        self.max_bytes = max_bytes
+        self.enabled = True
+        self.forced = False                   # keep the hub polling even with no viewer
+        self.fh = None
+        self.cur = None                       # {"name","path","t0","t1","frames","bytes"}
+        self.segments = []
+        self.lock = threading.Lock()
+        self.last_flush = 0.0
+        os.makedirs(root, exist_ok=True)
+        self._scan()
+
+    # ---- index ----
+    def _scan(self):
+        for path in sorted(glob.glob(os.path.join(self.root, "rec_*.bin"))):
+            idx = path[:-4] + ".idx.json"
+            try:
+                with open(idx) as f:
+                    meta = json.load(f)
+            except Exception:
+                meta = self._index_file(path)
+                try:
+                    with open(idx, "w") as f:
+                        json.dump(meta, f)
+                except Exception:
+                    pass
+            if meta:
+                self.segments.append(meta)
+
+    def _index_file(self, path):
+        t0 = t1 = None
+        frames = 0
+        try:
+            for t, _, _, _ in self.iter_file(path):
+                frames += 1
+                t0 = t if t0 is None else t0
+                t1 = t
+        except Exception:
+            pass
+        return {"name": os.path.basename(path), "path": path, "t0": t0, "t1": t1, "frames": frames,
+                "bytes": os.path.getsize(path)}
+
+    @classmethod
+    def iter_file(cls, path, t_from=None, t_to=None):
+        """Yield (t, meta_dict, ch1_bytes, ch2_bytes) from a segment file."""
+        with open(path, "rb") as f:
+            while True:
+                head = f.read(3 + 12)
+                if len(head) < 15:
+                    return
+                if head[:3] != cls.MAGIC:
+                    return                                   # torn tail: stop
+                t, n = struct.unpack("<dI", head[3:15])
+                meta_b = f.read(n)
+                if len(meta_b) < n:
+                    return
+                try:
+                    meta = json.loads(meta_b)
+                except ValueError:
+                    return
+                m = meta.get("n", 1024)
+                data = f.read(2 * m)
+                if len(data) < 2 * m:
+                    return
+                if (t_from is not None and t < t_from) or (t_to is not None and t > t_to):
+                    continue
+                yield t, meta, data[:m], data[m:]
+
+    # ---- writing ----
+    def _rotate(self):
+        if self.fh:
+            self.fh.close()
+            self.fh = None
+            if self.cur:
+                try:
+                    with open(self.cur["path"][:-4] + ".idx.json", "w") as f:
+                        json.dump(self.cur, f)
+                except Exception:
+                    pass
+        name = time.strftime("rec_%Y%m%d_%H%M%S.bin")
+        path = os.path.join(self.root, name)
+        self.fh = open(path, "ab")
+        self.cur = {"name": name, "path": path, "t0": None, "t1": None, "frames": 0, "bytes": 0}
+        self.segments.append(self.cur)
+        self._trim()
+
+    def _trim(self):
+        total = sum(sg["bytes"] for sg in self.segments)
+        while total > self.max_bytes and len(self.segments) > 1:
+            old = self.segments.pop(0)
+            total -= old["bytes"]
+            for pth in (old["path"], old["path"][:-4] + ".idx.json"):
+                try:
+                    os.remove(pth)
+                except OSError:
+                    pass
+            log("recorder: dropped", old["name"])
+
+    def write(self, fr, c1, c2):
+        if not self.enabled:
+            return
+        meta = {"hdr": fr["hdr"], "rate": fr["rate"], "vpc1": fr["vpc1"], "vpc2": fr["vpc2"],
+                "zero1": fr.get("zero1", 0.0), "zero2": fr.get("zero2", 0.0), "seq": fr["seq"], "n": len(c1)}
+        mb = json.dumps(meta, separators=(",", ":")).encode()
+        rec = self.MAGIC + struct.pack("<dI", fr["t"], len(mb)) + mb + c1 + c2
+        with self.lock:
+            now = time.time()
+            if (self.fh is None or self.cur["bytes"] + len(rec) > self.SEG_BYTES
+                    or (self.cur["t0"] and now - self.cur["t0"] > self.SEG_SECONDS)):
+                self._rotate()
+            self.fh.write(rec)
+            self.cur["bytes"] += len(rec)
+            self.cur["frames"] += 1
+            self.cur["t0"] = self.cur["t0"] or fr["t"]
+            self.cur["t1"] = fr["t"]
+            if now - self.last_flush > 2.0:
+                self.fh.flush()
+                self.last_flush = now
+
+    def status(self):
+        with self.lock:
+            total = sum(sg["bytes"] for sg in self.segments)
+            return {"enabled": self.enabled, "forced": self.forced, "root": self.root, "max_gb": self.max_bytes / 1e9,
+                    "segments": len(self.segments), "total_mb": total / 1e6,
+                    "active": dict(self.cur, active=True) if self.cur else None,
+                    "frames_total": sum(sg["frames"] for sg in self.segments)}
+
+    def list(self):
+        with self.lock:
+            return [dict(sg, active=(sg is self.cur)) for sg in self.segments]
+
+    def query(self, t_from, t_to, every=1, limit=2000):
+        """Frames in [t_from, t_to], every n-th, at most `limit`, as viewer-style dicts."""
+        with self.lock:
+            segs = [sg for sg in self.segments if sg["t0"] is not None and sg["t0"] <= t_to and (sg["t1"] or time.time()) >= t_from]
+            if self.fh:
+                self.fh.flush()
+        out, k = [], 0
+        for sg in segs:
+            for t, meta, c1, c2 in self.iter_file(sg["path"], t_from, t_to):
+                k += 1
+                if (k - 1) % max(1, every):
+                    continue
+                out.append({"t": t, "hdr": meta["hdr"], "rate": meta["rate"], "vpc1": meta["vpc1"], "vpc2": meta["vpc2"],
+                            "zero1": meta.get("zero1", 0.0), "zero2": meta.get("zero2", 0.0), "seq": meta.get("seq"),
+                            "ch1": base64.b64encode(c1).decode(), "ch2": base64.b64encode(c2).decode(), "_raw": (c1, c2)})
+                if len(out) >= limit:
+                    return out
+        return out
+
+
 class Hub:
     """Acquisition loop + fan-out of the latest frame to web clients."""
 
@@ -380,7 +553,7 @@ class Hub:
             # polling entirely so the scope's own auto power-off / dark sleep can kick in
             # (every shell command counts as activity on the device). A viewer, a
             # frame.json request or a command wakes both ends again.
-            idle = self.viewers == 0 and not self.logging
+            idle = self.viewers == 0 and not self.logging and not (recorder is not None and recorder.forced)
             if idle and self.viewers == 0:
                 pass
             if not self.run or (idle and self.latest and time.time() - self.latest["t"] < 1.0) \
@@ -415,6 +588,12 @@ class Hub:
                   "zero1": z1, "zero2": z2,
                   "meas": {"ch1": measure(c1, vpc1, rate, z1), "ch2": measure(c2, vpc2, rate, z2)},
                   "fps": round(self.fps, 1), "errors": self.errors}
+            if recorder is not None:
+                try:
+                    recorder.write(fr, c1, c2)
+                except Exception as e:
+                    self.errors += 1
+                    self.status = "recorder: %s" % e
             if self.logging:
                 m1, m2 = fr["meas"]["ch1"], fr["meas"]["ch2"]
                 self.log_rows.append((now, h.get("tb"), h.get("rng1"), h.get("rng2"),
@@ -474,6 +653,59 @@ def make_http_handler(hub):
                 return self._send(200, hub.latest or {})
             if p == "/api/calib":
                 return self._send(200, CALIB)
+            if p == "/api/record":
+                return self._send(200, recorder.status() if recorder else {"enabled": False})
+            if p == "/api/records":
+                return self._send(200, recorder.list() if recorder else [])
+            if p.startswith("/api/records/query"):
+                q = dict(x.split("=", 1) for x in (self.path.split("?", 1)[1].split("&") if "?" in self.path else []) if "=" in x)
+                try:
+                    t0 = float(q.get("from", time.time() - 600)); t1 = float(q.get("to", time.time()))
+                    every = int(q.get("every", 1)); limit = min(int(q.get("limit", 2000)), 20000)
+                except ValueError:
+                    return self._send(400, {"error": "bad query"})
+                frs = recorder.query(t0, t1, every, limit) if recorder else []
+                for f in frs:
+                    f.pop("_raw", None)
+                return self._send(200, {"from": t0, "to": t1, "frames": frs})
+            if p.startswith("/api/records/") and p.endswith(".bin"):
+                name = os.path.basename(p)
+                sg = next((sg for sg in (recorder.list() if recorder else []) if sg["name"] == name), None)
+                if not sg:
+                    return self._send(404, {"error": "no such segment"})
+                with open(sg["path"], "rb") as f:
+                    data = f.read()
+                return self._send(200, data, "application/octet-stream", {"Content-Disposition": 'attachment; filename="%s"' % name})
+            if p.startswith("/api/analyze"):
+                if SA is None:
+                    return self._send(503, {"error": "scope_analysis not available on the Pi: %s" % SA_ERR})
+                q = dict(x.split("=", 1) for x in (self.path.split("?", 1)[1].split("&") if "?" in self.path else []) if "=" in x)
+                try:
+                    t0 = float(q.get("from", time.time() - 600)); t1 = float(q.get("to", time.time()))
+                    ch = int(q.get("ch", 1)); every = int(q.get("every", 1)); limit = min(int(q.get("limit", 2000)), 20000)
+                    pk = {k: float(v) for k, v in q.items() if k in ("hyst", "min_span", "low_res", "glitch_ratio", "freq_spread",
+                                                                      "input_limit_v", "limit_fraction", "square_extreme_frac", "sine_crest_max", "tri_crest_max")}
+                    params = SA.Params(**pk)
+                except (ValueError, TypeError) as e:
+                    return self._send(400, {"error": "bad query: %s" % e})
+                frs = recorder.query(t0, t1, every, limit) if recorder else []
+                if not frs:
+                    return self._send(404, {"error": "no stored frames in that window"})
+                recs, rows = [], []
+                for f in frs:
+                    c1, c2 = f.pop("_raw")
+                    raw = c1 if ch == 1 else c2
+                    h = f["hdr"]
+                    r = {"raw": raw, "rate": f["rate"], "vpc": f["vpc%d" % ch], "zero": f.get("zero%d" % ch, 0.0),
+                         "probe": 10 if h.get("prb%d" % ch) else 1, "cpl": ["DC", "AC", "GND"][h.get("cpl%d" % ch, 0)],
+                         "rng": h.get("rng%d" % ch), "tier": RANGE_TIER[h.get("rng%d" % ch, 0)], "enabled": bool(h.get("en%d" % ch, 1)),
+                         "channel": ch, "counts_per_div": COUNTS_PER_DIV, "gain": calib_gain(ch, h.get("rng%d" % ch)), "t": f["t"]}
+                    recs.append(r)
+                    lv = SA.levels(raw, r["vpc"], r["zero"]); fq = SA.frequency(raw, r["rate"], params); pm = SA.pulse_metrics(raw, r["rate"], params)
+                    rows.append({"t": f["t"], "amp": lv["vamp"], "mean": lv["vavg"], "rms_ac": lv["vrms_ac"], "freq": fq, "clipped": lv["clipped"],
+                                 "glitches": pm["glitches"] if pm else 0, "duty": pm["duty"] if pm else None})
+                overall = SA.analyze_records(recs, params)
+                return self._send(200, {"from": t0, "to": t1, "ch": ch, "frames": len(recs), "overall": overall, "per_frame": rows})
             if p == "/api/log":
                 return self._send(200, {"logging": hub.logging, "rows": len(hub.log_rows),
                                         "since": hub.log_started})
@@ -563,6 +795,19 @@ def make_http_handler(hub):
                 req = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if self.path == "/api/record":
+                if recorder is None:
+                    return self._send(503, {"error": "recorder disabled"})
+                a = req.get("action")
+                if a == "start":
+                    recorder.enabled = True; recorder.forced = True; hub.run = True
+                elif a == "stop":
+                    recorder.forced = False
+                elif a == "disable":
+                    recorder.enabled = False; recorder.forced = False
+                if req.get("max_gb"):
+                    recorder.max_bytes = int(float(req["max_gb"]) * 1e9)
+                return self._send(200, recorder.status())
             if self.path == "/api/calib":
                 # {"ch": 2, "rng": 6, "gain": 1.062} and/or {"ch": 2, "rng": 6, "zero": 16.4}; "clear": true
                 try:
@@ -638,12 +883,24 @@ class ThreadingTCP(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 
+recorder = None
+
+
 def main():
+    global recorder
     calib_load()
     ap = argparse.ArgumentParser()
     ap.add_argument("--http", type=int, default=8080)
     ap.add_argument("--tcp", type=int, default=7001)
+    ap.add_argument("--records", default=os.path.expanduser("~/records"), help="raw recorder folder ('' = disabled)")
+    ap.add_argument("--max-gb", type=float, default=40.0, help="ring size for raw records (54 GB free on the Pi, 2026-10-11)")
+    ap.add_argument("--record-always", type=int, default=1, help="1: keep polling+recording even with no viewer")
     a = ap.parse_args()
+    if a.records:
+        recorder = Recorder(a.records, int(a.max_gb * 1e9))
+        recorder.forced = bool(a.record_always)
+        st = recorder.status()
+        log("recorder: %s, %d segments, %.1f MB, ring %.0f GB, always=%s" % (a.records, st["segments"], st["total_mb"], a.max_gb, recorder.forced))
     scope = Scope()
     hub = Hub(scope)
     threading.Thread(target=hub.loop, daemon=True).start()

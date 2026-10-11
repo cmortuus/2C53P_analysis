@@ -4,9 +4,11 @@
 # Replaces the older socat-only scope-bridge service (same port 7001 for t_scope.py --tcp).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-apt-get update -qq && apt-get install -y -qq python3-serial mtools
-install -d /opt/scope/web
+apt-get update -qq && apt-get install -y -qq python3-serial python3-numpy mtools
+install -d /opt/scope/web /home/pi/records
 install -m 644 "$HERE/scope_server.py" /opt/scope/
+install -m 644 "$HERE/../scope_analysis.py" /opt/scope/      # shared analysis (server-side /api/analyze)
+chown -R pi /opt/scope /home/pi/records                       # calib.json and raw records are written by the service
 install -m 644 "$HERE/web/index.html" /opt/scope/web/
 install -m 644 "$HERE/scope-server.service" "$HERE/pwm-ref.service" /etc/systemd/system/
 grep -q "dtoverlay=pwm,pin=18" /boot/firmware/config.txt || printf "\n# hardware PWM reference on GPIO18 for calibration checks\ndtoverlay=pwm,pin=18,func=2\n" >> /boot/firmware/config.txt

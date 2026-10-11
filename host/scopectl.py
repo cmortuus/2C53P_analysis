@@ -16,6 +16,9 @@ uncalibrated range, intermittent, mains pickup) and can render a PNG of the reco
 real volt/time axes (matplotlib on this machine, nothing needed on the Pi).
 """
 import argparse, base64, json, math, os, statistics, sys, time, urllib.request
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import scope_analysis as SA
+from scope_analysis import fmt, fmt_f, fmt_t, fmt_rate, Params
 
 URL = os.environ.get("SCOPE_URL", "http://scope-pi.local:8080")
 CPL = ["DC", "AC", "GND"]
@@ -63,236 +66,56 @@ def decode(f):
     return f
 
 
-def fmt_rate(r):
-    return ("%.4g MS/s" % (r / 1e6)) if r >= 1e6 else ("%.4g kS/s" % (r / 1e3)) if r >= 1e3 else ("%.4g S/s" % r)
-
-
 def ch_fields(f, ch):
     decode(f)
     h = f["hdr"]
     return {"raw": f["b%d" % ch], "vpc": f["vpc%d" % ch], "rng": h["rng%d" % ch], "en": h["en%d" % ch],
-            "cpl": CPL[h["cpl%d" % ch]], "probe": 10 if h["prb%d" % ch] else 1, "meas": f["meas"]["ch%d" % ch]}
+            "cpl": CPL[h["cpl%d" % ch]], "probe": 10 if h["prb%d" % ch] else 1, "meas": (f.get("meas") or {}).get("ch%d" % ch, {})}
 
 
-# ------------------------------------------------------------------ pulse metrics
-def edges(raw, hyst=0.15):
-    """Rising and falling mean-level crossings (sub-sample), with hysteresis."""
-    mn, mx = min(raw), max(raw)
-    span = mx - mn
-    if span < 6:
-        return [], [], None
-    mean = sum(raw) / len(raw)
-    hi, lo = mean + hyst * span, mean - hyst * span
-    rises, falls = [], []
-    state = raw[0] > mean
-    for i in range(1, len(raw)):
-        x = raw[i]
-        if state and x < lo:
-            state = False
-            j = i
-            while j > 0 and raw[j - 1] < mean: j -= 1
-            falls.append(j - 1 + (mean - raw[j - 1]) / (raw[j] - raw[j - 1]) if j > 0 and raw[j] != raw[j - 1] else float(j))
-        elif not state and x > hi:
-            state = True
-            j = i
-            while j > 0 and raw[j - 1] > mean: j -= 1
-            rises.append(j - 1 + (mean - raw[j - 1]) / (raw[j] - raw[j - 1]) if j > 0 and raw[j] != raw[j - 1] else float(j))
-    return rises, falls, mean
+# ------------------------------------------------------------------ analysis (shared module)
+def rec_from_frame(f, ch, info):
+    """One channel of one viewer frame -> a scope_analysis record."""
+    c = ch_fields(f, ch)
+    return {"raw": c["raw"], "rate": f["rate"], "vpc": c["vpc"], "zero": f.get("zero%d" % ch, 0.0) or 0.0,
+            "probe": c["probe"], "cpl": c["cpl"], "rng": c["rng"], "tier": info["range_tier"][c["rng"]],
+            "enabled": bool(c["en"]), "channel": ch, "counts_per_div": info["counts_per_div"],
+            "gain": info.get("calib", {}).get("gain", {}).get(str(ch), {}).get(str(c["rng"]), 1.0), "t": f.get("t")}
 
 
-def transition_time(raw, pos, rising, mn, mx):
-    """10%-90% time (in samples) around an edge at `pos`, or None if unresolved."""
-    lo_t, hi_t = mn + 0.1 * (mx - mn), mn + 0.9 * (mx - mn)
-    i = int(pos)
-    a = b = None
-    for k in range(max(1, i - 40), min(len(raw) - 1, i + 41)):
-        y0, y1 = raw[k - 1], raw[k]
-        if rising:
-            if a is None and y0 < lo_t <= y1: a = k - 1 + (lo_t - y0) / (y1 - y0)
-            if a is not None and y0 < hi_t <= y1: b = k - 1 + (hi_t - y0) / (y1 - y0); break
-        else:
-            if a is None and y0 > hi_t >= y1: a = k - 1 + (hi_t - y0) / (y1 - y0)
-            if a is not None and y0 > lo_t >= y1: b = k - 1 + (lo_t - y0) / (y1 - y0); break
-    return (b - a) if (a is not None and b is not None and b > a) else None
+def analyze(fs, ch, info, p=None):
+    return SA.analyze_records([rec_from_frame(f, ch, info) for f in fs], p)
 
 
-def pulse_metrics(raw, rate):
-    rises, falls, mean = edges(raw)
-    if len(rises) < 2 and len(falls) < 2:
-        return None
-    mn, mx = min(raw), max(raw)
-    highs, lows = [], []
-    for r in rises:
-        f = next((f for f in falls if f > r), None)
-        if f is not None: highs.append(f - r)
-    for f in falls:
-        r = next((r for r in rises if r > f), None)
-        if r is not None: lows.append(r - f)
-    def med(v): return statistics.median(v) if v else None
-    rt = [t for t in (transition_time(raw, r, True, mn, mx) for r in rises[:50]) if t]
-    ft = [t for t in (transition_time(raw, f, False, mn, mx) for f in falls[:50]) if t]
-    glitches = 0
-    for w, ref in ((highs, med(highs)), (lows, med(lows))):
-        if ref:
-            glitches += sum(1 for x in w if x < 0.2 * ref)
-    per = (1.0 / rate) if rate else None
-    out = {"rising_edges": len(rises), "falling_edges": len(falls),
-           "high_s": med(highs) * per if (per and highs) else None, "low_s": med(lows) * per if (per and lows) else None,
-           "high_samples": med(highs), "low_samples": med(lows),
-           "rise_s": med(rt) * per if (per and rt) else None, "fall_s": med(ft) * per if (per and ft) else None,
-           "rise_samples": med(rt), "fall_samples": med(ft), "glitches": glitches,
-           "edge_resolution_s": (2 * per) if per else None}
-    return out
+def parse_params(items):
+    kw = {}
+    for it in items or []:
+        k, v = it.split("=", 1)
+        kw[k] = float(v) if k != "mains_band" else tuple(float(x) for x in v.split(","))
+    return Params(**kw)
 
 
-# ------------------------------------------------------------------ analysis
-def analyze(fs, ch, info):
-    """Combine several frames of one channel into a description dict."""
-    recs = [ch_fields(f, ch) for f in fs]
-    c = recs[-1]
-    rate = fs[-1]["rate"]
-    vpc = c["vpc"]
-    cal = vpc > 0
-    unit = "V" if cal else "cnt"
-    k = vpc if cal else 1.0
-
-    amps = [r["meas"]["vamp"] for r in recs]
-    freqs = [r["meas"]["freq"] for r in recs if r["meas"].get("freq")]
-    m = c["meas"]
-    raw = c["raw"]
-    mn, mx = min(raw), max(raw)
-    span_counts = mx - mn
-    amp = statistics.median(amps)
-    noise_counts = statistics.median(sorted(abs(x - y) for x, y in zip(raw, raw[1:]))[:len(raw) // 2] or [0])
-    d = {
-        "channel": ch, "enabled": bool(c["en"]), "range": c["rng"], "coupling": c["cpl"], "probe": c["probe"],
-        "calibrated": cal, "unit": unit, "rate_sps": rate, "record_s": 1024 / rate if rate else None,
-        "range_tier": info["range_tier"][c["rng"]],
-        "vdiv": (vpc * info["counts_per_div"]) if cal else None,
-        "amp_top_base": amp, "vpp": m["vpp"], "mean": m["vavg"], "rms_ac": m["vrms_ac"],
-        "top": m["vtop"], "base": m["vbase"], "freq_hz": statistics.median(freqs) if freqs else None,
-        "duty": m.get("duty"), "span_counts": span_counts, "clipped": bool(m["clipped"]),
-        "flags": [], "shape": None, "summary": "", "pulse": pulse_metrics(raw, rate),
-        "zero_counts": fs[-1].get("zero%d" % ch, 0.0), "gain": (info.get("calib", {}).get("gain", {}).get(str(ch), {}).get(str(c["rng"]), 1.0)),
-    }
-    pm = d["pulse"]
-    if pm and pm["glitches"]:
-        d["flags"].append("%d runt pulse(s) shorter than 20%% of the normal width: glitches or contact bounce" % pm["glitches"])
-    # ---- flags
-    if not c["en"]:
-        d["flags"].append("channel disabled")
-    if d["clipped"]:
-        d["flags"].append("clipped: signal exceeds this range, choose a larger V/div (autoset does this)")
-    if span_counts < 6:
-        d["flags"].append("no signal (or far below this range's resolution)")
-    elif span_counts < 24:
-        d["flags"].append("low resolution: only %d ADC counts of swing, use a finer range" % span_counts)
-    if not cal:
-        d["flags"].append("uncalibrated range %d: values are ADC counts, not volts" % c["rng"])
-    elif d["range_tier"] == "provisional":
-        d["flags"].append("range %d is provisionally calibrated (OpenScope); treat volts as +/-10 %%" % c["rng"])
-    if freqs and len(freqs) >= 3:
-        spread = (max(freqs) - min(freqs)) / statistics.median(freqs)
-        if spread > 0.05:
-            d["flags"].append("frequency unstable across frames (%.1f%% spread): intermittent contact, jitter or multiple tones" % (spread * 100))
-    if len(freqs) < len(recs) // 2 and span_counts >= 24:
-        d["flags"].append("periodicity not found on most frames: noise, DC with glitches, or frequency outside this timebase's reach")
-    if d["freq_hz"] and 58 <= d["freq_hz"] <= 62 and cal and amp > 0.05:
-        d["flags"].append("~60 Hz: mains pickup -- a floating/unconnected probe or missing ground clip looks exactly like this")
-    # ---- spectral peaks (numpy; Hann; top 3 distinct peaks, dB re the strongest)
-    d["spectrum_peaks"] = []
-    if rate and span_counts >= 6:
+def parse_time(t):
+    """unix seconds | 'now' | '-10m' / '-2h' / '-30s' (ago) | 'YYYY-MM-DD HH:MM[:SS]' local."""
+    if t is None or t == "now":
+        return time.time()
+    t = str(t).strip()
+    if t.startswith("-") and t[-1] in "smhd":
+        return time.time() - float(t[1:-1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[t[-1]]
+    try:
+        return float(t)
+    except ValueError:
+        pass
+    for fmt_ in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%H:%M:%S", "%H:%M"):
         try:
-            import numpy as np
-            x = (np.frombuffer(bytes(raw), dtype=np.uint8).astype(float) - sum(raw) / len(raw)) * np.hanning(len(raw))
-            mag = np.abs(np.fft.rfft(x))
-            mag[0] = 0
-            order = np.argsort(mag)[::-1]
-            peaks, taken = [], []
-            for k in order:
-                if mag[k] <= 0 or any(abs(k - t) < 4 for t in taken):
-                    continue
-                taken.append(int(k))
-                k0 = int(k)
-                if 1 <= k0 < len(mag) - 1 and mag[k0 - 1] > 0 and mag[k0 + 1] > 0:
-                    a, b, c2 = np.log(mag[k0 - 1]), np.log(mag[k0]), np.log(mag[k0 + 1])
-                    dd = (a - c2) / (2 * (a - 2 * b + c2)) if (a - 2 * b + c2) != 0 else 0.0
-                    kk = k0 + (dd if abs(dd) < 1 else 0.0)
-                else:
-                    kk = float(k0)
-                peaks.append({"hz": kk * rate / len(raw), "db_rel": 20 * math.log10(mag[k0] / mag[order[0]])})
-                if len(peaks) == 3:
-                    break
-            d["spectrum_peaks"] = peaks
-        except Exception:
-            pass
-    # ---- near the input limit for this probe setting?
-    if cal:
-        limit = 40.0 * c["probe"]
-        if max(abs(d["top"]), abs(d["base"])) > 0.8 * limit:
-            d["flags"].append("within 20%% of the input limit for a x%d probe (%g V): stop and switch to x10 / check the source" % (c["probe"], limit))
-    # ---- shape
-    if span_counts < 6:
-        d["shape"] = "flat (DC level %s)" % fmt(d["mean"], unit)
-    elif d["freq_hz"]:
-        # histogram of the record: fraction near the two extremes vs middle
-        lo_t, hi_t = mn + span_counts * 0.15, mx - span_counts * 0.15
-        near_ext = sum(1 for x in raw if x <= lo_t or x >= hi_t) / len(raw)
-        mean_c = sum(raw) / len(raw)                       # in counts, whatever the calibration
-        rms_c = (m["vrms_ac"] / k) if cal else m["vrms_ac"]
-        crest = max(mx - mean_c, mean_c - mn) / max(rms_c, 1e-9)
-        duty = d["duty"] or 0.5
-        if near_ext > 0.8:
-            d["shape"] = "square/pulse" if abs(duty - 0.5) < 0.08 else "pulse (duty %.0f%%)" % (duty * 100)
-        elif crest < 1.55:
-            d["shape"] = "sine-like"
-        elif crest < 1.9:
-            d["shape"] = "triangle/ramp-like"
-        else:
-            d["shape"] = "spiky/pulsed (crest factor %.1f)" % crest
-    else:
-        d["shape"] = "aperiodic/noise-like"
-    # ---- summary
-    parts = ["CH%d" % ch, d["shape"]]
-    if d["freq_hz"]:
-        parts.append("%s" % fmt_f(d["freq_hz"]))
-    parts.append("amplitude %s (top %s, base %s)" % (fmt(amp, unit), fmt(d["top"], unit), fmt(d["base"], unit)))
-    parts.append("mean %s" % fmt(d["mean"], unit))
-    if d["pulse"] and d["pulse"]["high_s"] and d["freq_hz"]:
-        pm = d["pulse"]
-        tt = []
-        for nm, v, samp in (("rise", pm["rise_s"], pm["rise_samples"]), ("fall", pm["fall_s"], pm["fall_samples"])):
-            if v is None or (samp is not None and samp < 2):
-                tt.append("%s <%s (unresolved at this rate)" % (nm, fmt_t(pm["edge_resolution_s"])))
-            else:
-                tt.append("%s %s" % (nm, fmt_t(v)))
-        parts.append("high %s / low %s, %s" % (fmt_t(pm["high_s"]), fmt_t(pm["low_s"]), ", ".join(tt)))
-    parts.append("probe x%d %s, range %d%s, %s/div" % (c["probe"], c["cpl"], c["rng"],
-                 "" if cal else " (uncal)", fmt(d["vdiv"], "V") if cal else "--"))
-    if d["zero_counts"] or d["gain"] != 1.0:
-        parts.append("unit cal applied (gain x%.3f, zero %+.1f cnt)" % (d["gain"], d["zero_counts"]))
-    if d.get("spectrum_peaks"):
-        parts.append("spectrum peaks " + ", ".join("%s (%+.0f dB)" % (fmt_f(pk["hz"]), pk["db_rel"]) for pk in d["spectrum_peaks"]))
-    d["summary"] = "; ".join(parts) + ("  FLAGS: " + " | ".join(d["flags"]) if d["flags"] else "")
-    return d
-
-
-def fmt(v, unit):
-    if v is None or (isinstance(v, float) and not math.isfinite(v)):
-        return "--"
-    if unit != "V":
-        return "%.1f cnt" % v
-    a = abs(v)
-    return ("%.2f V" % v) if a >= 1 else ("%.0f mV" % (v * 1e3)) if a >= 1e-3 else ("%.0f uV" % (v * 1e6))
-
-
-def fmt_f(f):
-    return ("%.4g MHz" % (f / 1e6)) if f >= 1e6 else ("%.4g kHz" % (f / 1e3)) if f >= 1e3 else ("%.4g Hz" % f)
-
-
-def fmt_t(s):
-    a = abs(s)
-    return ("%.3g s" % s) if a >= 1 else ("%.3g ms" % (s * 1e3)) if a >= 1e-3 else ("%.3g us" % (s * 1e6)) if a >= 1e-6 else ("%.3g ns" % (s * 1e9))
+            st = time.strptime(t, fmt_)
+            if fmt_.startswith("%H"):
+                now = time.localtime()
+                st = time.struct_time((now.tm_year, now.tm_mon, now.tm_mday, st.tm_hour, st.tm_min, st.tm_sec, 0, 0, -1))
+            return time.mktime(st)
+        except ValueError:
+            continue
+    raise SystemExit("cannot parse time %r" % t)
 
 
 # ------------------------------------------------------------------ autoset
@@ -368,33 +191,10 @@ def autoset(ch, info, verbose=True):
     return analyze(frames(3, settle=0.6), ch, info)
 
 
-# ------------------------------------------------------------------ two-channel timing
-def timing(fs, info):
-    """Delay/phase between CH1 and CH2 rising edges when both carry the same frequency."""
+# ------------------------------------------------------------------ two-channel timing (shared module)
+def timing(fs, info, p=None):
     f = fs[-1]
-    rate = f["rate"]
-    if not rate:
-        return None
-    r1, _, _ = edges(f["b1"]); r2, _, _ = edges(f["b2"])
-    if len(r1) < 2 or len(r2) < 2:
-        return None
-    p1 = statistics.median(b - a for a, b in zip(r1, r1[1:]))
-    p2 = statistics.median(b - a for a, b in zip(r2, r2[1:]))
-    if abs(p1 - p2) / max(p1, p2) > 0.03:
-        return {"same_freq": False, "f1": rate / p1, "f2": rate / p2}
-    ds = []
-    for a in r1:
-        cands = [b - a for b in r2 if -p1 / 2 <= b - a < p1 / 2]
-        if cands:
-            ds.append(min(cands, key=abs))
-    if not ds:
-        return None
-    d = statistics.median(ds)
-    phase = d / p1 * 360.0
-    out = {"same_freq": True, "period_s": p1 / rate, "delay_s": d / rate, "phase_deg": phase, "n": len(ds)}
-    if 60 < abs(phase) < 120:
-        out["quadrature"] = "CH2 %s CH1 by ~90 deg (%s)" % ("lags" if phase > 0 else "leads", "A->B order" if phase > 0 else "B->A order")
-    return out
+    return SA.timing(f["b1"], f["b2"], f["rate"], p)
 
 
 # ------------------------------------------------------------------ plotting
@@ -446,6 +246,9 @@ def main():
     p = sub.add_parser("zero", help="probe tip on GROUND: store this channel/range's zero offset on the Pi"); p.add_argument("--ch", type=int, required=True)
     p = sub.add_parser("gain", help="known amplitude applied: store this channel/range's gain correction"); p.add_argument("--ch", type=int, required=True); p.add_argument("--expected", type=float, required=True, help="true top-base amplitude in volts")
     p = sub.add_parser("calib"); p.add_argument("action", choices=["show", "clear"]); p.add_argument("--ch", type=int); p.add_argument("--rng", type=int)
+    p = sub.add_parser("record", help="raw recorder on the Pi (every frame, ring-limited)"); p.add_argument("action", choices=["start", "stop", "status"]); p.add_argument("--max-gb", type=float)
+    p = sub.add_parser("records", help="list/fetch stored raw segments"); p.add_argument("action", choices=["list", "fetch"]); p.add_argument("--from", dest="t0"); p.add_argument("--to", dest="t1"); p.add_argument("--every", type=int, default=1); p.add_argument("--limit", type=int, default=5000); p.add_argument("out", nargs="?")
+    p = sub.add_parser("replay", help="re-evaluate a stored time window with chosen criteria"); p.add_argument("--from", dest="t0", required=True); p.add_argument("--to", dest="t1", default="now"); p.add_argument("--ch", default="both"); p.add_argument("--every", type=int, default=1); p.add_argument("--limit", type=int, default=5000); p.add_argument("--param", action="append", help="e.g. hyst=0.1 glitch_ratio=0.3 low_res=16"); p.add_argument("--png", help="strip chart of amplitude/mean/freq over time"); p.add_argument("--csv", help="per-frame metrics"); p.add_argument("--json", action="store_true"); p.add_argument("--server", action="store_true", help="run the analysis on the Pi (/api/analyze) instead of locally")
     a = ap.parse_args()
     URL = a.url
     info = api("/api/info")
@@ -625,6 +428,83 @@ def main():
             print(api("/api/calib", {"ch": a.ch, "rng": a.rng, "clear": True}))
         else:
             print(json.dumps(api("/api/calib"), indent=1))
+        return
+
+    if a.cmd == "record":
+        if a.action == "status":
+            print(json.dumps(api("/api/record"), indent=1)); return
+        body = {"action": a.action}
+        if a.max_gb: body["max_gb"] = a.max_gb
+        print(json.dumps(api("/api/record", body), indent=1)); return
+
+    if a.cmd == "records":
+        if a.action == "list":
+            segs = api("/api/records")
+            tot = 0
+            for sg in segs:
+                tot += sg["bytes"]
+                print("%-28s %s .. %s  %6d frames  %6.1f MB%s" % (sg["name"], time.strftime("%m-%d %H:%M:%S", time.localtime(sg["t0"])),
+                      time.strftime("%H:%M:%S", time.localtime(sg["t1"])) if sg["t1"] else "...", sg["frames"], sg["bytes"] / 1e6, "  (active)" if sg.get("active") else ""))
+            print("%d segments, %.1f MB" % (len(segs), tot / 1e6)); return
+        t0, t1 = parse_time(a.t0 or "-10m"), parse_time(a.t1)
+        data = api("/api/records/query?from=%f&to=%f&every=%d&limit=%d" % (t0, t1, a.every, a.limit), timeout=300)
+        out = a.out or time.strftime("scope_records_%Y%m%d_%H%M%S.json")
+        open(out, "w").write(json.dumps(data)); print("saved %s: %d frames" % (out, len(data["frames"]))); return
+
+    if a.cmd == "replay":
+        t0, t1 = parse_time(a.t0), parse_time(a.t1)
+        chans = [1, 2] if a.ch == "both" else [int(a.ch)]
+        p = parse_params(a.param)
+        if a.server:
+            q = "&".join("%s=%s" % (k, v) for k, v in (p.as_dict().items()) if k != "mains_band")
+            res = {ch: api("/api/analyze?from=%f&to=%f&ch=%d&every=%d&limit=%d&%s" % (t0, t1, ch, a.every, a.limit, q), timeout=600) for ch in chans}
+            if a.json: print(json.dumps(res, indent=1, default=str)); return
+            for ch in chans:
+                r = res[ch]; print("CH%d (%d frames, server): %s" % (ch, r["frames"], r["overall"]["summary"]))
+            return
+        data = api("/api/records/query?from=%f&to=%f&every=%d&limit=%d" % (t0, t1, a.every, a.limit), timeout=600)
+        frs = data["frames"]
+        if not frs:
+            raise SystemExit("no stored frames between %s and %s" % (time.ctime(t0), time.ctime(t1)))
+        for f in frs:
+            decode(f)
+        print("%d frames from %s to %s" % (len(frs), time.strftime("%H:%M:%S", time.localtime(frs[0]["t"])), time.strftime("%H:%M:%S", time.localtime(frs[-1]["t"]))))
+        rows = []
+        res = {}
+        for ch in chans:
+            recs = [rec_from_frame(f, ch, info) for f in frs]
+            overall = SA.analyze_records(recs, p)
+            res[ch] = {"overall": overall, "per_frame": []}
+            for r in recs:
+                lv = SA.levels(r["raw"], r["vpc"], r["zero"]); fq = SA.frequency(r["raw"], r["rate"], p); pm = SA.pulse_metrics(r["raw"], r["rate"], p)
+                row = {"t": r["t"], "ch": ch, "amp": lv["vamp"], "mean": lv["vavg"], "rms_ac": lv["vrms_ac"], "freq": fq, "clipped": lv["clipped"],
+                       "glitches": pm["glitches"] if pm else 0, "duty": pm["duty"] if pm else None, "high_s": pm["high_s"] if pm else None}
+                res[ch]["per_frame"].append(row); rows.append(row)
+            print("CH%d overall: %s" % (ch, overall["summary"]))
+            pf = res[ch]["per_frame"]
+            amps = [x["amp"] for x in pf]; means = [x["mean"] for x in pf]; fqs = [x["freq"] for x in pf if x["freq"]]
+            u = overall["unit"]
+            print("   per frame: amp %s..%s  mean %s..%s  freq %s..%s  frames with glitches %d/%d  clipped %d" % (
+                fmt(min(amps), u), fmt(max(amps), u), fmt(min(means), u), fmt(max(means), u), fmt_f(min(fqs)) if fqs else "--", fmt_f(max(fqs)) if fqs else "--",
+                sum(1 for x in pf if x["glitches"]), len(pf), sum(1 for x in pf if x["clipped"])))
+        if a.csv:
+            import csv
+            with open(a.csv, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
+            print("csv:", a.csv)
+        if a.json:
+            print(json.dumps(res, indent=1, default=str))
+        if a.png:
+            import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+            for ch in chans:
+                pf = res[ch]["per_frame"]; ts = [x["t"] - frs[0]["t"] for x in pf]; col = "#1fb4d8" if ch == 1 else "#2458e8"
+                axes[0].plot(ts, [x["amp"] for x in pf], ".", ms=3, color=col, label="CH%d" % ch)
+                axes[1].plot(ts, [x["mean"] for x in pf], ".", ms=3, color=col)
+                axes[2].plot(ts, [x["freq"] if x["freq"] else float("nan") for x in pf], ".", ms=3, color=col)
+            axes[0].set_ylabel("amplitude (top-base)"); axes[1].set_ylabel("mean"); axes[2].set_ylabel("freq (Hz)"); axes[2].set_xlabel("seconds from %s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(frs[0]["t"])))
+            for ax in axes: ax.grid(True, alpha=.3)
+            axes[0].legend(); fig.tight_layout(); fig.savefig(a.png, dpi=110); print("strip chart:", a.png)
         return
 
     if a.cmd == "log":
