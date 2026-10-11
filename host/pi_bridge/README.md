@@ -22,7 +22,7 @@ API: `GET /api/info` (calibration tables, port, status), `GET /api/stream` (SSE,
 per event with base64 `ch1`/`ch2`), `GET /api/frame.json`, `GET /api/frame.csv`,
 `POST /api/cmd {"cmd": "..."}` (allow-list: `fpga scope …`, `btn …` except POWER, `version`,
 `status`, `settings`, `help`; **never** `mem write`, `fwload`, flash or reinit commands),
-`POST /api/run {"run": bool}`.
+`POST /api/run {"run": bool}`, `GET /api/screen.png?scale=1..4` (the scope's own LCD via `screen dumpbin`, 16-colour copy; the "Device screen" button in the viewer).
 
 ## Install / update
 ```bash

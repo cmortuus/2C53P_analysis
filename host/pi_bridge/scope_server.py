@@ -7,6 +7,7 @@ Owns the scope's USB CDC shell and serves:
            GET  /api/info         calibration tables, current settings, link status
            GET  /api/stream       Server-Sent Events: one JSON frame per capture
            GET  /api/frame.json   latest frame          GET /api/frame.csv  latest frame as CSV
+           GET  /api/screen.png   the device's own LCD (screen dumpbin), ?scale=1..4
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -158,6 +159,54 @@ class Scope:
                 return buf
         return buf
 
+    # ---- device screenshot (OpenScope `screen dumpbin`: 320x240, 4-bit palette) ----
+    SCREEN_HDR = re.compile(rb"SCREENBIN x=(\d+) y=(\d+) w=(\d+) h=(\d+) format=indexed4 len=(\d+) crc32=([0-9A-F]{8})\r\n")
+    SCREEN_PAL = [0x0000, 0xFFFF, 0xF800, 0x07E0, 0x001F, 0xFFE0, 0x07FF, 0xF81F,
+                  0x2104, 0x8410, 0xFCA0, 0x055F, 0x2945, 0x18C3, 0x3186, 0x6BB0]
+
+    def screen(self, timeout=20.0):
+        """Return (w, h, rgb_rows) of the LCD as the firmware's 16-colour shadow sees it.
+        The firmware sends the dump in two passes and its CRC only matches on a held screen,
+        so the CRC is reported but not enforced."""
+        with self.lock:
+            if not self.ensure():
+                raise ConnectionError("scope not connected")
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.write(b"screen dumpbin\r")
+                end = time.time() + timeout
+                buf = b""
+                m = None
+                while time.time() < end:
+                    buf += self.ser.read(max(1, self.ser.in_waiting))
+                    m = self.SCREEN_HDR.search(buf)
+                    if m:
+                        break
+                    if b"ERR" in buf and buf.endswith(b"> "):
+                        raise ValueError(buf.decode(errors="replace").strip())
+                if not m:
+                    raise ValueError("no SCREENBIN header")
+                w, h, n = int(m.group(3)), int(m.group(4)), int(m.group(5))
+                while len(buf) < m.end() + n and time.time() < end:
+                    buf += self.ser.read(max(1, min(self.ser.in_waiting, m.end() + n - len(buf)) or 1))
+                data = buf[m.end():m.end() + n]
+                self._read_until_prompt(1.0)
+            except (serial.SerialException, OSError) as e:
+                self.drop(e)
+                raise ConnectionError(str(e))
+        pal = [(((c >> 11) & 31) * 255 // 31, ((c >> 5) & 63) * 255 // 63, (c & 31) * 255 // 31)
+               for c in self.SCREEN_PAL]
+        row_len = (w + 1) // 2
+        rows = []
+        for y in range(h):
+            r = bytearray()
+            line = data[y * row_len:(y + 1) * row_len]
+            for x in range(w):
+                b = line[x >> 1] if (x >> 1) < len(line) else 0
+                r += bytes(pal[(b & 0x0F) if (x & 1) else (b >> 4)])
+            rows.append(bytes(r))
+        return w, h, rows
+
     def cmd(self, line, timeout=3.0):
         """Send a shell command, return its text output without echo and prompt."""
         out = self.raw(line, timeout).decode(errors="replace").replace("\r", "")
@@ -190,6 +239,22 @@ class Scope:
 
 
 # --------------------------------------------------------------------------------------------
+def png_rgb(w, h, rows, scale=1):
+    """Minimal PNG encoder (8-bit RGB, no filter), nearest-neighbour upscale by `scale`."""
+    import struct
+    def chunk(tag, body):
+        return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
+    raw = bytearray()
+    for r in rows:
+        if scale > 1:
+            r = b"".join(r[i:i + 3] * scale for i in range(0, len(r), 3))
+        for _ in range(scale):
+            raw += b"\x00" + r
+    ihdr = struct.pack(">IIBBBBB", w * scale, h * scale, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
+
+
 def measure(raw, vpc, rate):
     """Basic measurements on one channel. Volts when vpc>0, else ADC counts."""
     n = len(raw)
@@ -343,6 +408,19 @@ def make_http_handler(hub):
                     "status": hub.status, "port": scope.port, "run": hub.run})
             if p == "/api/frame.json":
                 return self._send(200, hub.latest or {})
+            if p == "/api/screen.png":
+                q = dict(x.split("=", 1) for x in self.path.split("?")[1:2][0].split("&")) if "?" in self.path else {}
+                try:
+                    scale = max(1, min(4, int(q.get("scale", "2"))))
+                except ValueError:
+                    scale = 2
+                try:
+                    w, h, rows = scope.screen()
+                except (ConnectionError, ValueError) as e:
+                    return self._send(503, {"error": str(e)})
+                name = time.strftime("2c53t_screen_%Y%m%d_%H%M%S.png")
+                return self._send(200, png_rgb(w, h, rows, scale), "image/png",
+                                  {"Content-Disposition": f'inline; filename="{name}"', "Cache-Control": "no-store"})
             if p == "/api/frame.csv":
                 fr = hub.latest
                 if not fr:

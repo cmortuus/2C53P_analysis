@@ -115,7 +115,9 @@
       <div class="btns">
         <button class="b" id="png">Save PNG</button>
         <button class="b" id="csv">Save CSV</button>
+        <button class="b" id="shot" style="grid-column: 1 / -1">Device screen</button>
       </div>
+      <div class="hint">Device screen = the scope's own LCD, fetched over the shell (16-colour copy; the olive grid shows gray).</div>
     </div>
 
     <div class="card console">
@@ -186,6 +188,7 @@ $('cmd').onkeydown = e => { if (e.key === 'Enter' && e.target.value.trim()) { sh
 function setRunBtn() { const b = $('runbtn'); b.textContent = running ? 'RUN' : 'STOP'; b.className = 'pill ' + (running ? 'run' : 'stop'); }
 $('runbtn').onclick = async () => { running = !running; setRunBtn(); await api('/api/run', { run: running }); };
 $('csv').onclick = () => { location.href = '/api/frame.csv'; };
+$('shot').onclick = () => { window.open('/api/screen.png?scale=2&t=' + Date.now(), '_blank'); };
 $('png').onclick = () => { const a = document.createElement('a'); a.download = 'scope_' + new Date().toISOString().replace(/[:.]/g, '-') + '.png'; a.href = cv.toDataURL('image/png'); a.click(); };
 
 // ---------- drawing ----------
