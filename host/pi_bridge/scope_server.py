@@ -41,7 +41,7 @@ RANGE_TIER = ["none"] * 4 + ["provisional", "measured", "measured", "measured", 
 
 # Commands the web UI may send. Anything else (mem write, flash, fwload…) is refused over HTTP.
 ALLOWED = [re.compile(p) for p in (
-    r"^fpga scope (timebase|vdiv|level|trigmode|edge|graticule|softtrig|hpos|measure|freq|cal|center)( [\w.\-]+){0,2}$",
+    r"^fpga scope (timebase|vdiv|level|trigmode|edge|graticule|softtrig|hpos|measure|freq|cal)( [\w.\-]+){0,2}$",   # not `center`: it stalls the CDC shell for seconds (link drop, 2026-10-10)
     r"^btn (ch1|ch2|move|select|trigger|prm|auto|save|menu|up|down|left|right|ok)( \d+)?$",
     r"^(version|status|settings|help)$",
 )]
