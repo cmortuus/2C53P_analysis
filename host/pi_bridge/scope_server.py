@@ -7,7 +7,7 @@ Owns the scope's USB CDC shell and serves:
            GET  /api/info         calibration tables, current settings, link status
            GET  /api/stream       Server-Sent Events: one JSON frame per capture
            GET  /api/frame.json   latest frame          GET /api/frame.csv  latest frame as CSV
-           GET  /api/screen.png   the device's own LCD (screen dumpbin), ?scale=1..4
+           GET  /api/screen.png   the device's own LCD (screen dumpbin), ?scale=1..4&hold=1|0
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -414,10 +414,28 @@ def make_http_handler(hub):
                     scale = max(1, min(4, int(q.get("scale", "2"))))
                 except ValueError:
                     scale = 2
+                # hold=1 (default): the firmware dumps the LCD in pages while the live
+                # compositor keeps drawing, so a free-running trace is stitched from two
+                # frames. Parking the trigger in SINGLE holds one record for the capture;
+                # the previous mode is restored afterwards.
+                hold = q.get("hold", "1") != "0"
+                prev = None
                 try:
+                    if hold:
+                        fr = hub.latest
+                        prev = ["auto", "normal", "single"][fr["hdr"].get("tmode", 0)] if fr else "auto"
+                        if prev != "single":
+                            scope.cmd("fpga scope trigmode single")
+                            time.sleep(0.5)
                     w, h, rows = scope.screen()
                 except (ConnectionError, ValueError) as e:
                     return self._send(503, {"error": str(e)})
+                finally:
+                    if hold and prev and prev != "single":
+                        try:
+                            scope.cmd("fpga scope trigmode " + prev)
+                        except (ConnectionError, ValueError):
+                            pass
                 name = time.strftime("2c53t_screen_%Y%m%d_%H%M%S.png")
                 return self._send(200, png_rgb(w, h, rows, scale), "image/png",
                                   {"Content-Disposition": f'inline; filename="{name}"', "Cache-Control": "no-store"})
