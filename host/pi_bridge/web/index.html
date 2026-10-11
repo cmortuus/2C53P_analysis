@@ -352,6 +352,9 @@ function draw() {
   for (const [c, on] of [[COL.ch1, frame.hdr.en1], [COL.ch2, frame.hdr.en2]]) if (on) {
     ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(0, H / 2 - 7); ctx.lineTo(10, H / 2); ctx.lineTo(0, H / 2 + 7); ctx.fill(); }
   if (frame.hdr.ordered) { ctx.fillStyle = '#f8a800'; ctx.beginPath(); ctx.moveTo(W / 2 - 7, 0); ctx.lineTo(W / 2 + 7, 0); ctx.lineTo(W / 2, 10); ctx.fill(); }
+  // trigger level marker (right edge): hdr.tlvl is the device's pixel offset from centre on its 216-px grid
+  { const ty = H / 2 - (frame.hdr.tlvl || 0) * (H / 216); ctx.fillStyle = '#f8a800'; ctx.beginPath();
+    ctx.moveTo(W, ty - 7); ctx.lineTo(W - 10, ty); ctx.lineTo(W, ty + 7); ctx.fill(); }
   drawCursors(spd);
   drawSpectrum();
   const sdiv = frame.rate ? spd / frame.rate : null;

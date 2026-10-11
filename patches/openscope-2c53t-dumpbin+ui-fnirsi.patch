@@ -580,7 +580,7 @@ index 0000000..539ebc3
 +
 +#endif /* SCOPE_TOPBAR_H */
 diff --git a/firmware/src/ui/scope_ui.c b/firmware/src/ui/scope_ui.c
-index 35b4903..de572d2 100644
+index 35b4903..043cf7a 100644
 --- a/firmware/src/ui/scope_ui.c
 +++ b/firmware/src/ui/scope_ui.c
 @@ -17,6 +17,7 @@
@@ -591,7 +591,7 @@ index 35b4903..de572d2 100644
  #include "scope_timebase.h"
  #include "scope_cursor.h"
  #include "scope_freq.h"
-@@ -43,7 +44,9 @@
+@@ -43,7 +44,10 @@
   * ═══════════════════════════════════════════════════════════════════ */
  
  #define SCOPE_TOP       18      /* Below status bar */
@@ -599,10 +599,11 @@ index 35b4903..de572d2 100644
 +#define SCOPE_BOT       (LCD_HEIGHT - 6)   /* Full-height graticule: 8 rows of GRID_ROW px (reskin 2026-10-10) */
 +#define GRID_COL        32                 /* 10 divisions across 320 px */
 +#define GRID_ROW        27                 /* 8 divisions in 216 px */
++#define SCOPE_H_FFT     (SCOPE_H - 10)     /* FFT/split/waterfall keep the 16-px bottom info bar (reskin) */
  #define SCOPE_H         (SCOPE_BOT - SCOPE_TOP)
  #define SCOPE_MID_Y     (SCOPE_TOP + SCOPE_H / 2)
  #ifdef SCOPE_DEBUG_OVERLAY
-@@ -184,27 +187,39 @@ bool scope_popup_active(void)
+@@ -184,27 +188,39 @@ bool scope_popup_active(void)
   * Grid
   * ═══════════════════════════════════════════════════════════════════ */
  
@@ -659,7 +660,7 @@ index 35b4903..de572d2 100644
  }
  
  /* ═══════════════════════════════════════════════════════════════════
-@@ -220,41 +235,20 @@ static void draw_trigger_indicator(const scope_state_t *ss, const theme_t *th,
+@@ -220,41 +236,20 @@ static void draw_trigger_indicator(const scope_state_t *ss, const theme_t *th,
      if (trig_y < SCOPE_TOP + 2) trig_y = SCOPE_TOP + 2;
      if (trig_y > SCOPE_BOT - 3) trig_y = SCOPE_BOT - 3;
  
@@ -714,7 +715,7 @@ index 35b4903..de572d2 100644
  }
  
  /* ═══════════════════════════════════════════════════════════════════
-@@ -266,35 +260,21 @@ static void draw_ground_markers(const scope_state_t *ss, const theme_t *th)
+@@ -266,35 +261,21 @@ static void draw_ground_markers(const scope_state_t *ss, const theme_t *th)
      /* CH1 ground marker — small right-pointing arrow with "1" */
      if (ss->ch1.enabled) {
          int16_t ch1_y = SCOPE_MID_Y - ss->ch1.position;
@@ -760,7 +761,7 @@ index 35b4903..de572d2 100644
      }
  }
  
-@@ -302,6 +282,7 @@ static void draw_ground_markers(const scope_state_t *ss, const theme_t *th)
+@@ -302,6 +283,7 @@ static void draw_ground_markers(const scope_state_t *ss, const theme_t *th)
   * Trigger status badge
   * ═══════════════════════════════════════════════════════════════════ */
  
@@ -768,7 +769,7 @@ index 35b4903..de572d2 100644
  static void draw_trigger_status(const scope_state_t *ss, const theme_t *th)
  {
      const char *label;
-@@ -345,6 +326,7 @@ static void draw_run_stop(const scope_state_t *ss, const theme_t *th)
+@@ -345,6 +327,7 @@ static void draw_run_stop(const scope_state_t *ss, const theme_t *th)
                                  th->text_primary, th->warning, &font_small);
      }
  }
@@ -776,7 +777,7 @@ index 35b4903..de572d2 100644
  
  /* ═══════════════════════════════════════════════════════════════════
   * Measurement badges
-@@ -353,14 +335,18 @@ static void draw_run_stop(const scope_state_t *ss, const theme_t *th)
+@@ -353,14 +336,18 @@ static void draw_run_stop(const scope_state_t *ss, const theme_t *th)
  static void draw_one_badge(uint16_t x, uint16_t y, const char *label,
                             const char *value, uint16_t color, const theme_t *th)
  {
@@ -803,7 +804,7 @@ index 35b4903..de572d2 100644
  }
  
  /* Shown wherever the instrument cannot measure the quantity today. */
-@@ -482,11 +468,12 @@ static void fmt_volts(char *b, size_t n, float v)
+@@ -482,11 +469,12 @@ static void fmt_volts(char *b, size_t n, float v)
   *
   * The compile-time check below is what keeps the volts/div label honest.
   * SCOPE_CAL_COUNTS_PER_DIV is a claim about THIS renderer's geometry — the
@@ -818,7 +819,7 @@ index 35b4903..de572d2 100644
                 "grid pitch no longer matches SCOPE_CAL_COUNTS_PER_DIV — "
                 "the volts/div labels in the status bar would be wrong");
  
-@@ -626,68 +613,43 @@ void scope_ui_mask_slot_refresh(void)
+@@ -626,68 +614,43 @@ void scope_ui_mask_slot_refresh(void)
  static void draw_measurement_badges(const scope_state_t *ss, const theme_t *th)
  {
      char buf[16];
@@ -904,7 +905,7 @@ index 35b4903..de572d2 100644
          }
          if (fe) {
              freq_hz = fr.hz;
-@@ -700,92 +662,43 @@ static void draw_measurement_badges(const scope_state_t *ss, const theme_t *th)
+@@ -700,92 +663,43 @@ static void draw_measurement_badges(const scope_state_t *ss, const theme_t *th)
  
          if (freq_hz > 0.0f) {
              fmt_hz(buf, sizeof(buf), freq_hz);
@@ -1012,7 +1013,7 @@ index 35b4903..de572d2 100644
  }
  
  /* ═══════════════════════════════════════════════════════════════════
-@@ -794,18 +707,25 @@ static void draw_measurement_badges(const scope_state_t *ss, const theme_t *th)
+@@ -794,18 +708,25 @@ static void draw_measurement_badges(const scope_state_t *ss, const theme_t *th)
  
  static void draw_popup_box(const theme_t *th)
  {
@@ -1049,7 +1050,7 @@ index 35b4903..de572d2 100644
      popup_painted = true;
  }
  
-@@ -867,6 +787,7 @@ void scope_popup_overlay_tick(void)
+@@ -867,6 +788,7 @@ void scope_popup_overlay_tick(void)
  typedef struct {
      bool    on;
      int16_t y_top, y_bot;
@@ -1057,7 +1058,7 @@ index 35b4903..de572d2 100644
      int     h, span;
      uint8_t mn;
  } autofit_t;
-@@ -896,17 +817,41 @@ static void autofit_prep(autofit_t *a, const volatile uint8_t *buf,
+@@ -896,17 +818,41 @@ static void autofit_prep(autofit_t *a, const volatile uint8_t *buf,
      int h = (int)(y_bot - y_top) - 3;       /* usable height, small margin */
      if (h < 4) h = 4;
  
@@ -1106,7 +1107,7 @@ index 35b4903..de572d2 100644
      if (yy < a->y_top) yy = a->y_top;
      if (yy >= a->y_bot) yy = a->y_bot - 1;
      return (int16_t)yy;
-@@ -1006,7 +951,7 @@ static int16_t trigger_marker_y_full(const scope_state_t *ss)
+@@ -1006,7 +952,7 @@ static int16_t trigger_marker_y_full(const scope_state_t *ss)
      const bool c1 = ss->ch1.enabled, c2 = ss->ch2.enabled;
      const volatile uint8_t *src = src2 ? b2 : b1;
      uint16_t toff = scope_soft_trigger_offset(ss, src);
@@ -1115,7 +1116,7 @@ index 35b4903..de572d2 100644
      if (c1 && c2)
          autofit_prep(&a, src + toff, src2 ? (int16_t)(SCOPE_MID_Y + 1) : (int16_t)SCOPE_TOP,
                                       src2 ? (int16_t)SCOPE_BOT : (int16_t)(SCOPE_MID_Y - 1),
-@@ -1105,6 +1050,7 @@ static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
+@@ -1105,6 +1051,7 @@ static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
      const uint16_t fail_c = theme_get()->warning;
      const uint16_t bnd_c  = theme_get()->text_secondary;
      int16_t prev_y = -1;
@@ -1123,7 +1124,7 @@ index 35b4903..de572d2 100644
      for (uint16_t x = 0; x < n; x++) {
          int16_t y = autofit_y(&a, buf[x]);
          uint16_t cc = mask_px_fail(mask_ch, x) ? fail_c : color;
-@@ -1117,9 +1063,13 @@ static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
+@@ -1117,9 +1064,13 @@ static float draw_channel_autofit(const volatile uint8_t *buf, uint16_t color,
          if (prev_y >= 0) {                  /* connect prev..cur vertically */
              int16_t a = prev_y < y ? prev_y : y;
              int16_t b = prev_y < y ? y : prev_y;
@@ -1137,7 +1138,7 @@ index 35b4903..de572d2 100644
              lcd_set_pixel(x, (uint16_t)y, cc);
          }
          prev_y = y;
-@@ -1152,9 +1102,14 @@ static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
+@@ -1152,9 +1103,14 @@ static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
  {
      uint16_t n = (LCD_WIDTH < 512u) ? (uint16_t)LCD_WIDTH : 512u;
      int16_t  y_mid = (int16_t)((y_top + y_bot) / 2);
@@ -1152,7 +1153,7 @@ index 35b4903..de572d2 100644
      for (uint16_t x = 0; x < n; x++) {
          int yy = (int)y_mid - ((int)buf[x] - (int)center) * SCOPE_H / 256;
          if (yy < y_top)   yy = y_top;
-@@ -1174,9 +1129,13 @@ static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
+@@ -1174,9 +1130,13 @@ static float draw_channel_fixed(const volatile uint8_t *buf, uint16_t color,
          if (prev_y >= 0) {
              int16_t a = prev_y < y ? prev_y : y;
              int16_t b = prev_y < y ? y : prev_y;
@@ -1166,7 +1167,7 @@ index 35b4903..de572d2 100644
              lcd_set_pixel(x, (uint16_t)y, cc);
          }
          prev_y = y;
-@@ -1384,26 +1343,32 @@ void draw_demo_waveform(uint32_t frame)
+@@ -1384,26 +1344,32 @@ void draw_demo_waveform(uint32_t frame)
           * always autofits (its grid has no volts meaning to honour). Default
           * ss->true_scale == false keeps every build on autofit unless toggled
           * from the shell. */
@@ -1210,7 +1211,7 @@ index 35b4903..de572d2 100644
          }
          return;
      }
-@@ -2294,11 +2259,7 @@ void draw_scope_screen(uint32_t frame)
+@@ -2294,11 +2260,7 @@ void draw_scope_screen(uint32_t frame)
      /* Layer 7: Cursor lines */
      draw_cursors();
  
@@ -1223,7 +1224,7 @@ index 35b4903..de572d2 100644
  
      /* Layer 10: Measurement badges */
      draw_measurement_badges(ss, th);
-@@ -2306,12 +2267,9 @@ void draw_scope_screen(uint32_t frame)
+@@ -2306,12 +2268,9 @@ void draw_scope_screen(uint32_t frame)
      /* Layer 11: Quick-change popup (on top of everything) */
      draw_popup(th);
  
@@ -1238,7 +1239,7 @@ index 35b4903..de572d2 100644
      /* SPI3 acquisition diagnostic — small text overlay top-center.
       * Shows probing status so we can see FPGA data flow without serial. */
      {
-@@ -2396,7 +2354,7 @@ void draw_scope_live_frame(void)
+@@ -2396,7 +2355,7 @@ void draw_scope_live_frame(void)
       * That was the second occlusion bug in a row here: first the debug strip
       * painted over the badges, then moving the badges up put them inside the
       * live band. Anchor to the badges and both cases are covered. */
@@ -1247,7 +1248,7 @@ index 35b4903..de572d2 100644
      const uint16_t band_h = band_bot - SCOPE_TOP;
      (void)band_h;
  
-@@ -2414,15 +2372,14 @@ void draw_scope_live_frame(void)
+@@ -2414,15 +2373,14 @@ void draw_scope_live_frame(void)
      const bool en1 = ss->ch1.enabled;
      const bool en2 = ss->ch2.enabled;
  
@@ -1269,7 +1270,7 @@ index 35b4903..de572d2 100644
      }
  
      /* Trigger dotted line, placed exactly as the full path places it: on the
-@@ -2430,7 +2387,7 @@ void draw_scope_live_frame(void)
+@@ -2430,7 +2388,7 @@ void draw_scope_live_frame(void)
      int16_t trig_y = trigger_marker_y(ss, (ss->trigger.source == TRIG_SRC_CH2) ? &a2 : &a1);
      if (trig_y < SCOPE_TOP + 2) trig_y = SCOPE_TOP + 2;
      if (trig_y > SCOPE_BOT - 3) trig_y = SCOPE_BOT - 3;
@@ -1278,7 +1279,7 @@ index 35b4903..de572d2 100644
  
      int16_t p1 = 0, p2 = 0;  /* previous column's y — vertical continuity */
  
-@@ -2466,6 +2423,8 @@ void draw_scope_live_frame(void)
+@@ -2466,6 +2424,8 @@ void draw_scope_live_frame(void)
          uint16_t mstrip = mask_strip_color((int)x, th, &mdot);
          uint16_t tc1 = mask_px_fail(0, (int)x) ? th->warning : th->ch1;
          uint16_t tc2 = mask_px_fail(1, (int)x) ? th->warning : th->ch2;
@@ -1287,7 +1288,7 @@ index 35b4903..de572d2 100644
          /* Mask bounds (dotted, every other column), through each band's own
           * autofit -- the one transform, as everywhere else. -1 = none. */
          int16_t bl1 = -1, bh1 = -1, bl2 = -1, bh2 = -1;
-@@ -2514,16 +2473,17 @@ void draw_scope_live_frame(void)
+@@ -2514,16 +2474,17 @@ void draw_scope_live_frame(void)
                  c = tc2;
              else if (a1.on && (int16_t)y >= lo1 && (int16_t)y <= hi1)
                  c = tc1;
@@ -1311,6 +1312,47 @@ index 35b4903..de572d2 100644
              else
                  c = th->background;
              lcd_write_data(c);
+@@ -2886,7 +2847,7 @@ static void draw_fft_region(uint16_t y_top, uint16_t height)
+ void draw_fft_screen(void)
+ {
+     lcd_fill_rect(0, SCOPE_TOP, LCD_WIDTH, SCOPE_H, COLOR_BLACK);
+-    draw_fft_region(SCOPE_TOP + 2, SCOPE_H - 4);
++    draw_fft_region(SCOPE_TOP + 2, SCOPE_H_FFT - 4);
+ }
+ 
+ void draw_split_screen(uint32_t frame)
+@@ -2941,7 +2902,7 @@ void draw_split_screen(uint32_t frame)
+     for (x = 0; x < LCD_WIDTH; x++)
+         lcd_set_pixel(x, divider_y, COLOR_GRID_CENTER);
+ 
+-    draw_fft_region(divider_y + 1, SCOPE_H / 2 - 2);
++    draw_fft_region(divider_y + 1, SCOPE_H_FFT / 2 - 2);
+ }
+ 
+ /* Waterfall
+@@ -3106,17 +3067,17 @@ void draw_waterfall_screen(void)
+      * layout that lets the newest row wrap in place instead of the image
+      * scrolling — which changes what is drawn, so it is a design decision,
+      * not a speedup. */
+-    uint16_t row_height = SCOPE_H / WATERFALL_ROWS;
++    uint16_t row_height = SCOPE_H_FFT / WATERFALL_ROWS;
+     if (row_height < 1) row_height = 1;
+ 
+     uint16_t rows_drawn = WATERFALL_ROWS;
+-    if ((uint32_t)rows_drawn * row_height > SCOPE_H)
+-        rows_drawn = (uint16_t)(SCOPE_H / row_height);
++    if ((uint32_t)rows_drawn * row_height > SCOPE_H_FFT)
++        rows_drawn = (uint16_t)(SCOPE_H_FFT / row_height);
+     uint16_t block_h = (uint16_t)(rows_drawn * row_height);
+ 
+-    if (block_h < SCOPE_H)
++    if (block_h < SCOPE_H_FFT)
+         lcd_fill_rect(0, (uint16_t)(SCOPE_TOP + block_h), LCD_WIDTH,
+-                      (uint16_t)(SCOPE_H - block_h), COLOR_BLACK);
++                      (uint16_t)(SCOPE_H_FFT - block_h), COLOR_BLACK);
+ 
+     uint16_t r;
+     for (r = 0; r < rows_drawn; r++) {
 diff --git a/firmware/src/ui/settings_ui.c b/firmware/src/ui/settings_ui.c
 index 0236d1c..a497ce1 100644
 --- a/firmware/src/ui/settings_ui.c

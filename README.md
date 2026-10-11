@@ -3,8 +3,10 @@
 Two handheld FNIRSI scopes, one goal: get live waveforms and control onto a computer.
 
 - **2C53T** (project device, Artery AT32F403A): runs [OpenScope-2C53T](https://github.com/DavidClawson/OpenScope-2C53T.git)-based
-  open firmware with our `scope dumpbin` streaming command, plugged into a **Pi Zero 2 W** that
-  serves a **live browser viewer** (`http://scope-pi.local:8080`) and a WiFi shell proxy.
+  open firmware with our `scope dumpbin` streaming command and a stock-FNIRSI-look UI reskin,
+  plugged into a **Pi Zero 2 W** that serves a **live browser viewer** (`http://scope-pi.local:8080`:
+  both channels at ~20 fps, measurements, controls, cursors, history, spectrum, logger, device-screen
+  capture) and a WiFi shell proxy. Firmware can be reflashed from the Pi with no hands on the scope.
 - **2C53P** (daily scope, Synwit SWM34S): fully reverse-engineered statically (saved-file format,
   FPGA data path, UART0 factory protocol, config sector) — see `HANDOFF.md`. Not modified.
 
