@@ -8,6 +8,7 @@ Owns the scope's USB CDC shell and serves:
            GET  /api/stream       Server-Sent Events: one JSON frame per capture
            GET  /api/frame.json   latest frame          GET /api/frame.csv  latest frame as CSV
            GET  /api/screen.png   the device's own LCD (screen dumpbin), ?scale=1..4&hold=1|0
+           GET/POST /api/log       measurement logger (POST {action: start|stop|clear}); GET /api/log.csv
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -327,11 +328,15 @@ class Hub:
         self.errors = 0
         self.fast_ok = True
         self.status = "starting"
+        self.logging = False            # measurement logger: one row per frame, in memory
+        self.log_rows = []
+        self.log_started = None
+        self.LOG_MAX = 200000           # ~2.7 h at 20 fps; oldest rows drop first
 
     def loop(self):
         times = []
         while True:
-            if not self.run or (self.viewers == 0 and self.latest and time.time() - self.latest["t"] < 1.0):
+            if not self.run or (self.viewers == 0 and not self.logging and self.latest and time.time() - self.latest["t"] < 1.0):
                 time.sleep(0.05)
                 continue
             try:
@@ -359,6 +364,13 @@ class Hub:
                   "ch1": base64.b64encode(c1).decode(), "ch2": base64.b64encode(c2).decode(),
                   "meas": {"ch1": measure(c1, vpc1, rate), "ch2": measure(c2, vpc2, rate)},
                   "fps": round(self.fps, 1), "errors": self.errors}
+            if self.logging:
+                m1, m2 = fr["meas"]["ch1"], fr["meas"]["ch2"]
+                self.log_rows.append((now, h.get("tb"), h.get("rng1"), h.get("rng2"),
+                                      m1.get("vamp"), m1.get("vavg"), m1.get("vrms_ac"), m1.get("freq"),
+                                      m2.get("vamp"), m2.get("vavg"), m2.get("vrms_ac"), m2.get("freq")))
+                if len(self.log_rows) > self.LOG_MAX:
+                    del self.log_rows[:len(self.log_rows) - self.LOG_MAX]
             with self.cond:
                 self.seq += 1
                 self.latest = fr
@@ -408,6 +420,17 @@ def make_http_handler(hub):
                     "status": hub.status, "port": scope.port, "run": hub.run})
             if p == "/api/frame.json":
                 return self._send(200, hub.latest or {})
+            if p == "/api/log":
+                return self._send(200, {"logging": hub.logging, "rows": len(hub.log_rows),
+                                        "since": hub.log_started})
+            if p == "/api/log.csv":
+                rows = ["t_unix,t_iso,tb,rng1,rng2,ch1_amp,ch1_mean,ch1_rms_ac,ch1_freq,ch2_amp,ch2_mean,ch2_rms_ac,ch2_freq"]
+                for r in list(hub.log_rows):
+                    rows.append(",".join([f"{r[0]:.3f}", time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(r[0]))]
+                                         + ["" if v is None else (f"{v:.6g}" if isinstance(v, float) else str(v)) for v in r[1:]]))
+                name = time.strftime("scope_log_%Y%m%d_%H%M%S.csv")
+                return self._send(200, "\n".join(rows) + "\n", "text/csv",
+                                  {"Content-Disposition": f'attachment; filename="{name}"'})
             if p == "/api/screen.png":
                 q = dict(x.split("=", 1) for x in self.path.split("?")[1:2][0].split("&")) if "?" in self.path else {}
                 try:
@@ -484,6 +507,18 @@ def make_http_handler(hub):
                 req = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if self.path == "/api/log":
+                a = req.get("action")
+                if a == "start":
+                    hub.log_rows = []
+                    hub.log_started = time.time()
+                    hub.logging = True
+                    hub.run = True
+                elif a == "stop":
+                    hub.logging = False
+                elif a == "clear":
+                    hub.log_rows = []
+                return self._send(200, {"logging": hub.logging, "rows": len(hub.log_rows)})
             if self.path == "/api/run":
                 hub.run = bool(req.get("run", True))
                 return self._send(200, {"run": hub.run})

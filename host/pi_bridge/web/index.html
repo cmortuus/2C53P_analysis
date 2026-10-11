@@ -139,6 +139,8 @@
         <button class="b" id="csv">Save CSV</button>
         <button class="b" id="shot" style="grid-column: 1 / -1">Device screen</button>
         <button class="b" id="autoset" title="scope AUTO button" style="grid-column: 1 / -1">Autoset</button>
+        <button class="b" id="logbtn" title="record one row of measurements per frame on the Pi">Start log</button>
+        <button class="b" id="logdl" title="download the current log as CSV">Log CSV</button>
       </div>
       <div class="hint">Device screen = the scope's own LCD, fetched over the shell (16-colour copy; the olive grid shows gray). The trigger is parked in Single for the capture and restored.</div>
     </div>
@@ -256,7 +258,12 @@ function drawSpectrum() {
   c.strokeStyle = col; c.lineWidth = 1.5; c.beginPath();
   for (let k = 1; k < bins; k++) { const x = k / bins * W, y = (top - db(k)) / (top - bot) * H; k === 1 ? c.moveTo(x, y) : c.lineTo(x, y); }
   c.stroke();
-  const fs = frame.rate || 0, fpk = fs ? peak * fs / n : null;
+  // quadratic interpolation of the peak bin (log-magnitude parabola)
+  let pk = peak;
+  if (peak > 1 && peak < bins - 1 && mag[peak - 1] > 0 && mag[peak + 1] > 0) {
+    const a = Math.log(mag[peak - 1]), b = Math.log(mag[peak]), c2 = Math.log(mag[peak + 1]);
+    const d = (a - c2) / (2 * (a - 2 * b + c2)); if (isFinite(d) && Math.abs(d) < 1) pk = peak + d; }
+  const fs = frame.rate || 0, fpk = fs ? pk * fs / n : null;
   c.fillStyle = '#f8a800'; c.font = '20px sans-serif';
   if (pv > 0) { const x = peak / bins * W, y = (top - db(peak)) / (top - bot) * H; c.beginPath(); c.moveTo(x, y - 14); c.lineTo(x - 6, y - 24); c.lineTo(x + 6, y - 24); c.fill();
     c.fillText((fpk ? fmtF(fpk) : 'bin ' + peak) + '  ' + db(peak).toFixed(1) + (vpc ? ' dBV' : ' dBc'), Math.min(x + 10, W - 220), Math.max(y - 30, 22)); }
@@ -301,6 +308,11 @@ function drawCursors(spd) {
 $('csv').onclick = () => { location.href = '/api/frame.csv'; };
 $('shot').onclick = () => { window.open('/api/screen.png?scale=2&t=' + Date.now(), '_blank'); };
 $('autoset').onclick = () => sh('btn auto');
+let logging = false;
+async function logState() { const r = await api('/api/log'); logging = r.logging; $('logbtn').textContent = logging ? `Stop log (${r.rows} rows)` : 'Start log'; $('logbtn').style.borderColor = logging ? '#ef4444' : ''; }
+$('logbtn').onclick = async () => { await api('/api/log', { action: logging ? 'stop' : 'start' }); logState(); };
+$('logdl').onclick = () => { location.href = '/api/log.csv'; };
+setInterval(() => { if (logging) logState(); }, 5000); logState();
 $('png').onclick = () => { const a = document.createElement('a'); a.download = 'scope_' + new Date().toISOString().replace(/[:.]/g, '-') + '.png'; a.href = cv.toDataURL('image/png'); a.click(); };
 
 // ---------- drawing ----------
