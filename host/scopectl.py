@@ -199,6 +199,38 @@ def analyze(fs, ch, info):
         d["flags"].append("periodicity not found on most frames: noise, DC with glitches, or frequency outside this timebase's reach")
     if d["freq_hz"] and 58 <= d["freq_hz"] <= 62 and cal and amp > 0.05:
         d["flags"].append("~60 Hz: mains pickup -- a floating/unconnected probe or missing ground clip looks exactly like this")
+    # ---- spectral peaks (numpy; Hann; top 3 distinct peaks, dB re the strongest)
+    d["spectrum_peaks"] = []
+    if rate and span_counts >= 6:
+        try:
+            import numpy as np
+            x = (np.frombuffer(bytes(raw), dtype=np.uint8).astype(float) - sum(raw) / len(raw)) * np.hanning(len(raw))
+            mag = np.abs(np.fft.rfft(x))
+            mag[0] = 0
+            order = np.argsort(mag)[::-1]
+            peaks, taken = [], []
+            for k in order:
+                if mag[k] <= 0 or any(abs(k - t) < 4 for t in taken):
+                    continue
+                taken.append(int(k))
+                k0 = int(k)
+                if 1 <= k0 < len(mag) - 1 and mag[k0 - 1] > 0 and mag[k0 + 1] > 0:
+                    a, b, c2 = np.log(mag[k0 - 1]), np.log(mag[k0]), np.log(mag[k0 + 1])
+                    dd = (a - c2) / (2 * (a - 2 * b + c2)) if (a - 2 * b + c2) != 0 else 0.0
+                    kk = k0 + (dd if abs(dd) < 1 else 0.0)
+                else:
+                    kk = float(k0)
+                peaks.append({"hz": kk * rate / len(raw), "db_rel": 20 * math.log10(mag[k0] / mag[order[0]])})
+                if len(peaks) == 3:
+                    break
+            d["spectrum_peaks"] = peaks
+        except Exception:
+            pass
+    # ---- near the input limit for this probe setting?
+    if cal:
+        limit = 40.0 * c["probe"]
+        if max(abs(d["top"]), abs(d["base"])) > 0.8 * limit:
+            d["flags"].append("within 20%% of the input limit for a x%d probe (%g V): stop and switch to x10 / check the source" % (c["probe"], limit))
     # ---- shape
     if span_counts < 6:
         d["shape"] = "flat (DC level %s)" % fmt(d["mean"], unit)
@@ -239,6 +271,8 @@ def analyze(fs, ch, info):
                  "" if cal else " (uncal)", fmt(d["vdiv"], "V") if cal else "--"))
     if d["zero_counts"] or d["gain"] != 1.0:
         parts.append("unit cal applied (gain x%.3f, zero %+.1f cnt)" % (d["gain"], d["zero_counts"]))
+    if d.get("spectrum_peaks"):
+        parts.append("spectrum peaks " + ", ".join("%s (%+.0f dB)" % (fmt_f(pk["hz"]), pk["db_rel"]) for pk in d["spectrum_peaks"]))
     d["summary"] = "; ".join(parts) + ("  FLAGS: " + " | ".join(d["flags"]) if d["flags"] else "")
     return d
 
@@ -403,7 +437,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
     p = sub.add_parser("wait"); p.add_argument("--ch", default="any"); p.add_argument("--timeout", type=float, default=120); p.add_argument("--counts", type=int, default=12)
-    p = sub.add_parser("autoset"); p.add_argument("--ch", type=int, default=1); p.add_argument("--png")
+    p = sub.add_parser("autoset"); p.add_argument("--ch", default="1", help="1, 2 or both"); p.add_argument("--png")
+    p = sub.add_parser("report"); p.add_argument("dir"); p.add_argument("--ch", default="both"); p.add_argument("--no-autoset", action="store_true"); p.add_argument("--title", default="")
     p = sub.add_parser("describe"); p.add_argument("--ch", default="both"); p.add_argument("--png"); p.add_argument("--frames", type=int, default=5); p.add_argument("--json", action="store_true")
     p = sub.add_parser("set"); p.add_argument("line")
     p = sub.add_parser("screen"); p.add_argument("out"); p.add_argument("--scale", type=int, default=2)
@@ -446,10 +481,84 @@ def main():
         raise SystemExit("no signal within %.0f s" % a.timeout)
 
     if a.cmd == "autoset":
-        d = autoset(a.ch, info)
-        print(d["summary"])
+        chans = [1, 2] if a.ch == "both" else [int(a.ch)]
+        descs = {}
+        for ch in chans:
+            descs[ch] = autoset(ch, info)
+        if len(chans) == 2:
+            # one timebase for both: follow the faster periodic signal (step, not dir)
+            fr = [descs[c]["freq_hz"] for c in chans if descs[c]["freq_hz"]]
+            if fr:
+                tbs = sorted(info["timebases"], key=lambda t: -t["rate"])
+                want = max(fr) * 1024 / 10.0
+                t = min(tbs, key=lambda t: abs(math.log(t["rate"] / want)))
+                cmd("fpga scope timebase 0x%02X" % t["code"])
+                fs = frames(3, settle=0.6)
+                descs = {c: analyze(fs, c, info) for c in chans}
+        for ch in chans:
+            print(descs[ch]["summary"])
         if a.png:
-            plot(frames(1), [a.ch], info, a.png, {a.ch: d}); print("plot:", a.png)
+            plot(frames(1), chans, info, a.png, descs); print("plot:", a.png)
+        return
+
+    if a.cmd == "report":
+        chans = [1, 2] if a.ch == "both" else [int(a.ch)]
+        os.makedirs(a.dir, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        lines = ["# Scope report %s" % (a.title or stamp), "", "generated %s by scopectl against %s" % (stamp, URL), ""]
+        if not a.no_autoset:
+            for ch in chans:
+                autoset(ch, info, verbose=False)
+            if len(chans) == 2:
+                fs = frames(3, settle=0.6)
+                fr = [analyze(fs, c, info)["freq_hz"] for c in chans]
+                fr = [x for x in fr if x]
+                if fr:
+                    tbs = sorted(info["timebases"], key=lambda t: -t["rate"])
+                    want = max(fr) * 1024 / 10.0
+                    t = min(tbs, key=lambda t: abs(math.log(t["rate"] / want)))
+                    cmd("fpga scope timebase 0x%02X" % t["code"])
+        fs = frames(5, settle=0.6)
+        descs = {ch: analyze(fs, ch, info) for ch in chans}
+        f = fs[-1]
+        lines.append("Settings: timebase 0x%02X (%s), trigger %s %s CH%d" % (f["hdr"]["tb"], fmt_rate(f["rate"]) if f["rate"] else "uncal",
+                     TMODE[f["hdr"]["tmode"]], "rising" if f["hdr"]["tedge"] == 0 else "falling", f["hdr"]["tsrc"] + 1))
+        lines.append("")
+        for ch in chans:
+            d = descs[ch]
+            lines.append("## CH%d" % ch)
+            lines.append("- " + d["summary"])
+            if d["pulse"]:
+                pm = d["pulse"]
+                lines.append("- edges in record: %d rising / %d falling; glitches: %d" % (pm["rising_edges"], pm["falling_edges"], pm["glitches"]))
+            for fl in d["flags"]:
+                lines.append("- FLAG: " + fl)
+            lines.append("")
+        tm = timing(fs, info) if len(chans) == 2 else None
+        if tm:
+            lines.append("## CH1 -> CH2 timing")
+            if tm.get("same_freq"):
+                lines.append("- CH2 rising edge %s after CH1's (%.0f deg of %s), n=%d%s" % (fmt_t(tm["delay_s"]), tm["phase_deg"], fmt_t(tm["period_s"]), tm["n"],
+                             ("; " + tm["quadrature"]) if tm.get("quadrature") else ""))
+            else:
+                lines.append("- different frequencies: %s vs %s" % (fmt_f(tm["f1"]), fmt_f(tm["f2"])))
+            lines.append("")
+        png = os.path.join(a.dir, "record.png")
+        plot(fs, chans, info, png, descs)
+        lines.append("![record](record.png)")
+        try:
+            data = api("/api/screen.png?scale=2", timeout=60)
+            open(os.path.join(a.dir, "lcd.png"), "wb").write(data)
+            lines.append("")
+            lines.append("![device screen](lcd.png)")
+        except Exception as e:
+            lines.append("(device screen capture failed: %s)" % e)
+        with open(os.path.join(a.dir, "raw.json"), "w") as fh:
+            json.dump({"frame": {k: v for k, v in f.items() if k not in ("b1", "b2")}, "channels": descs, "timing": tm}, fh, indent=1, default=str)
+        md = os.path.join(a.dir, "report.md")
+        open(md, "w").write("\n".join(lines) + "\n")
+        print("\n".join(lines))
+        print("\nwritten:", md)
         return
 
     if a.cmd == "describe":

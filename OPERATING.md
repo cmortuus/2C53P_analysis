@@ -16,11 +16,15 @@ $P host/scopectl.py describe --ch 1 --json       # machine-readable
 $P host/scopectl.py set "fpga scope timebase 0x10"   # any allow-listed shell command
 $P host/scopectl.py screen /tmp/lcd.png          # the device's own LCD
 $P host/scopectl.py log start | stop | csv out.csv [--summary]   # long recordings (1 row per frame, hours)
+$P host/scopectl.py autoset --ch both --png /tmp/a.png   # both channels; timebase follows the faster one (step, not dir)
+$P host/scopectl.py report /tmp/r1 --title "spindle PWM"   # ONE call: autoset both, describe, timing, plot, LCD, report.md + raw.json
 $P host/scopectl.py zero --ch 2                  # tip on GROUND first: stores this range's zero offset on the Pi
 $P host/scopectl.py gain --ch 2 --expected 3.3   # a known amplitude applied: stores this range's gain
 $P host/scopectl.py calib show | clear --ch 2 --rng 6
 ```
-`describe` also reports, for pulse trains: high/low widths, 10–90 % rise/fall (or "unresolved" when the
+`describe` also lists the three strongest spectral peaks (dB relative to the strongest — a square shows
+its odd harmonics at −10/−14 dB; VFD/switching noise shows up here) and warns when a level is within
+20 % of the input limit for the probe setting. For pulse trains it reports high/low widths, 10–90 % rise/fall (or "unresolved" when the
 edge is under 2 samples), runt-pulse count (glitches, contact bounce); and with both channels on the
 same frequency the CH1→CH2 delay/phase, flagging ~90° as quadrature (encoder A/B order).
 Always read the plot (Read tool on the PNG). The text summary is good, the plot catches what
