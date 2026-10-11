@@ -76,6 +76,12 @@
       <canvas id="cv" width="1000" height="800"></canvas>
       <div class="overlay" id="ov"></div>
     </div>
+    <div id="scrubbar" style="display:none; margin-top:6px; align-items:center; gap:8px">
+      <span class="link" style="padding:0">history</span>
+      <input type="range" id="scrub" min="0" max="0" value="0" style="flex:1">
+      <span class="link" id="scrublabel" style="padding:0; min-width:120px; text-align:right"></span>
+    </div>
+    <div class="link" id="curread" style="padding:6px 2px 0; display:none"></div>
   </div>
 
   <div class="side">
@@ -100,6 +106,17 @@
       <div class="row"><label style="color:var(--ch2)">CH2 V/div</label><select id="r2"></select></div>
       <div class="row"><label>Show</label>
         <div class="toggles"><label><input type="checkbox" id="v1" checked> CH1</label><label><input type="checkbox" id="v2" checked> CH2</label></div></div>
+    </div>
+
+    <div class="card">
+      <h3>Cursors &amp; display</h3>
+      <div class="btns">
+        <button class="b" id="curT">Time cursors</button>
+        <button class="b" id="curV">Volt cursors</button>
+      </div>
+      <div class="row" style="margin-top:8px"><label>V cursors on</label><select id="curCh"><option value="1">CH1</option><option value="2">CH2</option></select></div>
+      <div class="row"><label>Persist</label><div class="toggles"><label><input type="checkbox" id="persist"> trails</label></div></div>
+      <div class="hint">Drag cursors on the screen. Space = RUN/STOP; when stopped, scrub the last 300 frames.</div>
     </div>
 
     <div class="card">
@@ -135,6 +152,7 @@ const cv = $('cv'), ctx = cv.getContext('2d');
 const COL = { ch1: getComputedStyle(document.documentElement).getPropertyValue('--ch1').trim(),
               ch2: getComputedStyle(document.documentElement).getPropertyValue('--ch2').trim() };
 let info = null, frame = null, running = true, busy = {};
+const HIST_MAX = 300; let hist = [], cur = { t: null, v: null, drag: null };
 
 function fmtV(v) { if (v == null || !isFinite(v)) return '—'; const a = Math.abs(v);
   return a >= 1 ? v.toFixed(a >= 10 ? 1 : 2) + ' V' : a >= 1e-3 ? (v * 1e3).toFixed(a >= 0.1 ? 0 : 1) + ' mV' : (v * 1e6).toFixed(0) + ' µV'; }
@@ -187,7 +205,50 @@ $('tlvl').onchange = e => sh('fpga scope level ' + e.target.value);
 $('v1').onchange = $('v2').onchange = $('zoom').onchange = () => draw();
 $('cmd').onkeydown = e => { if (e.key === 'Enter' && e.target.value.trim()) { sh(e.target.value.trim()); e.target.value = ''; } };
 function setRunBtn() { const b = $('runbtn'); b.textContent = running ? 'RUN' : 'STOP'; b.className = 'pill ' + (running ? 'run' : 'stop'); }
-$('runbtn').onclick = async () => { running = !running; setRunBtn(); await api('/api/run', { run: running }); };
+async function setRunning(on) { running = on; setRunBtn(); showScrub(); await api('/api/run', { run: running }); }
+$('runbtn').onclick = () => setRunning(!running);
+function showScrub() {
+  const sb = $('scrubbar'); sb.style.display = (!running && hist.length > 1) ? 'flex' : 'none';
+  if (!running) { $('scrub').max = hist.length - 1; $('scrub').value = hist.length - 1; scrubLabel(); }
+}
+function scrubLabel() { const i = +$('scrub').value, n = hist.length; const f = hist[i]; if (!f) return;
+  $('scrublabel').textContent = `${i - n + 1} (${((f.t - hist[n - 1].t)).toFixed(2)} s)`; }
+$('scrub').oninput = () => { const f = hist[+$('scrub').value]; if (f) { frame = f; scrubLabel(); updateStatus(f); draw(); } };
+document.addEventListener('keydown', e => { if (e.code === 'Space' && !/INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) { e.preventDefault(); setRunning(!running); } });
+$('persist').onchange = () => draw();
+// ---------- cursors ----------
+$('curT').onclick = () => { cur.t = cur.t ? null : [0.35, 0.65]; $('curT').style.borderColor = cur.t ? '#f8a800' : ''; draw(); };
+$('curV').onclick = () => { cur.v = cur.v ? null : [0.35, 0.65]; $('curV').style.borderColor = cur.v ? '#f8a800' : ''; draw(); };
+$('curCh').onchange = () => draw();
+function cvPos(e) { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; }
+cv.addEventListener('pointerdown', e => {
+  const [fx, fy] = cvPos(e); let best = null, bd = 0.02;
+  if (cur.t) cur.t.forEach((v, i) => { const d = Math.abs(v - fx); if (d < bd) { bd = d; best = ['t', i]; } });
+  if (cur.v) cur.v.forEach((v, i) => { const d = Math.abs(v - fy); if (d < bd) { bd = d; best = ['v', i]; } });
+  if (best) { cur.drag = best; cv.setPointerCapture(e.pointerId); e.preventDefault(); }
+});
+cv.addEventListener('pointermove', e => { if (!cur.drag) return; const [fx, fy] = cvPos(e);
+  const [k, i] = cur.drag; cur[k][i] = Math.max(0, Math.min(1, k === 't' ? fx : fy)); draw(); });
+cv.addEventListener('pointerup', () => { cur.drag = null; }); cv.addEventListener('pointercancel', () => { cur.drag = null; });
+function drawCursors(spd) {
+  const W = cv.width, H = cv.height; const out = [];
+  ctx.save(); ctx.strokeStyle = '#f8a800'; ctx.lineWidth = 1.5; ctx.setLineDash([8, 6]); ctx.fillStyle = '#f8a800'; ctx.font = '22px sans-serif';
+  if (cur.t) {
+    cur.t.forEach((fx, i) => { const x = fx * W; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); ctx.fillText('T' + (i + 1), x + 6, 24); });
+    if (frame && frame.rate) { const dt = (cur.t[1] - cur.t[0]) * spd * DIVX / frame.rate;
+      out.push(`Δt ${fmtT(dt)}`, `1/Δt ${fmtF(dt ? 1 / Math.abs(dt) : null)}`); } else out.push('Δt — (uncal timebase)');
+  }
+  if (cur.v) {
+    const ch = $('curCh').value, vpc = frame ? (ch === '1' ? frame.vpc1 : frame.vpc2) : 0;
+    cur.v.forEach((fy, i) => { const y = fy * H; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); ctx.fillText('V' + (i + 1), 8, y - 6); });
+    const counts = fy => (0.5 - fy) * DIVY * info.counts_per_div;
+    const c0 = counts(cur.v[0]), c1 = counts(cur.v[1]);
+    out.push(vpc ? `CH${ch}: V1 ${fmtV(c0 * vpc)}  V2 ${fmtV(c1 * vpc)}  ΔV ${fmtV(c1 - c0 ? (c1 - c0) * vpc : 0)}`
+                 : `CH${ch}: V1 ${c0.toFixed(1)} cnt  V2 ${c1.toFixed(1)} cnt  Δ ${(c1 - c0).toFixed(1)} cnt (uncal)`);
+  }
+  ctx.restore();
+  const cr = $('curread'); cr.style.display = out.length ? 'block' : 'none'; cr.textContent = out.join('    ');
+}
 $('csv').onclick = () => { location.href = '/api/frame.csv'; };
 $('shot').onclick = () => { window.open('/api/screen.png?scale=2&t=' + Date.now(), '_blank'); };
 $('autoset').onclick = () => sh('btn auto');
@@ -195,9 +256,9 @@ $('png').onclick = () => { const a = document.createElement('a'); a.download = '
 
 // ---------- drawing ----------
 const DIVX = 10, DIVY = 8;
-function grid() {
+function grid(fade) {
   const W = cv.width, H = cv.height, dx = W / DIVX, dy = H / DIVY;
-  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = fade ? 'rgba(0,0,0,.22)' : '#000'; ctx.fillRect(0, 0, W, H);
   ctx.strokeStyle = 'rgba(112,136,72,.8)'; ctx.lineWidth = 1; ctx.setLineDash([2, 6]);
   ctx.beginPath();
   for (let i = 1; i < DIVX; i++) { ctx.moveTo(i * dx + .5, 0); ctx.lineTo(i * dx + .5, H); }
@@ -220,7 +281,7 @@ function trace(bytes, color, spd) {
   ctx.stroke();
 }
 function draw() {
-  grid();
+  grid($('persist').checked && running);
   if (!frame || !info) return;
   const spd = parseFloat($('zoom').value);
   if ($('v1').checked && frame.hdr.en1) trace(frame.b1, COL.ch1, spd);
@@ -230,6 +291,7 @@ function draw() {
   for (const [c, on] of [[COL.ch1, frame.hdr.en1], [COL.ch2, frame.hdr.en2]]) if (on) {
     ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(0, H / 2 - 7); ctx.lineTo(10, H / 2); ctx.lineTo(0, H / 2 + 7); ctx.fill(); }
   if (frame.hdr.ordered) { ctx.fillStyle = '#f8a800'; ctx.beginPath(); ctx.moveTo(W / 2 - 7, 0); ctx.lineTo(W / 2 + 7, 0); ctx.lineTo(W / 2, 10); ctx.fill(); }
+  drawCursors(spd);
   const sdiv = frame.rate ? spd / frame.rate : null;
   $('ov').textContent = (frame.rate ? (frame.rate / 1e3).toFixed(1) + ' kS/s · ' : '') + (frame.hdr.ordered ? 'triggered' : 'free-run') +
     ' · gen ' + frame.hdr.gen + (frame.hdr.ready ? '' : ' · DEMO (no real samples yet)');
@@ -261,9 +323,10 @@ function updateStatus(f) {
 function connect() {
   const es = new EventSource('/api/stream');
   es.onmessage = ev => {
-    const f = JSON.parse(ev.data); f.b1 = b64(f.ch1); f.b2 = b64(f.ch2); frame = f;
+    const f = JSON.parse(ev.data); f.b1 = b64(f.ch1); f.b2 = b64(f.ch2);
+    hist.push(f); if (hist.length > HIST_MAX) hist.shift();
     $('dot').className = 'dot ok'; $('fps').textContent = f.fps.toFixed(1) + ' fps';
-    updateStatus(f); draw();
+    if (running) { frame = f; updateStatus(f); draw(); }
   };
   es.onerror = () => { $('dot').className = 'dot'; $('fps').textContent = 'reconnecting…'; };
 }

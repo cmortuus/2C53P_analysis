@@ -16,7 +16,9 @@ Both channels live (SSE push, ~20 fps with firmware v3; the raw record takes ~30
 status bar (V/div, probe, coupling, timebase, trigger), 10×8 graticule with volt/time scaling
 from the record header + OpenScope's calibration tables, measurements (Vpp/Vmax/Vmin/mean/
 AC-RMS/freq/period/duty, clipping warning), controls (timebase, V/div per channel, trigger
-mode/edge/level, RUN/STOP, PNG + CSV download) and a shell box limited to an allow-list.
+mode/edge/level, RUN/STOP, Autoset, PNG + CSV download, device-screen capture), draggable time and
+voltage cursors (Δt, 1/Δt, ΔV), a 300-frame history you can scrub when stopped, a persistence
+(trails) mode, Space = RUN/STOP, and a shell box limited to an allow-list.
 
 API: `GET /api/info` (calibration tables, port, status), `GET /api/stream` (SSE, one JSON frame
 per event with base64 `ch1`/`ch2`), `GET /api/frame.json`, `GET /api/frame.csv`,
