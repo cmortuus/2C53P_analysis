@@ -19,6 +19,11 @@ $P host/scopectl.py screen /tmp/lcd.png          # the device's own LCD
 $P host/scopectl.py log start | stop | csv out.csv [--summary]   # long recordings (1 row per frame, hours)
 $P host/scopectl.py autoset --ch both --png /tmp/a.png   # both channels; timebase follows the faster one (step, not dir)
 $P host/scopectl.py report /tmp/r1 --title "spindle PWM"   # ONE call: autoset both, describe, timing, plot, LCD, report.md + raw.json
+$P host/scopectl.py decode steps --ch 1 --dir-ch 2     # step/dir: count, +/- by DIR, step rate, interval jitter
+$P host/scopectl.py decode uart --ch 1 --baud 9600     # serial bytes (needs sample rate >= 8x baud; up to ~600 kbaud at 5 MS/s)
+$P host/scopectl.py avg --ch 2 --frames 16 --png /tmp/avg.png   # aligned average: ripple/small signals, noise / 4
+$P host/scopectl.py ref save spindle_pwm_ok --ch 2 --note "healthy"   # keep a known-good waveform on the Pi
+$P host/scopectl.py ref compare spindle_pwm_ok --ch 2 --png /tmp/cmp.png   # later: max/rms deviation, amp/freq change
 $P host/scopectl.py zero --ch 2                  # tip on GROUND first: stores this range's zero offset on the Pi
 $P host/scopectl.py gain --ch 2 --expected 3.3   # a known amplitude applied: stores this range's gain
 $P host/scopectl.py calib show | clear --ch 2 --rng 6
@@ -90,8 +95,10 @@ time, which is how a sagging rail or an intermittent contact shows up.
 - **Flags** in `describe`: clipped / no signal / low resolution / uncalibrated / frequency unstable
   (= intermittent contact or jitter) / ~60 Hz mains pickup (= a floating probe, missing ground clip).
 - **Free-run vs triggered:** most records are free-run (the plot says so); the time axis is still
-  exact, only the phase is random. Edge timing *within* a record is reliable; timing between two
-  records is not.
+  exact, only the phase is random, and each record contains ONE seam where the ring buffer wrapped
+  (a phase jump). The analysis finds that seam (abnormal plateau or kink) and rotates it to the end
+  before averaging, comparing or counting steps; frequency uses the seam-tolerant estimator. Edge
+  timing *within* a record is reliable; timing between two records is not.
 
 ## Safety limits (input)
 - Scope input with the probe at **×1: keep it under 40 V**. At **×10: under 400 V peak**, and the

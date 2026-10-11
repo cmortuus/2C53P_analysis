@@ -354,3 +354,174 @@ def timing(raw1, raw2, rate, p=None):
     if 60 < abs(phase) < 120:
         out["quadrature"] = "CH2 %s CH1 by ~90 deg (%s)" % ("lags" if phase > 0 else "leads", "A->B order" if phase > 0 else "B->A order")
     return out
+
+
+# ------------------------------------------------------------------ seam (free-run records)
+def find_seam(raw, p=None):
+    """Index of the ring-buffer wrap in a free-run record, or None. Pulse-like signals: the one
+    plateau whose length is off (the phase jumps there); otherwise the sharpest kink
+    (second difference) well above the record's typical curvature."""
+    p = p or Params()
+    rises, falls, mean = edges(raw, p.hyst, p.min_span)
+    if mean is None:
+        return None
+    ev = sorted([(r, 1) for r in rises] + [(f, 0) for f in falls])
+    if len(ev) >= 4:
+        segs = [(ev[i][0], ev[i + 1][0], ev[i][1]) for i in range(len(ev) - 1)]
+        for kind in (1, 0):
+            ls = sorted(b - a for a, b, k in segs if k == kind)
+            if len(ls) >= 3:
+                med = ls[len(ls) // 2]
+                worst = max(((abs((b - a) - med) / med), a, b) for a, b, k in segs if k == kind)
+                if worst[0] > 0.15:
+                    return int((worst[1] + worst[2]) / 2)
+        return None
+    # smooth signal: kink detector
+    n = len(raw)
+    d2 = [abs(raw[i + 1] - 2 * raw[i] + raw[i - 1]) for i in range(1, n - 1)]
+    srt = sorted(d2)
+    med = srt[len(srt) // 2] or 1
+    k = max(range(len(d2)), key=lambda i: d2[i])
+    return (k + 1) if d2[k] > 6 * med and d2[k] >= 4 else None
+
+
+def unrotate(raw, p=None):
+    """Rotate a free-run record so its seam is at the end (returns bytes)."""
+    k = find_seam(raw, p)
+    if k is None or k <= 0 or k >= len(raw) - 1:
+        return bytes(raw)
+    return bytes(raw[k:]) + bytes(raw[:k])
+
+
+# ------------------------------------------------------------------ averaging
+def aligned_average(raws, p=None, n_out=None):
+    """Average several records of a periodic signal after aligning each on its first rising edge
+    (free-run records have random phase). Returns (avg_list_of_floats, used_count) over the common
+    length, or (None, 0) when fewer than 2 records could be aligned. Noise drops by ~sqrt(used)."""
+    p = p or Params()
+    segs = []
+    for raw in raws:
+        raw = unrotate(raw, p)
+        rises, _, _ = edges(raw, p.hyst, p.min_span)
+        rises = [r for r in rises if r >= 2]
+        if not rises:
+            continue
+        start = int(round(rises[0]))
+        segs.append(raw[start:])
+    if len(segs) < 2:
+        return None, 0
+    L = min(len(x) for x in segs)
+    if n_out:
+        L = min(L, n_out)
+    acc = [0.0] * L
+    for sg in segs:
+        for i in range(L):
+            acc[i] += sg[i]
+    return [a / len(segs) for a in acc], len(segs)
+
+
+# ------------------------------------------------------------------ decoders
+def decode_steps(raw_step, raw_dir, rate, p=None):
+    """Step/dir decoder: counts step rising edges, signed by the DIR level at each edge
+    (DIR high = +). Returns counts, net position, step rate, interval stats."""
+    p = p or Params()
+    k = find_seam(raw_step, p)
+    if k is not None:                                   # same rotation for both channels
+        raw_step = bytes(raw_step[k:]) + bytes(raw_step[:k]); raw_dir = bytes(raw_dir[k:]) + bytes(raw_dir[:k])
+    rises, _, _ = edges(raw_step, p.hyst, p.min_span)
+    if not rises:
+        return {"steps": 0, "net": 0, "note": "no step edges in the record"}
+    dmean = sum(raw_dir) / len(raw_dir)
+    dmn, dmx = min(raw_dir), max(raw_dir)
+    dir_static = (dmx - dmn) < p.min_span
+    thr = (dmx + dmn) / 2.0
+    plus = minus = 0
+    for r in rises:
+        i = min(len(raw_dir) - 1, max(0, int(r)))
+        high = (raw_dir[i] > thr) if not dir_static else (dmean > 128)
+        if high: plus += 1
+        else: minus += 1
+    ivals = [b - a for a, b in zip(rises, rises[1:])]
+    if k is not None and len(ivals) >= 3:              # the cycle straddling the old seam is not real timing
+        ivals = sorted(ivals)[: -1] if (ivals and max(ivals) > 1.15 * sorted(ivals)[len(ivals) // 2]) else ivals
+    out = {"steps": len(rises), "plus": plus, "minus": minus, "net": plus - minus, "seam_rotated": k is not None,
+           "dir_static": dir_static, "dir_level": "high" if dmean > thr or (dir_static and dmean > 128) else "low"}
+    if rate and ivals:
+        out["step_rate_hz"] = rate / statistics.median(ivals)
+        out["interval_min_s"] = min(ivals) / rate; out["interval_max_s"] = max(ivals) / rate
+        out["interval_jitter"] = (max(ivals) - min(ivals)) / statistics.median(ivals)
+        out["record_s"] = len(raw_step) / rate
+    return out
+
+
+def decode_uart(raw, rate, baud, bits=8, parity=None, stop=1, idle_high=True, p=None):
+    """Asynchronous serial decoder on one record. Needs rate >= 8 * baud. Returns bytes and
+    per-frame flags (framing errors). Levels from the record's own top/base."""
+    p = p or Params()
+    if not rate or rate < 8 * baud:
+        return {"error": "sample rate %.0f too low for %d baud (need >= %d)" % (rate or 0, baud, 8 * baud)}
+    mn, mx = min(raw), max(raw)
+    if mx - mn < p.min_span:
+        return {"error": "no signal"}
+    thr = (mx + mn) / 2.0
+    lvl = [1 if x > thr else 0 for x in raw]
+    if not idle_high:
+        lvl = [1 - x for x in lvl]
+    spb = rate / float(baud)
+    out, errors, i, n = [], 0, 1, len(lvl)
+    while i < n:
+        if lvl[i - 1] == 1 and lvl[i] == 0:                    # start bit edge
+            pos = i + spb * 0.5                                 # mid of the start bit
+            if int(pos) >= n or lvl[int(pos)] != 0:
+                i += 1; continue
+            val = 0
+            ok = True
+            for b in range(bits):
+                k = int(pos + spb * (b + 1))
+                if k >= n: ok = False; break
+                val |= (lvl[k] << b)
+            if not ok:
+                break
+            k = int(pos + spb * (bits + 1 + (1 if parity else 0)))
+            if k < n and lvl[k] != 1:
+                errors += 1                                     # stop bit not high: framing error
+            out.append(val)
+            i = int(pos + spb * (bits + 1 + (1 if parity else 0) + stop - 0.5))
+        else:
+            i += 1
+    text = "".join(chr(b) if 32 <= b < 127 else "." for b in out)
+    return {"bytes": out, "hex": " ".join("%02X" % b for b in out), "text": text, "framing_errors": errors,
+            "samples_per_bit": spb, "count": len(out)}
+
+
+# ------------------------------------------------------------------ reference compare
+def compare_to_reference(raw, ref_raw, rate, vpc, zero=0.0, ref_vpc=None, ref_zero=0.0, p=None):
+    """Align both records on their first rising edge and compare in volts (or counts)."""
+    p = p or Params()
+    raw, ref_raw = unrotate(raw, p), unrotate(ref_raw, p)
+    k = vpc if vpc else 1.0
+    kr = (ref_vpc if ref_vpc is not None else vpc) or 1.0
+    za = (128 + zero) if vpc else 0
+    zr = (128 + ref_zero) if (ref_vpc if ref_vpc is not None else vpc) else 0
+    a = [(x - za) * k for x in raw]
+    b = [(x - zr) * kr for x in ref_raw]
+    ra, _, _ = edges(raw, p.hyst, p.min_span)
+    rb, _, _ = edges(ref_raw, p.hyst, p.min_span)
+    if ra and rb:
+        a = a[int(round(ra[0])):]; b = b[int(round(rb[0])):]
+        aligned = True
+    else:
+        aligned = False
+    L = min(len(a), len(b))
+    if L < 16:
+        return {"error": "records too short to compare"}
+    diffs = [a[i] - b[i] for i in range(L)]
+    mad = max(abs(d) for d in diffs)
+    rmsd = math.sqrt(sum(d * d for d in diffs) / L)
+    la, lb = levels(raw, vpc, zero), levels(ref_raw, ref_vpc if ref_vpc is not None else vpc, ref_zero)
+    fa, fb = frequency(raw, rate, p), frequency(ref_raw, rate, p)
+    return {"aligned_on_edge": aligned, "samples": L, "max_abs_diff": mad, "rms_diff": rmsd,
+            "amp_now": la["vamp"], "amp_ref": lb["vamp"], "amp_change": (la["vamp"] - lb["vamp"]),
+            "mean_now": la["vavg"], "mean_ref": lb["vavg"],
+            "freq_now": fa, "freq_ref": fb, "freq_change_pct": ((fa / fb - 1) * 100) if (fa and fb) else None,
+            "unit": "V" if vpc else "cnt"}

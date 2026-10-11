@@ -281,6 +281,9 @@ def main():
     p = sub.add_parser("records", help="list/fetch stored raw segments"); p.add_argument("action", choices=["list", "fetch"]); p.add_argument("--from", dest="t0"); p.add_argument("--to", dest="t1"); p.add_argument("--every", type=int, default=1); p.add_argument("--limit", type=int, default=5000); p.add_argument("out", nargs="?")
     p = sub.add_parser("find", help="events in the recorded metrics index, e.g. --where 'ch2_mean<4.5,ch1_glitches>0'"); p.add_argument("--from", dest="t0", default="-1h"); p.add_argument("--to", dest="t1", default="now"); p.add_argument("--where", required=True); p.add_argument("--gap", type=float, default=2.0); p.add_argument("--json", action="store_true")
     p = sub.add_parser("watch", help="live: report the moment a condition trips, e.g. --where 'ch2_mean<4.5'"); p.add_argument("--where", required=True); p.add_argument("--for", dest="duration", default="10m"); p.add_argument("--all", action="store_true", help="print every trip, not just the first")
+    p = sub.add_parser("decode", help="decoders on the latest frames: steps (step/dir) or uart"); p.add_argument("proto", choices=["steps", "uart"]); p.add_argument("--ch", type=int, default=1, help="step or data channel"); p.add_argument("--dir-ch", type=int, default=2); p.add_argument("--baud", type=int, default=9600); p.add_argument("--bits", type=int, default=8); p.add_argument("--idle-low", action="store_true"); p.add_argument("--frames", type=int, default=3)
+    p = sub.add_parser("avg", help="aligned average of N frames (small signals, ripple): levels + plot"); p.add_argument("--ch", type=int, default=1); p.add_argument("--frames", type=int, default=16); p.add_argument("--png")
+    p = sub.add_parser("ref", help="reference waveforms on the Pi: save | list | compare"); p.add_argument("action", choices=["save", "list", "compare"]); p.add_argument("name", nargs="?"); p.add_argument("--ch", type=int, default=1); p.add_argument("--note", default=""); p.add_argument("--png")
     p = sub.add_parser("replay", help="re-evaluate a stored time window with chosen criteria"); p.add_argument("--from", dest="t0", required=True); p.add_argument("--to", dest="t1", default="now"); p.add_argument("--ch", default="both"); p.add_argument("--every", type=int, default=1); p.add_argument("--limit", type=int, default=5000); p.add_argument("--param", action="append", help="e.g. hyst=0.1 glitch_ratio=0.3 low_res=16"); p.add_argument("--png", help="strip chart of amplitude/mean/freq over time"); p.add_argument("--csv", help="per-frame metrics"); p.add_argument("--json", action="store_true"); p.add_argument("--server", action="store_true", help="run the analysis on the Pi (/api/analyze) instead of locally")
     a = ap.parse_args()
     URL = a.url
@@ -500,6 +503,80 @@ def main():
         data = api("/api/records/query?from=%f&to=%f&every=%d&limit=%d" % (t0, t1, a.every, a.limit), timeout=300)
         out = a.out or time.strftime("scope_records_%Y%m%d_%H%M%S.json")
         open(out, "w").write(json.dumps(data)); print("saved %s: %d frames" % (out, len(data["frames"]))); return
+
+    if a.cmd == "decode":
+        fs = frames(a.frames)
+        f = fs[-1]
+        if a.proto == "steps":
+            res = [SA.decode_steps(fr["b%d" % a.ch], fr["b%d" % a.dir_ch], fr["rate"]) for fr in fs]
+            r = res[-1]
+            print("step/dir (step CH%d, dir CH%d), last of %d records: %s" % (a.ch, a.dir_ch, len(fs), json.dumps(r)))
+            if "step_rate_hz" in r:
+                print("  %d steps in %s (%d +, %d -, net %+d), step rate %s, interval %s..%s, jitter %.1f%%, DIR %s%s" % (
+                    r["steps"], fmt_t(r["record_s"]), r["plus"], r["minus"], r["net"], fmt_f(r["step_rate_hz"]), fmt_t(r["interval_min_s"]), fmt_t(r["interval_max_s"]),
+                    r["interval_jitter"] * 100, r["dir_level"], " (static)" if r["dir_static"] else " (changes within the record)"))
+        else:
+            r = SA.decode_uart(f["b%d" % a.ch], f["rate"], a.baud, bits=a.bits, idle_high=not a.idle_low)
+            if "error" in r:
+                print("uart: " + r["error"])
+            else:
+                print("uart CH%d %d baud 8N1, %.1f samples/bit: %d byte(s), %d framing error(s)" % (a.ch, a.baud, r["samples_per_bit"], r["count"], r["framing_errors"]))
+                print("  hex:  " + r["hex"]); print("  text: " + r["text"])
+        return
+
+    if a.cmd == "avg":
+        fs = frames(a.frames)
+        raws = [f["b%d" % a.ch] for f in fs]
+        avg, used = SA.aligned_average(raws)
+        if not avg:
+            raise SystemExit("could not align %d frames (no rising edges: is the signal periodic?)" % len(raws))
+        f = fs[-1]; vpc = f["vpc%d" % a.ch]; z = f.get("zero%d" % a.ch, 0.0)
+        ai = bytes(max(0, min(255, int(round(x)))) for x in avg)
+        lv = SA.levels(ai, vpc, z)
+        raw_lv = SA.levels(f["b%d" % a.ch], vpc, z)
+        u = lv["unit"]
+        print("CH%d aligned average of %d/%d frames (%d samples): top %s base %s amp %s mean %s AC-rms %s  (single frame AC-rms %s)" % (
+            a.ch, used, len(raws), len(avg), fmt(lv["vtop"], u), fmt(lv["vbase"], u), fmt(lv["vamp"], u), fmt(lv["vavg"], u), fmt(lv["vrms_ac"], u), fmt(raw_lv["vrms_ac"], u)))
+        if a.png:
+            import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+            rate = f["rate"]; xs = [(i / rate) if rate else i for i in range(len(avg))]
+            vals = [((x - 128 - z) * vpc) if vpc else x for x in avg]
+            plt.figure(figsize=(11, 3.5)); plt.plot(xs, vals, color="#1fb4d8" if a.ch == 1 else "#2458e8", lw=1)
+            plt.grid(True, alpha=.3); plt.ylabel("CH%d (%s)" % (a.ch, "V" if vpc else "cnt")); plt.xlabel("time (s)" if rate else "sample")
+            plt.title("aligned average of %d frames" % used, fontsize=10); plt.tight_layout(); plt.savefig(a.png, dpi=110); print("plot:", a.png)
+        return
+
+    if a.cmd == "ref":
+        if a.action == "list":
+            for r in api("/api/refs"):
+                print("%-24s CH%d %s range %d %s  %s" % (r["name"], r["ch"], time.strftime("%Y-%m-%d %H:%M", time.localtime(r["t"])), r["rng"], fmt_rate(r["rate"]) if r["rate"] else "", r["note"]))
+            return
+        if not a.name:
+            raise SystemExit("ref %s needs a name" % a.action)
+        if a.action == "save":
+            r = api("/api/refs", {"name": a.name, "ch": a.ch, "note": a.note})
+            print("saved reference %s: CH%d range %d %s" % (r["name"], r["ch"], r["rng"], fmt_rate(r["rate"]) if r["rate"] else "")); return
+        ref = api("/api/refs/%s" % a.name)
+        f = frames(1)[-1]
+        ch = ref["ch"] if a.ch == 1 and ref["ch"] != 1 else a.ch
+        raw = f["b%d" % ch]; vpc = f["vpc%d" % ch]; z = f.get("zero%d" % ch, 0.0)
+        ref_raw = base64.b64decode(ref["raw"])
+        if f["hdr"]["tb"] != ref["tb"]:
+            print("note: timebase now 0x%02X, reference 0x%02X -- comparing anyway (time axis differs)" % (f["hdr"]["tb"], ref["tb"]))
+        r = SA.compare_to_reference(raw, ref_raw, f["rate"], vpc, z, ref["vpc"], ref.get("zero", 0.0))
+        if "error" in r:
+            raise SystemExit("compare: " + r["error"])
+        u = r["unit"]
+        print("CH%d vs reference '%s' (%s): max |diff| %s, rms diff %s over %d samples%s" % (ch, ref["name"], time.strftime("%Y-%m-%d %H:%M", time.localtime(ref["t"])),
+              fmt(r["max_abs_diff"], u), fmt(r["rms_diff"], u), r["samples"], "" if r["aligned_on_edge"] else " (not edge-aligned)"))
+        print("  amplitude %s vs %s (%+s), mean %s vs %s, freq %s vs %s (%s)" % (fmt(r["amp_now"], u), fmt(r["amp_ref"], u), fmt(r["amp_change"], u), fmt(r["mean_now"], u), fmt(r["mean_ref"], u),
+              fmt_f(r["freq_now"]), fmt_f(r["freq_ref"]), ("%+.2f%%" % r["freq_change_pct"]) if r["freq_change_pct"] is not None else "--"))
+        if a.png:
+            import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+            k = vpc or 1.0; za = (128 + z) if vpc else 0; kr = (ref["vpc"] or 1.0) if ref["vpc"] else 1.0; zr = (128 + ref.get("zero", 0.0)) if ref["vpc"] else 0
+            plt.figure(figsize=(11, 3.5)); plt.plot([(x - zr) * kr for x in ref_raw], color="#888", lw=1, label="reference"); plt.plot([(x - za) * k for x in raw], color="#2458e8", lw=1, label="now")
+            plt.legend(); plt.grid(True, alpha=.3); plt.xlabel("sample"); plt.tight_layout(); plt.savefig(a.png, dpi=110); print("plot:", a.png)
+        return
 
     if a.cmd == "find":
         t0, t1 = parse_time(a.t0), parse_time(a.t1)

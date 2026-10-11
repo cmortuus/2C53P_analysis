@@ -15,6 +15,7 @@ Owns the scope's USB CDC shell and serves:
                 /api/records/query?from=&to=&every=&limit=   frames in a window (JSON, base64)
            GET  /api/analyze?from=&to=&ch=&every=&limit=&hyst=..   server-side re-evaluation (scope_analysis)
            GET  /api/events?from=&to=&where=ch2_mean<4.5,ch1_glitches>0&gap=2   events from the per-frame metrics index
+           GET/POST /api/refs, GET /api/refs/<name>   reference waveforms (scopectl ref save|compare)
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -820,6 +821,25 @@ def make_http_handler(hub):
                 return self._send(200, hub.latest or {})
             if p == "/api/calib":
                 return self._send(200, CALIB)
+            if p == "/api/refs" or p.startswith("/api/refs/"):
+                refdir = os.path.join(sys_path_dir, "refs")
+                if p == "/api/refs":
+                    out = []
+                    for fn in sorted(glob.glob(os.path.join(refdir, "*.json"))):
+                        try:
+                            with open(fn) as f:
+                                r = json.load(f)
+                            out.append({"name": r["name"], "t": r["t"], "ch": r["ch"], "note": r.get("note", ""),
+                                        "rate": r["rate"], "rng": r["rng"], "vpc": r["vpc"]})
+                        except Exception:
+                            continue
+                    return self._send(200, out)
+                name = os.path.basename(p)[:-5] if p.endswith(".json") else os.path.basename(p)
+                fn = os.path.join(refdir, re.sub(r"[^\w.-]", "_", name) + ".json")
+                if not os.path.exists(fn):
+                    return self._send(404, {"error": "no such reference"})
+                with open(fn) as f:
+                    return self._send(200, json.load(f))
             if p == "/api/health":
                 st = os.statvfs(recorder.root if recorder else "/")
                 fr = hub.latest or {}
@@ -995,6 +1015,25 @@ def make_http_handler(hub):
                 req = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if self.path == "/api/refs":
+                # {"name": "...", "ch": 1|2, "note": "..."} -> store the latest record of that channel
+                fr = hub.latest
+                if not fr:
+                    return self._send(503, {"error": "no frame yet"})
+                try:
+                    ch = int(req.get("ch", 1)); name = re.sub(r"[^\w.-]", "_", str(req["name"]))
+                except (KeyError, ValueError):
+                    return self._send(400, {"error": "need name and ch"})
+                refdir = os.path.join(sys_path_dir, "refs")
+                os.makedirs(refdir, exist_ok=True)
+                h = fr["hdr"]
+                rec = {"name": name, "t": fr["t"], "ch": ch, "note": str(req.get("note", "")), "rate": fr["rate"],
+                       "vpc": fr["vpc%d" % ch], "zero": fr.get("zero%d" % ch, 0.0), "rng": h["rng%d" % ch],
+                       "probe": 10 if h.get("prb%d" % ch) else 1, "cpl": h.get("cpl%d" % ch), "tb": h["tb"],
+                       "raw": fr["ch%d" % ch]}
+                with open(os.path.join(refdir, name + ".json"), "w") as f:
+                    json.dump(rec, f)
+                return self._send(200, {k: v for k, v in rec.items() if k != "raw"})
             if self.path == "/api/record":
                 if recorder is None:
                     return self._send(503, {"error": "recorder disabled"})
