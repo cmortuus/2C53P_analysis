@@ -312,11 +312,18 @@ def main():
         def line(label, val, good):
             ok.append(good); print("%s %-10s %s" % ("OK " if good else "!! ", label, val))
         line("link", "%s on %s" % (sc["status"], sc["port"]), sc["status"] == "ok")
-        line("frames", "%.1f fps, last %.1fs ago, %d errors" % (sc["fps"] or 0, sc["last_frame_age_s"] or 99, sc["errors"]), (sc["fps"] or 0) > 5 and (sc["last_frame_age_s"] or 99) < 5)
+        streaming = h.get("hub_mode", "streaming") == "streaming"
+        line("frames", "%.1f fps, last %.1fs ago, %d errors, %s" % (sc["fps"] or 0, sc["last_frame_age_s"] or 99, sc["errors"], h.get("hub_mode", "?")),
+             ((sc["fps"] or 0) > 5 and (sc["last_frame_age_s"] or 99) < 5) or not streaming)
         line("firmware", " | ".join(sc["firmware"]) if sc["firmware"] else "(no answer)", bool(sc["firmware"]))
         line("recorder", "%s, %d segments, %.1f MB, %s frames" % ("on" if rc["enabled"] else "OFF", rc["segments"] or 0, rc["total_mb"] or 0, rc["frames_total"]), bool(rc["enabled"]))
         line("index", "backlog %s, dropped %s" % (rc["indexer_backlog"], rc["indexer_dropped"]), (rc["indexer_backlog"] or 0) < 100)
         line("disk", "%.1f of %.1f GB free" % (h["disk_free_gb"], h["disk_total_gb"]), h["disk_free_gb"] > 5)
+        pw = h.get("power") or {}
+        if pw:
+            src = "Pi on its own supply" if pw.get("pi_power") == "external" else ("Pi inside, scope on USB power" if pw.get("external") else "Pi inside, ON BATTERY")
+            line("power", "%s; scope battery %s mV%s" % (src, pw.get("battery_mv"), ("; vbus sense error: %s" % pw["vbus_err"]) if pw.get("vbus_err") else ""),
+                 (pw.get("battery_mv") or 0) > 3500 and not pw.get("vbus_err"))
         line("pi", "load %.2f %.2f %.2f, up %.1f h, %d viewer(s), logging %s" % (*h["load"], (h["pi_uptime_s"] or 0) / 3600, h["viewers"], h["logging"]), h["load"][0] < 3.5)
         line("calib", "gain %s zero %s" % (h["calib"]["gain"], {c: {r: round(v, 1) for r, v in d.items()} for c, d in h["calib"]["zero"].items()}), True)
         print("ALL OK" if all(ok) else "ATTENTION NEEDED")

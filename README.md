@@ -10,7 +10,7 @@ Two handheld FNIRSI scopes, one goal: get live waveforms and control onto a comp
 - **2C53P** (daily scope, Synwit SWM34S): fully reverse-engineered statically (saved-file format,
   FPGA data path, UART0 factory protocol, config sector) — see `HANDOFF.md`. Not modified.
 
-Start with [`OPERATING.md`](OPERATING.md) (how to drive the scope remotely), [`HANDOFF.md`](HANDOFF.md)
+Start with [`OPERATING.md`](OPERATING.md) (how to drive the scope remotely), [`INTERNAL_BUILD.md`](INTERNAL_BUILD.md) (Pi inside the case), [`HANDOFF.md`](HANDOFF.md)
 (status, decisions, every finding) and [`T_ARRIVAL_RUNBOOK.md`](T_ARRIVAL_RUNBOOK.md) (backup → flash → recovery).
 
 ## Layout

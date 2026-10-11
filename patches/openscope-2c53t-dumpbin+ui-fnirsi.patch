@@ -32,19 +32,21 @@ index 00816fa..891485e 100644
      acq_pause_req = false;      /* don't leave a half-armed request behind */
      return false;
 diff --git a/firmware/src/drivers/usb_debug.c b/firmware/src/drivers/usb_debug.c
-index dd5d5fa..6d552f0 100644
+index dd5d5fa..d476285 100644
 --- a/firmware/src/drivers/usb_debug.c
 +++ b/firmware/src/drivers/usb_debug.c
-@@ -39,6 +39,8 @@
+@@ -39,6 +39,10 @@
  #endif
  #include "scope_trigger.h"
  #include "fpga.h"
 +#include "idle_off.h"
++#include "battery.h"
 +static void cmd_idle(const char *args);   /* defined after the command table */
++static void cmd_power(void);
  #include "lcd.h"
  #include "meter_auto.h"
  #include "meter_autoselect.h"
-@@ -193,6 +195,28 @@ static void usb_send_str(const char *str)
+@@ -193,6 +197,28 @@ static void usb_send_str(const char *str)
      usb_send_bytes((const uint8_t *)str, strlen(str));
  }
  
@@ -73,7 +75,7 @@ index dd5d5fa..6d552f0 100644
  int usb_debug_printf(const char *fmt, ...)
  {
      char buf[256];
-@@ -2156,6 +2180,99 @@ static void cmd_screen_dumpbin(const char *args)
+@@ -2156,6 +2182,103 @@ static void cmd_screen_dumpbin(const char *args)
      usb_send_str("\r\nSCREENBIN END\r\n");
  }
  
@@ -151,6 +153,10 @@ index dd5d5fa..6d552f0 100644
 +                     ss->ch1.enabled ? 1U : 0U, ss->ch2.enabled ? 1U : 0U,
 +                     (unsigned)ss->ch1.coupling, (unsigned)ss->ch2.coupling,
 +                     (unsigned)ss->ch1.probe, (unsigned)ss->ch2.probe);
++    /* ext/bat/off (2026-10-11): external power present, battery mV, power-off
++     * pending (idle_off.h) -- lets the internal Pi follow the power state. */
++    usb_debug_printf("ext=%u bat=%u off=%u ", (unsigned)battery_is_charging(),
++                     (unsigned)battery_read_mv(), (unsigned)power_off_pending);
 +    usb_debug_printf("rng1=%u rng2=%u vpc1_nv=%lu vpc2_nv=%lu pos1=%d pos2=%d "
 +                     "tmode=%u tedge=%u tsrc=%u tlvl=%d len=%lu crc32=%08lX\r\n",
 +                     (unsigned)ss->ch1.vdiv_idx, (unsigned)ss->ch2.vdiv_idx,
@@ -173,16 +179,18 @@ index dd5d5fa..6d552f0 100644
  static void cmd_screen_shadow(const char *args)
  {
      if (args == NULL || *args == '\0') {
-@@ -7833,6 +7950,8 @@ static const shell_cmd_t shell_cmds[] = {
+@@ -7833,6 +7956,10 @@ static const shell_cmd_t shell_cmds[] = {
            "help                            Show this help\r\n"),
      CMD_V("?", cmd_help, SC_EXACT,
            NULL /* alias */),
++    CMD_V("power", cmd_power, SC_EXACT,
++          "power                           Battery mV/%, external power, auto-off state\r\n"),
 +    CMD_A("idle", cmd_idle, 0,
 +          "idle [off|<min>]                Auto power-off after N min without a button/shell command (default 5)\r\n"),
      CMD_V("version", cmd_version, SC_EXACT,
            "version                         Firmware info\r\n"),
      CMD_V("status", cmd_status, SC_EXACT,
-@@ -7892,6 +8011,8 @@ static const shell_cmd_t shell_cmds[] = {
+@@ -7892,6 +8019,8 @@ static const shell_cmd_t shell_cmds[] = {
            "screen dump [shadow] [x y w h]  Dump text indexed4 LCD shadow\r\n"),
      CMD_A("screen dumpbin", cmd_screen_dumpbin, 0,
            "screen dumpbin [x y w h]        Binary indexed4 LCD shadow dump\r\n"),
@@ -191,10 +199,19 @@ index dd5d5fa..6d552f0 100644
      CMD_A("screen shadow", cmd_screen_shadow, 0,
            "screen shadow page [y]          Clear full-screen shadow capture\r\n"),
      CMD_A("fpga cmd", cmd_fpga_cmd, SC_NEEDARGS,
-@@ -8122,6 +8243,21 @@ static void cmd_help(void)
+@@ -8122,6 +8251,30 @@ static void cmd_help(void)
      usb_send_str("\r\n");
  }
  
++static void cmd_power(void)
++{
++    usb_debug_printf("battery %u mV (%u%%), external power %s, %s, auto-off %u min (idle %lus)%s\r\n",
++                     (unsigned)battery_read_mv(), (unsigned)battery_percent(),
++                     battery_is_charging() ? "YES" : "no", battery_is_critical() ? "CRITICAL" : "ok",
++                     (unsigned)idle_off_get_minutes(), (unsigned long)idle_off_idle_seconds(),
++                     power_off_pending ? ", POWER-OFF PENDING" : "");
++}
++
 +static void cmd_idle(const char *args)
 +{
 +    while (*args == ' ') args++;
@@ -213,7 +230,7 @@ index dd5d5fa..6d552f0 100644
  static void dispatch_command(char *line)
  {
      /* Strip trailing \r\n */
-@@ -8130,6 +8266,7 @@ static void dispatch_command(char *line)
+@@ -8130,6 +8283,7 @@ static void dispatch_command(char *line)
          line[--len] = '\0';
  
      if (len == 0) return;
@@ -285,7 +302,7 @@ index 33b2db6..4243316 100644
      /* Initialize oscilloscope state */
      scope_state_init(scope_state_get());
 diff --git a/firmware/src/tasks/input_handler.c b/firmware/src/tasks/input_handler.c
-index 974bbbf..7405abb 100644
+index 974bbbf..427668f 100644
 --- a/firmware/src/tasks/input_handler.c
 +++ b/firmware/src/tasks/input_handler.c
 @@ -34,6 +34,7 @@
@@ -310,12 +327,20 @@ index 974bbbf..7405abb 100644
      scope_state_t *ss = scope_state_get();
      uint8_t cmd = DCMD_REDRAW_ALL;
      char pb[24];
+@@ -1117,6 +1125,7 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
+              * the "Goodbye!" frame so its SPI2 traffic is invisible to the
+              * user, and before the rail drops. */
+             (void)settings_store_flush(settings_now_ms());
++            power_off_notify_and_wait();     /* a connected Pi closes its files (idle_off.h) */
+ 
+             /* Drop PC9 LOW — device powers off */
+             GPIOC->clr = (1U << 9);
 diff --git a/firmware/src/ui/idle_off.c b/firmware/src/ui/idle_off.c
 new file mode 100644
-index 0000000..5e0488a
+index 0000000..8deaded
 --- /dev/null
 +++ b/firmware/src/ui/idle_off.c
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,98 @@
 +/*
 + * idle_off.c — see idle_off.h.
 + */
@@ -333,6 +358,16 @@ index 0000000..5e0488a
 +static volatile bool     wake_req;
 +static volatile bool     asleep;
 +static uint16_t          timeout_min = 5;
++volatile uint8_t         power_off_pending;
++
++bool usb_debug_connected(void);
++
++void power_off_notify_and_wait(void)
++{
++    power_off_pending = 1u;
++    if (usb_debug_connected() && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
++        vTaskDelay(pdMS_TO_TICKS(POWER_OFF_NOTICE_MS));
++}
 +
 +void idle_off_touch(void)
 +{
@@ -392,6 +427,7 @@ index 0000000..5e0488a
 +    font_draw_string_center(160, 125, "no activity", th->text_secondary, th->background, &font_small);
 +    vTaskDelay(pdMS_TO_TICKS(800));
 +    (void)settings_store_flush((uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
++    power_off_notify_and_wait();              /* let a connected Pi close its files */
 +    GPIOC->clr = (1U << 9);                   /* release the power hold */
 +    vTaskDelay(pdMS_TO_TICKS(600));
 +
@@ -401,13 +437,14 @@ index 0000000..5e0488a
 +    lcd_display_off();
 +    wake_req = false;
 +    asleep = true;
++    power_off_pending = 0u;                   /* still powered (USB): not actually off */
 +}
 diff --git a/firmware/src/ui/idle_off.h b/firmware/src/ui/idle_off.h
 new file mode 100644
-index 0000000..2d2cb5e
+index 0000000..61c40ae
 --- /dev/null
 +++ b/firmware/src/ui/idle_off.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,37 @@
 +/*
 + * idle_off.h — auto power-off after N minutes without activity.
 + *
@@ -434,6 +471,14 @@ index 0000000..2d2cb5e
 +void     idle_off_set_minutes(uint16_t minutes);   /* 0 = disabled */
 +uint16_t idle_off_get_minutes(void);
 +uint32_t idle_off_idle_seconds(void);
++
++/* Power-off notice for a USB host that must close files first (the internal Pi):
++ * sets power_off_pending (reported as off=1 in every SCOPEBIN header) and, if a
++ * CDC host is configured, waits POWER_OFF_NOTICE_MS before returning. Call right
++ * before dropping PC9, from task context. */
++#define POWER_OFF_NOTICE_MS 3000u
++extern volatile uint8_t power_off_pending;
++void power_off_notify_and_wait(void);
 +void     idle_off_service(void);              /* display task only, every loop pass */
 +
 +#endif /* IDLE_OFF_H */
@@ -1666,18 +1711,19 @@ index 0236d1c..a497ce1 100644
      if (selected)
          font_draw_string(MENU_LEFT, y + 4, ">",
 diff --git a/firmware/src/ui/status_bar.c b/firmware/src/ui/status_bar.c
-index 4a9ecad..c1a4b21 100644
+index 4a9ecad..c5187dd 100644
 --- a/firmware/src/ui/status_bar.c
 +++ b/firmware/src/ui/status_bar.c
-@@ -10,6 +10,7 @@
+@@ -10,6 +10,8 @@
  #include "scope_cal.h"
  #include "scope_timebase.h"
  #include "battery.h"
++#include "idle_off.h"
 +#include "scope_topbar.h"
  #include "at32f403a_407.h"
  #include <stdio.h>
  
-@@ -17,25 +18,44 @@
+@@ -17,25 +19,44 @@
  static uint8_t status_bar_drawn = 0;
  
  /* Draw the top status bar */
@@ -1732,7 +1778,7 @@ index 4a9ecad..c1a4b21 100644
      {
          char buf[12];
          if (battery_is_critical()) {
-@@ -57,8 +77,12 @@ void draw_status_bar(void)
+@@ -57,8 +78,12 @@ void draw_status_bar(void)
                                     bat_color, th->status_bar_bg, &font_small);
          }
      }
@@ -1746,7 +1792,15 @@ index 4a9ecad..c1a4b21 100644
      if (battery_is_critical()) {
          static uint8_t shutdown_timer = 0;
          shutdown_timer++;
-@@ -91,6 +115,17 @@ void draw_info_bar(void)
+@@ -70,6 +95,7 @@ void draw_status_bar(void)
+                                     th->text_secondary, 0x0000, &font_medium);
+             /* Brief delay so user can see the message */
+             for (volatile uint32_t d = 0; d < 100000000; d++);
++            power_off_notify_and_wait();     /* a connected Pi closes its files */
+             GPIOC->clr = (1U << 9);  /* PC9 LOW = power off */
+             while (1);
+         }
+@@ -91,6 +117,17 @@ void draw_info_bar(void)
          meter_softkeys_draw();
          return;
      }

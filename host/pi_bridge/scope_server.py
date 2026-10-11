@@ -99,7 +99,8 @@ RANGE_TIER = ["none"] * 4 + ["provisional", "measured", "measured", "measured", 
 # Commands the web UI may send. Anything else (mem write, flash, fwload…) is refused over HTTP.
 ALLOWED = [re.compile(p) for p in (
     r"^fpga scope (timebase|vdiv|level|trigmode|edge|graticule|softtrig|hpos|measure|freq|cal)( [\w.\-]+){0,2}$",
-    r"^idle( off| \d{1,3})?$",   # not `center`: it stalls the CDC shell for seconds (link drop, 2026-10-10)
+    r"^idle( off| \d{1,3})?$",
+    r"^power$",   # not `center`: it stalls the CDC shell for seconds (link drop, 2026-10-10)
     r"^btn (ch1|ch2|move|select|trigger|prm|auto|save|menu|up|down|left|right|ok)( \d+)?$",
     r"^(version|status|settings|help)$",
 )]
@@ -384,7 +385,9 @@ class Recorder:
         self.root = root
         self.max_bytes = max_bytes
         self.enabled = True
-        self.forced = False                   # keep the hub polling even with no viewer
+        self.forced = False                   # keep the hub polling even with no viewer (only on external power)
+        self.user_forced = False              # `record start`: poll + record even on battery
+        self.paused_until = 0.0               # after a power-off notice: write nothing until then
         self.fh = None
         self.cur = None                       # {"name","path","t0","t1","frames","bytes"}
         self.segments = []
@@ -462,6 +465,11 @@ class Recorder:
                     pass
         name = time.strftime("rec_%Y%m%d_%H%M%S.bin")
         path = os.path.join(self.root, name)
+        k = 2
+        while os.path.exists(path):                     # a quiesce + resume within the same second
+            name = time.strftime("rec_%Y%m%d_%H%M%S") + "_%d.bin" % k
+            path = os.path.join(self.root, name)
+            k += 1
         self.fh = open(path, "ab")
         self.cur = {"name": name, "path": path, "t0": None, "t1": None, "frames": 0, "bytes": 0}
         self.segments.append(self.cur)
@@ -479,8 +487,34 @@ class Recorder:
                     pass
             log("recorder: dropped", old["name"])
 
+    def quiesce(self, why=""):
+        """Make everything on disk consistent NOW (power may drop in ~3 s): flush + fsync the
+        active segment, write its index, close it, flush the metrics index, sync the fs."""
+        with self.lock:
+            if self.fh:
+                try:
+                    self.fh.flush(); os.fsync(self.fh.fileno())
+                except Exception:
+                    pass
+                self.fh.close(); self.fh = None
+                if self.cur:
+                    try:
+                        with open(self.cur["path"][:-4] + ".idx.json", "w") as f:
+                            json.dump(self.cur, f); f.flush(); os.fsync(f.fileno())
+                    except Exception:
+                        pass
+                self.cur = None
+        if indexer is not None:
+            indexer.flush()
+        try:
+            os.sync()
+        except Exception:
+            pass
+        if why:
+            log("recorder quiesced:", why)
+
     def write(self, fr, c1, c2):
-        if not self.enabled:
+        if not self.enabled or time.time() < self.paused_until:
             return
         meta = {"hdr": fr["hdr"], "rate": fr["rate"], "vpc1": fr["vpc1"], "vpc2": fr["vpc2"],
                 "zero1": fr.get("zero1", 0.0), "zero2": fr.get("zero2", 0.0), "seq": fr["seq"], "n": len(c1),
@@ -504,7 +538,8 @@ class Recorder:
     def status(self):
         with self.lock:
             total = sum(sg["bytes"] for sg in self.segments)
-            return {"enabled": self.enabled, "forced": self.forced, "root": self.root, "max_gb": self.max_bytes / 1e9,
+            return {"enabled": self.enabled, "forced": self.forced, "user_forced": self.user_forced,
+                    "paused": time.time() < self.paused_until, "root": self.root, "max_gb": self.max_bytes / 1e9,
                     "segments": len(self.segments), "total_mb": total / 1e6,
                     "active": dict(self.cur, active=True) if self.cur else None,
                     "indexer_dropped": (indexer.dropped if indexer else None), "indexer_backlog": (len(indexer.q) if indexer else None),
@@ -573,6 +608,13 @@ class Indexer(threading.Thread):
                         time.sleep(0.25)           # paced: ~200 frames/s max, own thread
             os.replace(mpath + ".tmp", mpath)
             log("indexer: backfilled %s (%d frames)" % (sg["name"], n))
+
+    def flush(self):
+        try:
+            if self.fh:
+                self.fh.flush(); os.fsync(self.fh.fileno())
+        except Exception:
+            pass
 
     def submit(self, seg_path, t, meta, c1, c2):
         with self.cv:
@@ -691,6 +733,34 @@ def find_events(recorder, t0, t1, conds, gap=2.0, limit_rows=200000):
     return {"scanned": scanned, "matched": matched, "events": events}
 
 
+class VbusSense:
+    """External-power sense for the INTERNAL build: the scope's USB-C VBUS through a divider
+    (e.g. 10k over 20k, 5 V -> 3.3 V) to a Pi GPIO. The scope's own `ext` flag cannot be used:
+    it is a battery-voltage threshold (> 4.3 V) and reads 0 on USB once the cell is full."""
+    def __init__(self, line):
+        self.line = line
+        self.req = None
+        self.err = None
+        try:
+            import gpiod
+            from gpiod.line import Direction, Bias
+            self.req = gpiod.request_lines("/dev/gpiochip0", consumer="scope-vbus",
+                                           config={line: gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_DOWN)})
+        except Exception as e:
+            self.err = str(e)
+            log("vbus sense on GPIO%d unavailable: %s" % (line, e))
+
+    def present(self):
+        if self.req is None:
+            return None
+        try:
+            from gpiod.line import Value
+            return self.req.get_value(self.line) == Value.ACTIVE
+        except Exception as e:
+            self.err = str(e)
+            return None
+
+
 class Hub:
     """Acquisition loop + fan-out of the latest frame to web clients."""
 
@@ -706,6 +776,13 @@ class Hub:
         self.fast_ok = True
         self.status = "starting"
         self.last_interest = time.time()   # last viewer / frame.json / command
+        self.ext_power = True              # policy input: is the PI on external power? (see pi_power)
+        self.pi_power = "external"         # "external": Pi has its own supply; "internal": Pi runs off the scope battery
+        self.vbus = None                   # VbusSense when internal
+        self.scope_ext_hdr = None          # the scope's own (unreliable) ext flag, reported only
+        self.mode = "starting"
+        self.battery_mv = None
+        self.quiesced_idle = False
         self.IDLE_STOP_S = 180
         self.logging = False            # measurement logger: one row per frame, in memory
         self.log_rows = []
@@ -719,11 +796,24 @@ class Hub:
             # polling entirely so the scope's own auto power-off / dark sleep can kick in
             # (every shell command counts as activity on the device). A viewer, a
             # frame.json request or a command wakes both ends again.
-            idle = self.viewers == 0 and not self.logging and not (recorder is not None and recorder.forced)
-            if idle and self.viewers == 0:
-                pass
-            if not self.run or (idle and self.latest and time.time() - self.latest["t"] < 1.0) \
-               or (idle and time.time() - self.last_interest > self.IDLE_STOP_S):
+            # Always-on recording only on EXTERNAL power (or when the user asked with
+            # `record start`): on battery an unattended Pi must let the scope auto-off.
+            if self.pi_power == "internal":
+                v = self.vbus.present() if self.vbus else None
+                self.ext_power = bool(v) if v is not None else False
+            else:
+                self.ext_power = True
+            always = recorder is not None and (recorder.user_forced or (recorder.forced and self.ext_power))
+            idle = self.viewers == 0 and not self.logging and not always
+            stopped = idle and time.time() - self.last_interest > self.IDLE_STOP_S
+            if stopped and not self.quiesced_idle and recorder is not None:
+                recorder.quiesce("idle (no viewer, on battery or recording off)")
+                self.quiesced_idle = True
+            if not stopped:
+                self.quiesced_idle = False
+            self.mode = ("paused (RUN off)" if not self.run else "stopped (idle, scope may auto-off)" if stopped
+                         else "idle (1 Hz, no viewer)" if idle else "streaming")
+            if not self.run or (idle and self.latest and time.time() - self.latest["t"] < 1.0) or stopped:
                 time.sleep(0.05)
                 continue
             try:
@@ -742,6 +832,12 @@ class Hub:
                 time.sleep(0.2)
                 continue
             self.status = "ok"
+            if "ext" in h:
+                self.scope_ext_hdr = bool(h["ext"])
+                self.battery_mv = h.get("bat")
+            if h.get("off") and recorder is not None and time.time() >= recorder.paused_until:
+                recorder.paused_until = time.time() + 15.0      # resumes if power did not drop
+                recorder.quiesce("scope power-off notice")
             now = time.time()
             times = [t for t in times if now - t < 3.0] + [now]
             self.fps = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else 0.0
@@ -875,7 +971,11 @@ def make_http_handler(hub):
                     "disk_free_gb": st.f_bavail * st.f_frsize / 1e9, "disk_total_gb": st.f_blocks * st.f_frsize / 1e9,
                     "scope": {"status": hub.status, "port": scope.port, "fps": fr.get("fps"), "errors": hub.errors,
                               "last_frame_age_s": (time.time() - fr["t"]) if fr else None, "firmware": fw.strip().splitlines()[:2]},
-                    "recorder": {k: rs.get(k) for k in ("enabled", "forced", "segments", "total_mb", "frames_total", "indexer_backlog", "indexer_dropped")},
+                    "recorder": {k: rs.get(k) for k in ("enabled", "forced", "user_forced", "paused", "segments", "total_mb", "frames_total", "indexer_backlog", "indexer_dropped")},
+                    "power": {"pi_power": hub.pi_power, "external": hub.ext_power, "battery_mv": hub.battery_mv,
+                              "scope_ext_flag": hub.scope_ext_hdr,
+                              "vbus_gpio": (hub.vbus.line if hub.vbus else None), "vbus_err": (hub.vbus.err if hub.vbus else None)},
+                    "hub_mode": hub.mode,
                     "logging": hub.logging, "viewers": hub.viewers, "calib": CALIB})
             if p == "/api/record":
                 return self._send(200, recorder.status() if recorder else {"enabled": False})
@@ -1056,11 +1156,11 @@ def make_http_handler(hub):
                     return self._send(503, {"error": "recorder disabled"})
                 a = req.get("action")
                 if a == "start":
-                    recorder.enabled = True; recorder.forced = True; hub.run = True
+                    recorder.enabled = True; recorder.user_forced = True; hub.run = True
                 elif a == "stop":
-                    recorder.forced = False
+                    recorder.user_forced = False
                 elif a == "disable":
-                    recorder.enabled = False; recorder.forced = False
+                    recorder.enabled = False; recorder.user_forced = False
                 if req.get("max_gb"):
                     recorder.max_bytes = int(float(req["max_gb"]) * 1e9)
                 return self._send(200, recorder.status())
@@ -1156,7 +1256,10 @@ def main():
     ap.add_argument("--tcp", type=int, default=7001)
     ap.add_argument("--records", default=os.path.expanduser("~/records"), help="raw recorder folder ('' = disabled)")
     ap.add_argument("--max-gb", type=float, default=40.0, help="ring size for raw records (54 GB free on the Pi, 2026-10-11)")
-    ap.add_argument("--record-always", type=int, default=1, help="1: keep polling+recording even with no viewer")
+    ap.add_argument("--record-always", type=int, default=1, help="1: keep polling+recording with no viewer while on external power")
+    ap.add_argument("--pi-power", choices=["external", "internal"], default="external",
+                    help="internal = Pi runs off the scope battery (always-recording only while VBUS is sensed)")
+    ap.add_argument("--vbus-gpio", type=int, default=17, help="GPIO with the scope's VBUS via a divider (internal build)")
     a = ap.parse_args()
     global indexer
     if a.records:
@@ -1168,6 +1271,10 @@ def main():
         log("recorder: %s, %d segments, %.1f MB, ring %.0f GB, always=%s" % (a.records, st["segments"], st["total_mb"], a.max_gb, recorder.forced))
     scope = Scope()
     hub = Hub(scope)
+    hub.pi_power = a.pi_power
+    if a.pi_power == "internal":
+        hub.vbus = VbusSense(a.vbus_gpio)
+    log("power: Pi on %s supply%s" % (a.pi_power, (", VBUS sense GPIO%d" % a.vbus_gpio) if a.pi_power == "internal" else ""))
     threading.Thread(target=hub.loop, daemon=True).start()
     TcpShell.scope = scope
     tcp = ThreadingTCP(("0.0.0.0", a.tcp), TcpShell)
