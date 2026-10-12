@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-unit vertical calibration of one channel against the Pi reference (GPIO18 on the probe tip,
 Pi GND on the clip). For each range:
-  zero: GPIO18 driven LOW (0 V)  -> mean ADC count over N frames - 128   (sub-count, noise-dithered)
+  zero: GPIO18 + GPIO12 driven LOW (0 V)  -> mean ADC count over N frames - 128   (sub-count, noise-dithered)
   gain: GPIO18 = 1 kHz square    -> top/base = means of the flat parts (edges excluded) over N frames,
                                     gain = REF_V / ((top - base) * firmware volts-per-count)
 Writes both to the Pi's calib.json via POST /api/calib. Ranges where the square clips, or where the
@@ -104,7 +104,7 @@ def main():
     try:
         cmd("fpga scope trigmode auto")
         # ---- zero: pin driven low
-        pi("sudo pinctrl set 18 op dl")
+        pi("sudo pinctrl set 18 op dl; sudo pinctrl set 12 op dl")     # both reference pins (CH2 may be on GPIO12, pin 32)
         for rng in a.ranges:
             cmd("fpga scope vdiv %d %d" % (ch, rng))
             fs = frames(a.frames)
@@ -118,7 +118,7 @@ def main():
             print("CH%d range %d: zero %+.2f counts (swing %d)%s" % (ch, rng, z, swing,
                   "  RAILED at the ADC floor: centre the offset DAC first" if railed else ("  NOT QUIET" if swing > 12 else "")))
         # ---- gain: 1 kHz square
-        pi("sudo pinctrl set 18 a5; C=/sys/class/pwm/pwmchip0/pwm0; echo 0 | sudo tee $C/duty_cycle >/dev/null; "
+        pi("sudo pinctrl set 18 a5; sudo pinctrl set 12 a0; C=/sys/class/pwm/pwmchip0/pwm0; echo 0 | sudo tee $C/duty_cycle >/dev/null; "
            "echo 1000000 | sudo tee $C/period >/dev/null; echo 500000 | sudo tee $C/duty_cycle >/dev/null; echo 1 | sudo tee $C/enable >/dev/null")
         for rng in a.ranges:
             cmd("fpga scope vdiv %d %d" % (ch, rng))
