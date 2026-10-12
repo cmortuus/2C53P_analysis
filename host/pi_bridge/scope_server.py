@@ -604,6 +604,7 @@ class Indexer(threading.Thread):
         self.fh_path = None
 
     def backfill(self):
+        """Index closed segments that have no metrics sidecar (resumable)."""
         """Index segments that have no metrics sidecar (recorded before the indexer existed or
         while it was down). Own thread, paced (~200 frames/s) so live indexing and the Pi stay
         responsive."""
@@ -613,10 +614,22 @@ class Indexer(threading.Thread):
             mpath = sg["path"][:-4] + ".metrics.jsonl"
             if os.path.exists(mpath):
                 continue
-            log("indexer: backfilling", sg["name"])
+            tmp = mpath + ".tmp"
+            resume_t = None                       # resumable: a restart continues after the last row
+            if os.path.exists(tmp):
+                try:
+                    with open(tmp, "rb") as f:
+                        f.seek(max(0, os.path.getsize(tmp) - 4096))
+                        tail = f.read().decode(errors="replace").strip().splitlines()
+                    resume_t = json.loads(tail[-1])["t"] if tail else None
+                except Exception:
+                    resume_t = None
+            log("indexer: backfilling", sg["name"], ("(resuming after t=%.3f)" % resume_t) if resume_t else "")
             n = 0
-            with open(mpath + ".tmp", "w") as out:
+            with open(tmp, "a") as out:
                 for t, meta, c1, c2 in Recorder.iter_file(sg["path"]):
+                    if resume_t is not None and t <= resume_t + 1e-6:
+                        continue
                     v = meta.get("valid")
                     if v:
                         c1, c2 = c1[:v], c2[:v]
@@ -629,9 +642,9 @@ class Indexer(threading.Thread):
                            "ch2": self.metrics(c2, meta["rate"], meta["vpc2"], meta.get("zero2", 0.0))}
                     out.write(json.dumps(row, separators=(",", ":")) + "\n")
                     n += 1
-                    if n % 50 == 0:
-                        time.sleep(0.25)           # paced: ~200 frames/s max, own thread
-            os.replace(mpath + ".tmp", mpath)
+                    if n % 200 == 0:
+                        time.sleep(0.05)           # own niced process; brief yields only
+            os.replace(tmp, mpath)
             log("indexer: backfilled %s (%d frames)" % (sg["name"], n))
 
     def flush(self):
@@ -655,7 +668,7 @@ class Indexer(threading.Thread):
             return None
         lv = SA.levels(raw, vpc, zero)
         fq = SA.frequency(raw, rate) if lv["span_counts"] >= 6 else None
-        pm = SA.pulse_metrics(raw, rate) if lv["span_counts"] >= 6 else None
+        pm = SA.pulse_metrics(raw, rate, timing=False) if lv["span_counts"] >= 6 else None
         return {"amp": round(lv["vamp"], 5), "mean": round(lv["vavg"], 5), "rms": round(lv["vrms_ac"], 5),
                 "freq": round(fq, 3) if fq else None, "clipped": int(lv["clipped"]),
                 "glitches": pm["glitches"] if pm else 0, "duty": round(pm["duty"], 4) if (pm and pm["duty"] is not None) else None,
@@ -668,7 +681,13 @@ class Indexer(threading.Thread):
             log("indexer backfill:", e)
 
     def run(self):
-        threading.Thread(target=self._backfill_thread, daemon=True).start()   # never blocks live indexing
+        # Backfill runs as a separate, niced PROCESS (`--backfill-worker`): a thread here would share
+        # the one Python core (GIL) with the hub and live indexing and crawl at ~4 frames/s.
+        try:
+            subprocess.Popen(["nice", "-n", "10", sys.executable, os.path.abspath(__file__), "--backfill-worker",
+                              self.recorder.root], stdout=None, stderr=None)          # logs go to the journal
+        except Exception as e:
+            log("backfill worker not started:", e)
         while True:
             with self.cv:
                 while not self.q:
@@ -1409,8 +1428,30 @@ def urllib_unquote(x):
     return urllib.parse.unquote_plus(x)
 
 
+def backfill_worker(root):
+    """Separate process: index every CLOSED segment (one with an .idx.json) lacking metrics."""
+    class _Rec:                                   # minimal stand-in for Recorder.list()
+        def list(self):
+            out = []
+            for idx in sorted(glob.glob(os.path.join(root, "rec_*.idx.json"))):
+                try:
+                    with open(idx) as f:
+                        meta = json.load(f)
+                    meta["path"] = idx[:-9] + ".bin"
+                    out.append(meta)
+                except Exception:
+                    continue
+            return out
+    ix = Indexer(_Rec())
+    log("backfill worker: start (%d closed segments)" % len(ix.recorder.list()))
+    ix.backfill()
+    log("backfill worker: done")
+
+
 def main():
     global recorder
+    if len(sys.argv) >= 3 and sys.argv[1] == "--backfill-worker":
+        return backfill_worker(sys.argv[2])
     calib_load()
     ap = argparse.ArgumentParser()
     ap.add_argument("--http", type=int, default=8080)
