@@ -150,6 +150,8 @@ the Pi Zero: ~4 MS/s for seconds, 24 MS/s for short bursts (USB 2 + RAM; 64 M sa
 - Motor phase / anything switching: "×10, and clip only to earth ground."
 
 ## CNC-flavoured checks the tool can do today
+**PASS/FAIL checks: `scopectl cnc step|encoder|levels|rail|bounce`. The runbook for wiring each one, in
+order, is [CNC_BRINGUP.md](CNC_BRINGUP.md).** The manual equivalents:
 - Step pulse rate/width/duty (`describe`: freq + duty; cursors in the viewer for pulse width).
 - Direction setup/hold relative to step: CH1 step, CH2 dir, triggered view, cursors.
 - Spindle PWM duty and frequency; enable/alarm line levels.

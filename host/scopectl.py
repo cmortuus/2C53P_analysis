@@ -9,6 +9,7 @@ cannot see the screen (an AI assistant, a script, a remote human).
     .venv/bin/python host/scopectl.py set "fpga scope timebase 0x0F"         # any allow-listed shell cmd
     .venv/bin/python host/scopectl.py screen out.png                         # the device's own LCD
     .venv/bin/python host/scopectl.py log start|stop|status|csv out.csv
+    .venv/bin/python host/scopectl.py cnc step|encoder|levels|rail|bounce ...   # PASS/FAIL bring-up checks (CNC_BRINGUP.md)
 
 Everything goes through http://scope-pi.local:8080 (override with --url or SCOPE_URL).
 `describe` prints a plain-language summary plus flags (clipped, no signal, low resolution,
@@ -18,6 +19,7 @@ real volt/time axes (matplotlib on this machine, nothing needed on the Pi).
 import argparse, base64, json, math, os, re, statistics, sys, time, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scope_analysis as SA
+import cnc_checks as CC
 from scope_analysis import fmt, fmt_f, fmt_t, fmt_rate, Params
 
 URL = os.environ.get("SCOPE_URL", "http://scope-pi.local:8080")
@@ -167,6 +169,13 @@ def autoset(ch, info, verbose=True):
     """Deterministic: find the finest range that holds the signal, a timebase that shows
     ~10 cycles, and a mid-level trigger. Returns the final description."""
     say = (lambda *a: print(*a, file=sys.stderr)) if verbose else (lambda *a: None)
+    d = autorange(ch, info, say)
+    return _autoset_time(ch, info, d, say)
+
+
+def autorange(ch, info, say=None):
+    """Vertical only: the finest range that holds the signal's top and base."""
+    say = say or (lambda *a: print(*a, file=sys.stderr))
     mvpc = info["mv_per_count"][str(ch)] if str(ch) in info["mv_per_count"] else info["mv_per_count"][ch - 1]
     cpd = info["counts_per_div"]
     cal_ranges = [r for r in range(10) if mvpc[r]]          # 4..9 on this unit
@@ -203,6 +212,10 @@ def autoset(ch, info, verbose=True):
             break
         cmd("fpga scope vdiv %d %d" % (ch, best))
     say("autoset: range %d (%s/div)%s" % (d["range"], fmt(d["vdiv"], "V") if d["calibrated"] else "--", " CLIPPED" if d["clipped"] else ""))
+    return d
+
+
+def _autoset_time(ch, info, d, say):
     # 2. timebase: aim for ~10 cycles per 1024-sample record
     tbs = sorted(info["timebases"], key=lambda t: -t["rate"])
     f0 = d["freq_hz"]
@@ -242,6 +255,230 @@ def autoset(ch, info, verbose=True):
 def timing(fs, info, p=None):
     f = fs[-1]
     return SA.timing(f["b1"], f["b2"], f["rate"], p)
+
+
+# ------------------------------------------------------------------ CNC bring-up checks (host/cnc_checks.py)
+def si(x):
+    """'2.5us' '5ms' '100k' '24' '0.5V' -> float (seconds / Hz / volts)."""
+    if x is None:
+        return None
+    m = re.match(r"^\s*([-+\d.eE]+)\s*([munpkM]?)", str(x))
+    if not m:
+        raise SystemExit("bad value %r" % x)
+    return float(m.group(1)) * {"": 1, "m": 1e-3, "u": 1e-6, "n": 1e-9, "p": 1e-12, "k": 1e3, "M": 1e6}[m.group(2)]
+
+
+# A typical microstepping driver's input timing (DM542-class); the drive's own datasheet wins.
+STEP_SPEC_DEFAULT = {"min_pulse": 2.5e-6, "min_space": 2.5e-6, "min_setup": 5e-6, "min_hold": 5e-6}
+
+
+def _tb_codes(info, measured_only=True):
+    return sorted((t for t in info["timebases"] if t["tier"].startswith("measured") or not measured_only), key=lambda t: -t["rate"])
+
+
+def _set_tb(code):
+    cmd("fpga scope timebase 0x%02X" % code)
+
+
+def _recs(fs, ch, info):
+    return [rec_from_frame(f, ch, info) for f in fs]
+
+
+def _pairs(fs, info):
+    out = []
+    for f in fs:
+        r1, r2 = rec_from_frame(f, 1, info), rec_from_frame(f, 2, info)
+        out.append((r1["raw"], r2["raw"], r1["rate"]))
+    return out
+
+
+def _print_result(title, r, extra=None):
+    print("== %s: %s" % (title, r["verdict"]))
+    for c in r["checks"]:
+        print("  " + CC.fmt_check(c))
+    for k, v in (extra or {}).items():
+        print("  %-28s %s" % (k, v))
+
+
+def _tb_for_plateaus(ch, info, min_samples=20):
+    """Timebase for level checks: the slowest measured rate at which the SHORTER plateau
+    (high or low time) still spans `min_samples`, so plateau noise is seen, not just edges."""
+    for t in _tb_codes(info):                                   # fastest first: find complete pulses
+        _set_tb(t["code"])
+        pm = analyze(frames(2, settle=0.5), ch, info)["pulse"]
+        if pm and pm["high_s"] and pm["low_s"]:
+            need = min_samples / min(pm["high_s"], pm["low_s"])
+            ok = [c for c in _tb_codes(info) if c["rate"] >= need]
+            best = ok[-1] if ok else _tb_codes(info)[0]
+            _set_tb(best["code"])
+            print("levels: timebase 0x%02X (%s): shortest plateau %s = %.0f samples"
+                  % (best["code"], fmt_rate(best["rate"]), fmt_t(min(pm["high_s"], pm["low_s"])), min(pm["high_s"], pm["low_s"]) * best["rate"]), file=sys.stderr)
+            return best
+    return None
+
+
+def cnc(a, info):
+    p = Params()
+    f0 = frames(1)[-1]
+    restore = {"tb": f0["hdr"]["tb"], "tmode": TMODE[f0["hdr"]["tmode"]]}
+    try:
+        if a.check == "step":
+            spec = dict(STEP_SPEC_DEFAULT) if not a.no_default_spec else {}
+            for k in ("min_pulse", "min_space", "min_setup", "min_hold", "max_rate"):
+                if getattr(a, k) is not None:
+                    spec[k] = si(getattr(a, k))
+            if not a.no_autoset:
+                autorange(1, info)
+                if a.dir_ch:
+                    autorange(2, info)
+            # finest measured rate that still holds complete pulses; slower until enough are seen
+            res = None
+            for t in _tb_codes(info):
+                if t["rate"] > 5.1e6 and not a.provisional:
+                    continue
+                _set_tb(t["code"])
+                fs = frames(a.frames, settle=0.6)
+                pr = _pairs(fs, info)
+                res = CC.step_dir([(x[0], x[1] if a.dir_ch else None) for x in pr], pr[-1][2], a.active, spec, p)
+                if res["metrics"]["steps"] >= 3 and res["metrics"]["pulse_min_s"] is not None:
+                    break
+                print("  (%s: %d complete step pulses, trying a slower timebase)" % (fmt_rate(t["rate"]), res["metrics"]["steps"]), file=sys.stderr)
+            m = res["metrics"]
+            extra = {"records": "%d at %s (resolution %s)" % (m["records"], fmt_rate(1 / m["resolution_s"]), fmt_t(m["resolution_s"])),
+                     "steps seen / DIR changes": "%d / %d" % (m["steps"], m["dir_changes"]),
+                     "pulse median / space median": "%s / %s" % (fmt_t(m["pulse_median_s"]) if m["pulse_median_s"] else "--", fmt_t(m["space_median_s"]) if m["space_median_s"] else "--"),
+                     "step rate median": fmt_f(m["rate_median_hz"]) if m["rate_median_hz"] else "--"}
+            if a.steps_per_mm and m["rate_median_hz"]:
+                extra["feed (median / max)"] = "%.0f / %.0f mm/min" % (m["rate_median_hz"] / a.steps_per_mm * 60, m["rate_max_hz"] / a.steps_per_mm * 60)
+            _print_result("step/dir (CH1 step%s, active %s)" % (", CH2 dir" if a.dir_ch else "", a.active), res, extra)
+            out = res
+
+        elif a.check == "encoder":
+            if not a.no_autoset:
+                autoset(1, info, verbose=True); autorange(2, info)
+            fs = frames(a.frames, settle=0.6)
+            per = [CC.encoder(r1, r2, rate, a.lines, p) for r1, r2, rate in _pairs(fs, info)]
+            order = {CC.FAIL: 0, CC.MARGINAL: 1, CC.PASS: 2, CC.INFO: 3}
+            worst = min(per, key=lambda r: order[r["verdict"]])
+            ph = [r["metrics"]["phase_deg"] for r in per if r["metrics"]["phase_deg"] is not None]
+            gaps = [r["metrics"]["min_edge_gap_s"] for r in per if r["metrics"]["min_edge_gap_s"] is not None]
+            extra = {"frames": "%d (%d %s, worst shown)" % (len(per), sum(r["verdict"] == CC.PASS for r in per), "PASS")}
+            if ph:
+                extra["phase over frames"] = "%.0f .. %.0f deg" % (min(ph), max(ph))
+            if gaps:
+                extra["closest A/B edges (all)"] = fmt_t(min(gaps))
+            if worst["metrics"].get("freq_hz"):
+                extra["A frequency"] = fmt_f(worst["metrics"]["freq_hz"])
+            if worst["metrics"].get("rpm") is not None:
+                extra["speed"] = "%.1f rpm (%g lines/rev)" % (worst["metrics"]["rpm"], a.lines)
+            _print_result("encoder (CH1 A, CH2 B)", worst, extra)
+            out = {"worst": worst, "frames": per}
+
+        elif a.check == "levels":
+            vil, vih = (si(a.vil), si(a.vih)) if a.vil and a.vih else CC.FAMILIES[a.family]
+            if not a.no_autoset:
+                d = autorange(a.ch, info)
+                if d["span_counts"] >= p.min_span:
+                    _tb_for_plateaus(a.ch, info)
+            fs = frames(a.frames, settle=0.6)
+            recs = _recs(fs, a.ch, info)
+            if not recs[-1]["vpc"]:
+                raise SystemExit("range %d is uncalibrated: volts unknown" % recs[-1]["rng"])
+            per = [CC.logic_levels(r["raw"], r["vpc"], r.get("zero", 0.0), vil, vih) for r in recs]
+            order = {CC.FAIL: 0, CC.MARGINAL: 1, CC.PASS: 2, CC.INFO: 3}
+            worst = min(per, key=lambda r: order[r["verdict"]])
+            m = worst["metrics"]
+            extra = {"thresholds": "VIL %s / VIH %s (%s)" % (fmt(vil, "V"), fmt(vih, "V"), "custom" if a.vil else a.family),
+                     "frames": "%d, worst shown" % len(per)}
+            if m.get("noise_margin_high_v") is not None:
+                extra["noise margin high / low"] = "%s / %s" % (fmt(m["noise_margin_high_v"], "V"), fmt(m["noise_margin_low_v"], "V"))
+            _print_result("logic levels CH%d" % a.ch, worst, extra)
+            out = {"worst": worst, "frames": per}
+
+        elif a.check == "rail":
+            if not a.no_autoset:
+                autorange(a.ch, info)
+            _set_tb(int(a.tb, 0))
+            n = max(3, int(a.seconds * 14))
+            fs = frames(n, settle=0.6)
+            recs = [{"raw": r["raw"], "rate": r["rate"], "vpc": r["vpc"], "zero": r.get("zero", 0.0), "rng": r["rng"]} for r in _recs(fs, a.ch, info)]
+            if not recs[-1]["vpc"]:
+                raise SystemExit("range uncalibrated: volts unknown")
+            res = CC.rail(recs, si(a.nominal) if a.nominal else None, a.tol / 100.0, si(a.ripple) if a.ripple else None)
+            m = res["metrics"]
+            extra = {"frames": "%d over ~%.0f s at %s" % (m["frames"], a.seconds, fmt_rate(recs[-1]["rate"])),
+                     "mean / lowest frame / highest frame": "%s / %s / %s" % (fmt(m["mean_v"], "V"), fmt(m["lowest_frame_mean_v"], "V"), fmt(m["highest_frame_mean_v"], "V")),
+                     "ripple p-p median / worst": "%s / %s" % (fmt(m["ripple_pp_median_v"], "V"), fmt(m["ripple_pp_worst_v"], "V")),
+                     "ripple main frequency": fmt_f(m["ripple_freq_hz"]) if m["ripple_freq_hz"] else "-- (nothing above the scope noise)",
+                     "resolution": fmt(m["resolution_v"], "V") + " per ADC step"}
+            _print_result("rail CH%d" % a.ch, res, extra)
+            out = res
+
+        elif a.check == "bounce":
+            if f0["hdr"].get("tsrc", 0) != 0:
+                raise SystemExit("the scope's trigger source is CH2; bounce uses CH1 (set the source on the device)")
+            # idle level decides the edge and the range
+            d = autorange(1, info)
+            idle = d["mean"]
+            vhigh = si(a.vhigh) if a.vhigh else None
+            edge = a.edge or ("falling" if idle > 1.0 else "rising")
+            if edge == "rising" and not vhigh and idle <= 1.0:
+                raise SystemExit("line idles low: give --vhigh (the closed-contact voltage, e.g. 24) so the range and trigger level can be set")
+            hi_v = max(idle, vhigh or 0)
+            mv = info["mv_per_count"][str(1)] if str(1) in info["mv_per_count"] else info["mv_per_count"][0]
+            cpd = info["counts_per_div"]
+            rngs = [r for r in range(10) if mv[r] and hi_v <= 3.6 * mv[r] / 1000 * cpd]
+            if rngs:
+                cmd("fpga scope vdiv 1 %d" % min(rngs, key=lambda r: mv[r]))
+            fs = frames(2, settle=0.6)
+            r0 = rec_from_frame(fs[-1], 1, info)
+            thr_v = hi_v / 2.0
+            thr_c = 128 + r0.get("zero", 0.0) + thr_v / r0["vpc"]
+            level = max(-100, min(100, int(round((thr_c - 128) * 216 / 256))))
+            win = si(a.window)
+            t = min(_tb_codes(info), key=lambda t: abs(math.log(1024 / t["rate"] / win)))
+            _set_tb(t["code"])
+            cmd("fpga scope edge " + edge); cmd("fpga scope level %d" % level); cmd("fpga scope trigmode normal")
+            time.sleep(0.5)
+            g0 = frames(1)[-1]["hdr"]["gen"]
+            print("armed: CH1 %s edge at %s, record %s (%s). Operate the switch now (waiting up to %.0f s) ..."
+                  % (edge, fmt(thr_v, "V"), fmt_t(1024 / t["rate"]), fmt_rate(t["rate"]), a.timeout))
+            t0, got = time.time(), None
+            while time.time() - t0 < a.timeout:
+                f = frames(1, settle=0.05)[-1]
+                if f["hdr"]["gen"] != g0:
+                    time.sleep(0.3)                       # let the record finish filling
+                    got = frames(1, settle=0.05)[-1]; break
+            if not got:
+                raise SystemExit("no trigger within %.0f s" % a.timeout)
+            raw = got["b1"]
+            k = got.get("seam") or 0                             # undo the hub's free-run junk rotation, if it applied one
+            if k:
+                raw = raw[len(raw) - k:] + raw[:len(raw) - k]
+            u, seam = CC.unrotate_triggered(raw, edge == "rising", 512, p)
+            if seam is None:
+                print("  note: could not place the trigger in this record (edges before it?); analysing it as read", file=sys.stderr)
+            got = dict(got, b1=u, valid=len(u))                 # time-ordered, trigger at 512
+            r = rec_from_frame(got, 1, info)
+            res = CC.bounce(r["raw"], r["rate"], si(a.debounce) if a.debounce else None, p)
+            m = res["metrics"]
+            extra = {"transitions": m["transitions"]}
+            if m["transitions"]:
+                extra.update({"bounce (first..last edge)": fmt_t(m["bounce_s"]) if m["bounce_s"] else "none (one clean edge)",
+                              "shortest pulse": fmt_t(m["shortest_pulse_s"]) if m.get("shortest_pulse_s") else "--",
+                              "settled": m["final"], "record": fmt_t(m["record_s"])})
+            _print_result("contact bounce CH1", res, extra)
+            out = res
+            if a.png:
+                plot([got], [1], info, a.png, {1: analyze([got], 1, info)}); print("plot:", a.png)
+        if a.json:
+            print(json.dumps(out, default=str, indent=1))
+        return out
+    finally:                                   # leave the trigger mode and timebase as they were
+        try:
+            cmd("fpga scope trigmode " + restore["tmode"]); _set_tb(restore["tb"])
+        except SystemExit:
+            pass
 
 
 # ------------------------------------------------------------------ self-test
@@ -416,6 +653,22 @@ def main():
     p = sub.add_parser("decode", help="decoders on the latest frames: steps (step/dir) or uart"); p.add_argument("proto", choices=["steps", "uart"]); p.add_argument("--ch", type=int, default=1, help="step or data channel"); p.add_argument("--dir-ch", type=int, default=2); p.add_argument("--baud", type=int, default=9600); p.add_argument("--bits", type=int, default=8); p.add_argument("--idle-low", action="store_true"); p.add_argument("--frames", type=int, default=3)
     p = sub.add_parser("avg", help="aligned average of N frames (small signals, ripple): levels + plot"); p.add_argument("--ch", type=int, default=1); p.add_argument("--frames", type=int, default=16); p.add_argument("--png")
     p = sub.add_parser("ref", help="reference waveforms on the Pi: save | list | compare"); p.add_argument("action", choices=["save", "list", "compare"]); p.add_argument("name", nargs="?"); p.add_argument("--ch", type=int, default=1); p.add_argument("--note", default=""); p.add_argument("--png")
+    p = sub.add_parser("cnc", help="CNC bring-up checks with PASS/FAIL: step | encoder | levels | rail | bounce")
+    p.add_argument("check", choices=["step", "encoder", "levels", "rail", "bounce"])
+    p.add_argument("--ch", type=int, default=1); p.add_argument("--frames", type=int, default=30); p.add_argument("--no-autoset", action="store_true")
+    p.add_argument("--json", action="store_true"); p.add_argument("--png")
+    p.add_argument("--active", choices=["rising", "falling"], default="rising", help="step: the edge the drive counts (rising = active-high pulses)")
+    p.add_argument("--dir-ch", type=int, default=2, help="step: 2 = DIR on CH2, 0 = no DIR probe")
+    p.add_argument("--min-pulse"); p.add_argument("--min-space"); p.add_argument("--min-setup"); p.add_argument("--min-hold"); p.add_argument("--max-rate")
+    p.add_argument("--no-default-spec", action="store_true", help="step: judge only the limits given (default: a typical driver, 2.5us pulse/space, 5us setup/hold)")
+    p.add_argument("--provisional", action="store_true", help="step: allow the provisional 12.5/25 MS/s timebases")
+    p.add_argument("--steps-per-mm", type=float)
+    p.add_argument("--lines", type=float, help="encoder: pulses per revolution per channel")
+    p.add_argument("--family", choices=sorted(CC.FAMILIES), default="3v3"); p.add_argument("--vil"); p.add_argument("--vih")
+    p.add_argument("--nominal", help="rail: e.g. 24, 5, 3.3"); p.add_argument("--tol", type=float, default=5.0, help="rail: %% tolerance")
+    p.add_argument("--ripple", help="rail: max ripple p-p in volts (default 2%% of nominal)"); p.add_argument("--seconds", type=float, default=5.0); p.add_argument("--tb", default="0x0E", help="rail: timebase code (0x0E = 50 kS/s, 20 ms records)")
+    p.add_argument("--edge", choices=["rising", "falling"]); p.add_argument("--vhigh", help="bounce: closed-contact voltage when the line idles low")
+    p.add_argument("--window", default="20ms", help="bounce: record length to aim for"); p.add_argument("--timeout", type=float, default=60); p.add_argument("--debounce", help="bounce: the input filter time, e.g. 5ms")
     p = sub.add_parser("replay", help="re-evaluate a stored time window with chosen criteria"); p.add_argument("--from", dest="t0", required=True); p.add_argument("--to", dest="t1", default="now"); p.add_argument("--ch", default="both"); p.add_argument("--every", type=int, default=1); p.add_argument("--limit", type=int, default=5000); p.add_argument("--param", action="append", help="e.g. hyst=0.1 glitch_ratio=0.3 low_res=16"); p.add_argument("--png", help="strip chart of amplitude/mean/freq over time"); p.add_argument("--csv", help="per-frame metrics"); p.add_argument("--json", action="store_true"); p.add_argument("--server", action="store_true", help="run the analysis on the Pi (/api/analyze) instead of locally")
     a = ap.parse_args()
     URL = a.url
@@ -528,6 +781,10 @@ def main():
         for m in api("/api/marks?from=%f" % parse_time(a.t0)):
             print("%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["t"])), m["text"]))
         return
+
+    if a.cmd == "cnc":
+        r = cnc(a, info)
+        sys.exit(0 if r and (r.get("verdict") or r.get("worst", {}).get("verdict")) in (CC.PASS, CC.INFO) else 1)
 
     if a.cmd == "selftest":
         res = selftest(info, verbose=not a.json)
