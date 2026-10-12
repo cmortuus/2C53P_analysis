@@ -83,6 +83,8 @@ $P host/scopectl.py la status                                   # is the fx2lafw
 $P host/scopectl.py la capture --rate 4M --seconds 2 --label "jog X"   # on demand, stored on the Pi
 $P host/scopectl.py la capture --rate 4M --seconds 5 --trigger D0=r    # wait for a rising edge on D0
 $P host/scopectl.py la stats --step D0 --dir D1               # per channel freq/duty/widths/glitches; step count, net, rates, DIR setup
+$P host/scopectl.py la stats --step D0 --dir D1 --steps-per-mm 80   # + distance (mm) and feed (mm/min): "did a 10 mm jog make 10 mm of steps?"
+$P host/scopectl.py la stats --qa D4 --qb D5 --cpr 2000        # quadrature encoder: count, direction, ILLEGAL transitions (noise / missed edges), RPM
 $P host/scopectl.py la decode --pd uart:rx=D2:baudrate=115200 --ann uart=rx-data
 $P host/scopectl.py la decode --pd i2c:scl=D0:sda=D1        # also spi, can, pwm, stepper_motor, onewire ... (sigrok -L)
 $P host/scopectl.py la list | fetch [name]

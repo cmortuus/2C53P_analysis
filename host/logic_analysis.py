@@ -187,3 +187,46 @@ def step_dir(data, rate, step=0, dirc=1, dir_high_positive=True):
             if first_after.size:
                 out["min_dir_setup_s"] = float(first_after.min())
     return out
+
+
+def steps_to_motion(sd, steps_per_mm):
+    """Add distance (mm) and feed (mm/min) to a step_dir() result."""
+    if not steps_per_mm or not sd.get("steps"):
+        return sd
+    out = dict(sd)
+    out["net_mm"] = sd["net"] / steps_per_mm
+    out["travel_mm"] = sd["steps"] / steps_per_mm
+    if sd.get("median_step_rate_hz"):
+        out["median_feed_mm_min"] = sd["median_step_rate_hz"] / steps_per_mm * 60.0
+        out["max_feed_mm_min"] = sd["max_step_rate_hz"] / steps_per_mm * 60.0
+    return out
+
+
+def quadrature(data, rate, a=0, b=1, counts_per_rev=None):
+    """Quadrature (A/B) decoder: x4 counting on every edge of A and B. Returns the net count,
+    direction, the number of ILLEGAL transitions (both lines changed at once: noise, missed
+    samples or a too-slow sample rate), max/median edge rate and, with counts_per_rev
+    (x4 counts per revolution), revolutions and RPM."""
+    A = ((data >> a) & 1).astype(np.int8)
+    B = ((data >> b) & 1).astype(np.int8)
+    st = (A << 1) | B                                      # 0..3 Gray state
+    ch = np.flatnonzero(np.diff(st) != 0) + 1
+    if ch.size == 0:
+        return {"count": 0, "edges": 0, "illegal": 0, "direction": "none"}
+    prev, cur = st[ch - 1], st[ch]
+    # Gray sequence 00->01->11->10->00 (= 0,1,3,2) is +1
+    order = np.array([0, 1, 3, 2])
+    pos = np.empty(4, dtype=np.int8); pos[order] = np.arange(4)
+    d = (pos[cur] - pos[prev]) % 4                          # 1 = +1, 3 = -1, 2 = illegal
+    plus, minus, illegal = int((d == 1).sum()), int((d == 3).sum()), int((d == 2).sum())
+    out = {"count": plus - minus, "edges": int(ch.size), "plus": plus, "minus": minus, "illegal": illegal,
+           "direction": "A leads B (+)" if plus > minus else "B leads A (-)" if minus > plus else "none"}
+    if ch.size >= 2:
+        iv = np.diff(ch) / rate
+        out["max_edge_rate_hz"] = float(1.0 / iv.min())
+        out["median_edge_rate_hz"] = float(1.0 / np.median(iv))
+    if counts_per_rev:
+        out["revolutions"] = out["count"] / counts_per_rev
+        dur = len(A) / rate
+        out["rpm"] = out["revolutions"] / dur * 60.0
+    return out

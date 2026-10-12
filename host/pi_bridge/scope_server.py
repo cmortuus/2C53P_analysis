@@ -1046,6 +1046,11 @@ def make_http_handler(hub):
                     if "step" in q:
                         out["step_dir"] = LA.step_dir(data, meta["rate"], int(q["step"].lstrip("D")), int(q.get("dir", "D1").lstrip("D")),
                                                       q.get("dir_pos", "high") == "high")
+                        if q.get("steps_per_mm"):
+                            out["step_dir"] = LA.steps_to_motion(out["step_dir"], float(q["steps_per_mm"]))
+                    if "qa" in q:
+                        out["quadrature"] = LA.quadrature(data, meta["rate"], int(q["qa"].lstrip("D")), int(q.get("qb", "D1").lstrip("D")),
+                                                          float(q["cpr"]) if q.get("cpr") else None)
                     return self._send(200, out)
                 return self._send(404, {"error": "unknown la route"})
             if p == "/api/refsig":

@@ -33,6 +33,21 @@ class Stats(unittest.TestCase):
         self.assertAlmostEqual(sd["median_step_rate_hz"], 2e4, delta=1)
         self.assertEqual(sd["dir_changes"], 1)
 
+    def test_quadrature_and_motion(self):
+        rate = 1e6
+        seq = [0, 1, 3, 2]                                    # Gray order, +1 per step
+        states = [seq[i % 4] for i in range(1000)] + [seq[(1000 - i) % 4] for i in range(1, 401)]
+        st = np.repeat(np.array(states, dtype=np.uint8), 50)  # 50 samples per state
+        data = (((st >> 1) & 1) << 4) | ((st & 1) << 5)       # A on D4, B on D5
+        q = LA.quadrature(data.astype(np.uint8), rate, a=4, b=5, counts_per_rev=400)
+        self.assertEqual(q["illegal"], 0)
+        self.assertEqual(q["count"], 999 - 399)          # first reverse state repeats the last forward one
+        bad = data.copy(); bad[5000] ^= 0b110000                # both lines flip at once
+        self.assertGreaterEqual(LA.quadrature(bad.astype(np.uint8), rate, 4, 5)["illegal"], 1)
+        m = LA.steps_to_motion({"steps": 800, "net": 400, "median_step_rate_hz": 8000.0, "max_step_rate_hz": 9000.0}, 80.0)
+        self.assertAlmostEqual(m["net_mm"], 5.0)
+        self.assertAlmostEqual(m["median_feed_mm_min"], 6000.0)
+
     def test_rate_parse(self):
         self.assertEqual(LA.parse_rate("4M"), 4e6)
         self.assertEqual(LA.parse_rate("500k"), 5e5)

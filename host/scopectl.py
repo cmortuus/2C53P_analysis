@@ -386,6 +386,8 @@ def main():
     p.add_argument("--demo", action="store_true", help="sigrok's fake device (no hardware)")
     p.add_argument("--label", default=""); p.add_argument("--trigger", help="sigrok trigger, e.g. D0=r")
     p.add_argument("--step"); p.add_argument("--dir", default="D1"); p.add_argument("--dir-negative", action="store_true")
+    p.add_argument("--steps-per-mm", type=float, help="machine calibration: turn step counts into mm and mm/min")
+    p.add_argument("--qa", help="quadrature encoder A channel, e.g. D4"); p.add_argument("--qb", default="D5"); p.add_argument("--cpr", type=float, help="x4 counts per revolution")
     p.add_argument("--pd", help="sigrok decoder, e.g. uart:rx=D0:baudrate=115200 | i2c:scl=D0:sda=D1 | spi:clk=D0:mosi=D1:cs=D2")
     p.add_argument("--ann", help="annotation filter, e.g. uart=rx-data"); p.add_argument("--limit", type=int, default=200)
     p.add_argument("--out")
@@ -454,7 +456,14 @@ def main():
         if not name:
             raise SystemExit("no captures yet")
         if a.action == "stats":
-            q = "?step=%s&dir=%s&dir_pos=%s" % (a.step, a.dir, "low" if a.dir_negative else "high") if a.step else ""
+            qs = []
+            if a.step:
+                qs.append("step=%s&dir=%s&dir_pos=%s" % (a.step, a.dir, "low" if a.dir_negative else "high"))
+                if a.steps_per_mm:
+                    qs.append("steps_per_mm=%g" % a.steps_per_mm)
+            if a.qa:
+                qs.append("qa=%s&qb=%s" % (a.qa, a.qb) + ("&cpr=%g" % a.cpr if a.cpr else ""))
+            q = ("?" + "&".join(qs)) if qs else ""
             d = api("/api/la/%s/stats%s" % (name, q), timeout=120)
             m = d["meta"]
             print("%s: %s, %s at %s" % (name, fmt_t(m["samples"] / m["rate"]), m["driver"], fmt_rate(m["rate"])))
@@ -470,6 +479,14 @@ def main():
                 print("  step/dir (%s/%s): %d steps (+%d / -%d, net %+d), median %s, max %s, DIR changes %d, min DIR setup %s" % (
                     a.step, a.dir, sd["steps"], sd.get("plus", 0), sd.get("minus", 0), sd["net"], fmt_f(sd.get("median_step_rate_hz")),
                     fmt_f(sd.get("max_step_rate_hz")), sd.get("dir_changes", 0), fmt_t(sd.get("min_dir_setup_s"))))
+                if "net_mm" in sd:
+                    print("  motion: net %+.3f mm, travel %.3f mm, feed median %.0f / max %.0f mm/min" % (
+                        sd["net_mm"], sd["travel_mm"], sd.get("median_feed_mm_min", 0), sd.get("max_feed_mm_min", 0)))
+            if d.get("quadrature"):
+                qd = d["quadrature"]
+                print("  quadrature (%s/%s): count %+d (%d edges), %s, ILLEGAL transitions %d, edge rate median %s / max %s%s" % (
+                    a.qa, a.qb, qd["count"], qd["edges"], qd["direction"], qd["illegal"], fmt_f(qd.get("median_edge_rate_hz")), fmt_f(qd.get("max_edge_rate_hz")),
+                    (", %.3f rev, %.1f RPM" % (qd["revolutions"], qd["rpm"])) if "rpm" in qd else ""))
             return
         if a.action == "decode":
             if not a.pd:
