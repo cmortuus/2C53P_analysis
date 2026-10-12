@@ -145,6 +145,16 @@
       <div class="hint">Device screen = the scope's own LCD, fetched over the shell (16-colour copy; the olive grid shows gray). The trigger is parked in Single for the capture and restored.</div>
     </div>
 
+    <div class="card">
+      <h3>Session markers</h3>
+      <div class="btns">
+        <input type="text" id="marktext" placeholder="e.g. spindle on" style="grid-column: 1 / -1">
+        <button class="b" id="markbtn" style="grid-column: 1 / -1">Mark now</button>
+      </div>
+      <pre id="marklist" style="background:#07090c;border:1px solid #20252c;border-radius:5px;padding:6px;max-height:120px;overflow:auto;margin:6px 0 0;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#b9c2cf"></pre>
+      <div class="hint">Markers are stored with the recordings; the assistant can search around them later.</div>
+    </div>
+
     <div class="card console">
       <h3>Shell</h3>
       <input type="text" id="cmd" placeholder="e.g. fpga scope cal   (Enter)">
@@ -313,6 +323,19 @@ async function logState() { const r = await api('/api/log'); logging = r.logging
 $('logbtn').onclick = async () => { await api('/api/log', { action: logging ? 'stop' : 'start' }); logState(); };
 $('logdl').onclick = () => { location.href = '/api/log.csv'; };
 setInterval(() => { if (logging) logState(); }, 5000); logState();
+async function loadMarks() {
+  try {
+    const ms = await api('/api/marks?from=' + (Date.now() / 1000 - 7 * 86400));
+    $('marklist').textContent = ms.slice(-12).reverse().map(m => new Date(m.t * 1000).toLocaleString() + '  ' + m.text).join('\n') || '(none yet)';
+  } catch (e) {}
+}
+async function addMark() {
+  const t = $('marktext').value.trim() || 'mark';
+  await api('/api/mark', { text: t }); $('marktext').value = ''; loadMarks();
+}
+$('markbtn').onclick = addMark;
+$('marktext').onkeydown = e => { if (e.key === 'Enter') addMark(); };
+loadMarks();
 $('png').onclick = () => { const a = document.createElement('a'); a.download = 'scope_' + new Date().toISOString().replace(/[:.]/g, '-') + '.png'; a.href = cv.toDataURL('image/png'); a.click(); };
 
 // ---------- drawing ----------

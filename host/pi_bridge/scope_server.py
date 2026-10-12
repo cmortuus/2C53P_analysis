@@ -605,6 +605,13 @@ class Indexer(threading.Thread):
             n = 0
             with open(mpath + ".tmp", "w") as out:
                 for t, meta, c1, c2 in Recorder.iter_file(sg["path"]):
+                    v = meta.get("valid")
+                    if v:
+                        c1, c2 = c1[:v], c2[:v]
+                    elif SA is not None:                       # recorded before `valid` existed
+                        pick = c1 if (max(c1) - min(c1)) >= (max(c2) - min(c2)) else c2
+                        sp = SA.junk_span(pick)
+                        c1, c2 = SA.clean_record(c1, span=sp), SA.clean_record(c2, span=sp)
                     row = {"t": round(t, 3), "tb": meta["hdr"].get("tb"), "rng1": meta["hdr"].get("rng1"), "rng2": meta["hdr"].get("rng2"),
                            "ch1": self.metrics(c1, meta["rate"], meta["vpc1"], meta.get("zero1", 0.0)),
                            "ch2": self.metrics(c2, meta["rate"], meta["vpc2"], meta.get("zero2", 0.0))}
