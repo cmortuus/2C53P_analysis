@@ -389,6 +389,7 @@ function connect() {
   const es = new EventSource('/api/stream');
   es.onmessage = ev => {
     const f = JSON.parse(ev.data); f.b1 = b64(f.ch1); f.b2 = b64(f.ch2);
+    if (f.valid && f.valid < f.b1.length) { f.b1 = f.b1.subarray(0, f.valid); f.b2 = f.b2.subarray(0, f.valid); }   // drop the ring-buffer junk block
     hist.push(f); if (hist.length > HIST_MAX) hist.shift();
     $('dot').className = 'dot ok'; $('fps').textContent = f.fps.toFixed(1) + ' fps';
     if (running) { frame = f; updateStatus(f); draw(); }

@@ -16,6 +16,8 @@ Owns the scope's USB CDC shell and serves:
            GET  /api/analyze?from=&to=&ch=&every=&limit=&hyst=..   server-side re-evaluation (scope_analysis)
            GET  /api/events?from=&to=&where=ch2_mean<4.5,ch1_glitches>0&gap=2   events from the per-frame metrics index
            GET/POST /api/refs, GET /api/refs/<name>   reference waveforms (scopectl ref save|compare)
+           GET/POST /api/refsig    the Pi's calibration signal on GPIO18: {mode: pwm, hz, duty} | {mode: high|low}
+           POST /api/mark {text}, GET /api/marks?from&to   session markers ("spindle on") kept with the records
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -521,7 +523,7 @@ class Recorder:
             return
         meta = {"hdr": fr["hdr"], "rate": fr["rate"], "vpc1": fr["vpc1"], "vpc2": fr["vpc2"],
                 "zero1": fr.get("zero1", 0.0), "zero2": fr.get("zero2", 0.0), "seq": fr["seq"], "n": len(c1),
-                "seam": fr.get("seam", 0)}
+                "seam": fr.get("seam", 0), "valid": fr.get("valid", len(c1))}
         mb = json.dumps(meta, separators=(",", ":")).encode()
         rec = self.MAGIC + struct.pack("<dI", fr["t"], len(mb)) + mb + c1 + c2
         with self.lock:
@@ -566,6 +568,7 @@ class Recorder:
                     continue
                 out.append({"t": t, "hdr": meta["hdr"], "rate": meta["rate"], "vpc1": meta["vpc1"], "vpc2": meta["vpc2"],
                             "zero1": meta.get("zero1", 0.0), "zero2": meta.get("zero2", 0.0), "seq": meta.get("seq"),
+                            "valid": meta.get("valid"),
                             "ch1": base64.b64encode(c1).decode(), "ch2": base64.b64encode(c2).decode(), "_raw": (c1, c2)})
                 if len(out) >= limit:
                     return out
@@ -736,6 +739,38 @@ def find_events(recorder, t0, t1, conds, gap=2.0, limit_rows=200000):
     return {"scanned": scanned, "matched": matched, "events": events}
 
 
+class RefSignal:
+    """The calibration reference on GPIO18 (header pin 12): hardware PWM from the Pi's crystal,
+    or a steady level. Only this pin, only these modes. Needs passwordless sudo (pinctrl, sysfs)."""
+    C = "/sys/class/pwm/pwmchip0/pwm0"
+
+    def __init__(self):
+        self.state = {"mode": "pwm", "hz": 1000.0, "duty": 0.5}
+
+    @staticmethod
+    def _sh(cmd):
+        return subprocess.run(["sudo", "sh", "-c", cmd], capture_output=True, text=True, timeout=10)
+
+    def set(self, mode, hz=1000.0, duty=0.5):
+        if mode == "pwm":
+            hz = float(hz); duty = float(duty)
+            if not (1.0 <= hz <= 10e6) or not (0.0 < duty < 1.0):
+                raise ValueError("hz 1..10e6, duty 0..1")
+            period = int(round(1e9 / hz))
+            d = max(1, min(period - 1, int(round(period * duty))))
+            r = self._sh("pinctrl set 18 a5; C=%s; [ -d $C ] || echo 0 > /sys/class/pwm/pwmchip0/export; sleep 0.1; "
+                         "echo 0 > $C/duty_cycle; echo %d > $C/period; echo %d > $C/duty_cycle; echo 1 > $C/enable; cat $C/period"
+                         % (self.C, period, d))
+            actual = 1e9 / int(r.stdout.strip()) if r.stdout.strip().isdigit() else None
+            self.state = {"mode": "pwm", "hz": actual or hz, "duty": d / period}
+        elif mode in ("high", "low"):
+            self._sh("pinctrl set 18 op %s" % ("dh" if mode == "high" else "dl"))
+            self.state = {"mode": mode}
+        else:
+            raise ValueError("mode pwm|high|low")
+        return self.state
+
+
 class VbusSense:
     """External-power sense for the INTERNAL build: the scope's USB-C VBUS through a divider
     (e.g. 10k over 20k, 5 V -> 3.3 V) to a Pi GPIO. The scope's own `ext` flag cannot be used:
@@ -850,31 +885,40 @@ class Hub:
             # record is continuous for the viewer, the measurements and the recorder; `seam`
             # in the frame says how far (0 = untouched; the firmware's own strobed records are
             # already ordered).
-            seam_k = 0
+            # (2026-10-11) A free-run record is a rotated ring buffer with a ~24-sample block of
+            # junk at a drifting position. Rotate both channels so the continuous part comes
+            # first and the junk block (plus the two truncated plateaus around it) sits at the
+            # END; `valid` = how many leading samples are continuous. Nothing is discarded: the
+            # recorder keeps all samples, measurements use [:valid].
+            seam_k, valid = 0, len(c1)
             if SA is not None and not h.get("ordered"):
                 try:
                     pick = c1 if (max(c1) - min(c1)) >= (max(c2) - min(c2)) else c2
-                    k = SA.find_seam(pick)
-                    if k and 0 < k < len(c1) - 1:
-                        c1 = c1[k:] + c1[:k]
-                        c2 = c2[k:] + c2[:k]
-                        seam_k = k
+                    sp = SA.junk_span(pick)
+                    if sp:
+                        a, b = sp
+                        if 0 < b < len(c1):
+                            c1 = c1[b:] + c1[:b]
+                            c2 = c2[b:] + c2[:b]
+                            seam_k = b
+                        valid = len(c1) - (b - a)
                 except Exception:
-                    seam_k = 0
+                    seam_k, valid = 0, len(c1)
             vpc1 = h.get("vpc1_nv", 0) / 1e9 * calib_gain(1, h.get("rng1"))
             vpc2 = h.get("vpc2_nv", 0) / 1e9 * calib_gain(2, h.get("rng2"))
             z1, z2 = calib_zero(1, h.get("rng1")), calib_zero(2, h.get("rng2"))
             fr = {"seq": self.seq + 1, "t": now, "hdr": h, "rate": rate, "vpc1": vpc1, "vpc2": vpc2,
                   "ch1": base64.b64encode(c1).decode(), "ch2": base64.b64encode(c2).decode(),
-                  "zero1": z1, "zero2": z2, "seam": seam_k,
-                  "meas": {"ch1": measure(c1, vpc1, rate, z1), "ch2": measure(c2, vpc2, rate, z2)},
+                  "zero1": z1, "zero2": z2, "seam": seam_k, "valid": valid,
+                  "meas": {"ch1": measure(c1[:valid], vpc1, rate, z1), "ch2": measure(c2[:valid], vpc2, rate, z2)},
                   "fps": round(self.fps, 1), "errors": self.errors}
             if recorder is not None:
                 try:
                     recorder.write(fr, c1, c2)
                     if indexer is not None and recorder.cur:
                         indexer.submit(recorder.cur["path"], fr["t"],
-                                       {"hdr": h, "rate": rate, "vpc1": vpc1, "vpc2": vpc2, "zero1": z1, "zero2": z2}, c1, c2)
+                                       {"hdr": h, "rate": rate, "vpc1": vpc1, "vpc2": vpc2, "zero1": z1, "zero2": z2},
+                                       c1[:valid], c2[:valid])
                 except Exception as e:
                     self.errors += 1
                     self.status = "recorder: %s" % e
@@ -956,6 +1000,24 @@ def make_http_handler(hub):
                     return self._send(404, {"error": "no such reference"})
                 with open(fn) as f:
                     return self._send(200, json.load(f))
+            if p == "/api/refsig":
+                return self._send(200, refsig.state)
+            if p.startswith("/api/marks"):
+                q = dict(x.split("=", 1) for x in (self.path.split("?", 1)[1].split("&") if "?" in self.path else []) if "=" in x)
+                t0 = float(q.get("from", 0)); t1 = float(q.get("to", time.time() + 1))
+                out = []
+                try:
+                    with open(os.path.join(recorder.root if recorder else sys_path_dir, "markers.jsonl")) as f:
+                        for line in f:
+                            try:
+                                m = json.loads(line)
+                            except ValueError:
+                                continue
+                            if t0 <= m["t"] <= t1:
+                                out.append(m)
+                except FileNotFoundError:
+                    pass
+                return self._send(200, out)
             if p == "/api/health":
                 st = os.statvfs(recorder.root if recorder else "/")
                 fr = hub.latest or {}
@@ -1035,11 +1097,12 @@ def make_http_handler(hub):
                 for f in frs:
                     c1, c2 = f.pop("_raw")
                     raw = c1 if ch == 1 else c2
+                    raw = raw[:f["valid"]] if f.get("valid") else SA.clean_record(raw)
                     h = f["hdr"]
                     r = {"raw": raw, "rate": f["rate"], "vpc": f["vpc%d" % ch], "zero": f.get("zero%d" % ch, 0.0),
                          "probe": 10 if h.get("prb%d" % ch) else 1, "cpl": ["DC", "AC", "GND"][h.get("cpl%d" % ch, 0)],
                          "rng": h.get("rng%d" % ch), "tier": RANGE_TIER[h.get("rng%d" % ch, 0)], "enabled": bool(h.get("en%d" % ch, 1)),
-                         "channel": ch, "counts_per_div": COUNTS_PER_DIV, "gain": calib_gain(ch, h.get("rng%d" % ch)), "t": f["t"]}
+                         "channel": ch, "counts_per_div": COUNTS_PER_DIV, "gain": calib_gain(ch, h.get("rng%d" % ch)), "t": f["t"], "clean": True}
                     recs.append(r)
                     lv = SA.levels(raw, r["vpc"], r["zero"]); fq = SA.frequency(raw, r["rate"], params); pm = SA.pulse_metrics(raw, r["rate"], params)
                     rows.append({"t": f["t"], "amp": lv["vamp"], "mean": lv["vavg"], "rms_ac": lv["vrms_ac"], "freq": fq, "clipped": lv["clipped"],
@@ -1135,6 +1198,21 @@ def make_http_handler(hub):
                 req = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if self.path == "/api/mark":
+                # {"text": "spindle on", "t": optional unix time} -> markers.jsonl next to the records
+                text = str(req.get("text", "")).strip()[:200]
+                if not text:
+                    return self._send(400, {"error": "need text"})
+                m = {"t": float(req.get("t", time.time())), "text": text}
+                with open(os.path.join(recorder.root if recorder else sys_path_dir, "markers.jsonl"), "a") as f:
+                    f.write(json.dumps(m) + "\n")
+                return self._send(200, m)
+            if self.path == "/api/refsig":
+                try:
+                    st = refsig.set(req.get("mode", "pwm"), req.get("hz", 1000.0), req.get("duty", 0.5))
+                except (ValueError, subprocess.SubprocessError) as e:
+                    return self._send(400, {"error": str(e)})
+                return self._send(200, st)
             if self.path == "/api/refs":
                 # {"name": "...", "ch": 1|2, "note": "..."} -> store the latest record of that channel
                 fr = hub.latest
@@ -1244,6 +1322,7 @@ class ThreadingTCP(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 recorder = None
 indexer = None
+refsig = RefSignal()
 
 
 def urllib_unquote(x):

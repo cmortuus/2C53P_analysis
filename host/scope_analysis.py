@@ -82,8 +82,15 @@ def edges(raw, hyst=0.15, min_span=6):
     span = mx - mn
     if span < min_span:
         return [], [], None
-    mean = sum(raw) / len(raw)
-    hi, lo = mean + hyst * span, mean - hyst * span
+    # threshold = midpoint between the two plateaus (not the record mean, which sits at the
+    # duty-cycle fraction of the step and biases widths on asymmetric pulses), hysteresis
+    # relative to the plateau-to-plateau step (not max-min, which overshoot inflates)
+    top, base = plateau_levels(raw)
+    step = top - base
+    if step < min_span / 2.0:
+        top, base, step = mx, mn, span
+    mean = (top + base) / 2.0
+    hi, lo = mean + hyst * step, mean - hyst * step
     rises, falls = [], []
     state = raw[0] > mean
     for i in range(1, len(raw)):
@@ -244,6 +251,7 @@ def analyze_records(recs, p=None):
     rng, tier ('measured'|'provisional'|'none'), enabled (bool), channel (1|2), counts_per_div, gain.
     Uses the LAST record for the shape and levels, all records for stability. Returns a dict."""
     p = p or Params()
+    recs = [dict(r, raw=(r["raw"] if r.get("clean") else clean_record(r["raw"], p))) for r in recs]
     c = recs[-1]
     raw, rate, vpc, zero = c["raw"], c["rate"], c["vpc"], c.get("zero", 0.0)
     cal = vpc > 0
@@ -373,41 +381,76 @@ def timing(raw1, raw2, rate, p=None):
     return out
 
 
-# ------------------------------------------------------------------ seam (free-run records)
-def find_seam(raw, p=None):
-    """Index of the ring-buffer wrap in a free-run record, or None. Pulse-like signals: the one
-    plateau whose length is off (the phase jumps there); otherwise the sharpest kink
-    (second difference) well above the record's typical curvature."""
+# ------------------------------------------------------------------ seam / junk block (free-run records)
+def junk_span(raw, p=None, max_junk=64):
+    """Free-run records are a rotated ring buffer and contain, at a drifting position, a block of
+    ~24 samples that does not belong to the continuous signal (bench, 2026-10-11: a too-short high
+    and a too-short low at every timebase). Returns (a, b): drop raw[a:b] and the rest,
+    raw[b:] + raw[:a], is continuous. (k, k) = a single cut with nothing to drop; None = nothing
+    found (or too few edges to tell). Only ONE block is removed, so genuine glitches elsewhere in
+    the record stay visible to the glitch counter."""
     p = p or Params()
-    rises, falls, mean = edges(raw, p.hyst, p.min_span)
-    if mean is None:
+    n = len(raw)
+    rises, falls, mid = edges(raw, p.hyst, p.min_span)
+    if mid is None:
         return None
     ev = sorted([(r, 1) for r in rises] + [(f, 0) for f in falls])
-    if len(ev) >= 4:
+    if len(ev) >= 5:
         segs = [(ev[i][0], ev[i + 1][0], ev[i][1]) for i in range(len(ev) - 1)]
-        for kind in (1, 0):
+        meds = {}
+        for kind in (0, 1):
             ls = sorted(b - a for a, b, k in segs if k == kind)
             if len(ls) >= 3:
-                med = ls[len(ls) // 2]
-                worst = max(((abs((b - a) - med) / med), a, b) for a, b, k in segs if k == kind)
-                if worst[0] > 0.15:
-                    return int((worst[1] + worst[2]) / 2)
-        return None
-    # smooth signal: kink detector
-    n = len(raw)
+                meds[kind] = ls[len(ls) // 2]
+        if not meds:
+            return None
+        bad = [(a, b, abs((b - a) - meds[k]) / meds[k]) for a, b, k in segs if k in meds and abs((b - a) - meds[k]) / meds[k] > 0.15]
+        if not bad:
+            return None
+        clusters, cur = [], [bad[0]]
+        for x in bad[1:]:
+            if x[0] - cur[-1][1] <= 2:
+                cur.append(x)
+            else:
+                clusters.append(cur); cur = [x]
+        clusters.append(cur)
+        limit = 2 * max(meds.values()) + max_junk
+        cands = [c for c in clusters if c[-1][1] - c[0][0] <= limit]
+        if not cands:
+            return None
+        c = max(cands, key=lambda c: (len(c), sum(x[2] for x in c)))
+        a, b = int(math.floor(c[0][0])), int(math.ceil(c[-1][1]))
+        return (max(0, a), min(n, b))
+    # smooth signal: kinks (second difference far above the record's typical curvature)
     d2 = [abs(raw[i + 1] - 2 * raw[i] + raw[i - 1]) for i in range(1, n - 1)]
     srt = sorted(d2)
     med = srt[len(srt) // 2] or 1
-    k = max(range(len(d2)), key=lambda i: d2[i])
-    return (k + 1) if d2[k] > 6 * med and d2[k] >= 4 else None
+    kinks = sorted((i + 1 for i in range(len(d2)) if d2[i] > 6 * med and d2[i] >= 4), key=lambda i: -d2[i - 1])[:2]
+    if not kinks:
+        return None
+    if len(kinks) == 2 and abs(kinks[0] - kinks[1]) <= max_junk:
+        a, b = min(kinks) - 1, max(kinks) + 1
+        return (max(0, a), min(n, b))
+    return (kinks[0], kinks[0])
+
+
+def clean_record(raw, p=None, span=None):
+    """raw[b:] + raw[:a] for the junk span (a, b): the continuous part, junk removed."""
+    sp = junk_span(raw, p) if span is None else span
+    if not sp:
+        return bytes(raw)
+    a, b = sp
+    return bytes(raw[b:]) + bytes(raw[:a])
+
+
+def find_seam(raw, p=None):
+    """Compatibility: where a continuous record starts (end of the junk block), or None."""
+    sp = junk_span(raw, p)
+    return sp[1] if sp else None
 
 
 def unrotate(raw, p=None):
-    """Rotate a free-run record so its seam is at the end (returns bytes)."""
-    k = find_seam(raw, p)
-    if k is None or k <= 0 or k >= len(raw) - 1:
-        return bytes(raw)
-    return bytes(raw[k:]) + bytes(raw[:k])
+    return clean_record(raw, p)
 
 
 # ------------------------------------------------------------------ averaging
@@ -442,9 +485,10 @@ def decode_steps(raw_step, raw_dir, rate, p=None):
     """Step/dir decoder: counts step rising edges, signed by the DIR level at each edge
     (DIR high = +). Returns counts, net position, step rate, interval stats."""
     p = p or Params()
-    k = find_seam(raw_step, p)
-    if k is not None:                                   # same rotation for both channels
-        raw_step = bytes(raw_step[k:]) + bytes(raw_step[:k]); raw_dir = bytes(raw_dir[k:]) + bytes(raw_dir[:k])
+    sp = junk_span(raw_step, p)
+    k = sp[1] if sp else None
+    if sp:                                              # same cut on both channels
+        raw_step = clean_record(raw_step, p, sp); raw_dir = clean_record(raw_dir, p, sp)
     rises, _, _ = edges(raw_step, p.hyst, p.min_span)
     if not rises:
         return {"steps": 0, "net": 0, "note": "no step edges in the record"}
@@ -459,8 +503,6 @@ def decode_steps(raw_step, raw_dir, rate, p=None):
         if high: plus += 1
         else: minus += 1
     ivals = [b - a for a, b in zip(rises, rises[1:])]
-    if k is not None and len(ivals) >= 3:              # the cycle straddling the old seam is not real timing
-        ivals = sorted(ivals)[: -1] if (ivals and max(ivals) > 1.15 * sorted(ivals)[len(ivals) // 2]) else ivals
     out = {"steps": len(rises), "plus": plus, "minus": minus, "net": plus - minus, "seam_rotated": k is not None,
            "dir_static": dir_static, "dir_level": "high" if dmean > thr or (dir_static and dmean > 128) else "low"}
     if rate and ivals:

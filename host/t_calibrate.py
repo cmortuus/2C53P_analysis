@@ -31,6 +31,29 @@ def cmd(line):
         raise SystemExit("refused %s: %s" % (line, r))
 
 
+OFFSET = {1: ("trig raw", 2748, 0.120), 2: ("trig2 raw", 2678, 0.123)}   # shell cmd, boot code (r15), counts/code
+
+
+def raw_shell(line, wait=1.2):
+    """Commands outside the web allow-list (offset DAC) go through the Pi's raw shell port."""
+    import socket
+    host = URL.split("//", 1)[1].split(":", 1)[0]
+    s = socket.create_connection((host, 7001), timeout=5)
+    s.settimeout(0.4)
+    s.sendall(line.encode() + b"\r")
+    t0, out = time.time(), b""
+    while time.time() - t0 < wait:
+        try:
+            c = s.recv(4096)
+            if not c:
+                break
+            out += c
+        except socket.timeout:
+            pass
+    s.close()
+    return out.decode(errors="replace")
+
+
 def pi(sh):
     return subprocess.run(["ssh", "-o", "BatchMode=yes", PI, sh], capture_output=True, text=True, timeout=30).stdout
 
@@ -69,6 +92,9 @@ def main():
     ap.add_argument("--frames", type=int, default=10)
     ap.add_argument("--min-counts", type=float, default=8.0)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--shift-clipped", action="store_true",
+                    help="for ranges where the square clips at the top, move the offset so its base sits just above the "
+                         "ADC floor, measure the step (gain only depends on the step), then restore the boot offset")
     a = ap.parse_args()
     ch = a.ch
     f0 = api("/api/frame.json")
@@ -108,6 +134,27 @@ def main():
                 vpcs.append(f["hdr"]["vpc%d_nv" % ch] / 1e9)
             r = results[rng]
             vpc_fw = statistics.median(vpcs)
+            if clipped and a.shift_clipped and vpc_fw > 0:
+                cmd_s, boot, slope = OFFSET[ch]
+                code = int(boot - (128 - 58) / slope)
+                for _ in range(4):                         # walk the base to ~58 counts
+                    raw_shell("%s %d" % (cmd_s, code))
+                    fs2 = frames(4)
+                    b = statistics.fmean(flat_levels(base64.b64decode(f["ch%d" % ch]))[1] or 0 for f in fs2)
+                    if abs(b - 58) < 3:
+                        break
+                    code = int(code + (58 - b) / slope)
+                fs = frames(a.frames)
+                amps, clipped = [], False
+                for f in fs:
+                    raw = base64.b64decode(f["ch%d" % ch])
+                    top, base = flat_levels(raw)
+                    if max(raw) >= 227 or (base is not None and base < 50):
+                        clipped = True
+                    if top is not None and base is not None:
+                        amps.append(top - base)
+                raw_shell("%s %d" % (cmd_s, boot))
+                print("CH%d range %d: offset shifted to code %d for the gain step (base %.1f counts)%s" % (ch, rng, code, b, " -- still clipped" if clipped else ""))
             bases = [flat_levels(base64.b64decode(f["ch%d" % ch]))[1] for f in fs]
             if any(b is not None and b < 50 for b in bases):
                 clipped = True        # this ADC floors near 44 counts: a base there is railed, not measured

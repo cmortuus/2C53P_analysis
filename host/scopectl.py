@@ -77,7 +77,9 @@ def ch_fields(f, ch):
 def rec_from_frame(f, ch, info):
     """One channel of one viewer frame -> a scope_analysis record."""
     c = ch_fields(f, ch)
-    return {"raw": c["raw"], "rate": f["rate"], "vpc": c["vpc"], "zero": f.get("zero%d" % ch, 0.0) or 0.0,
+    v = f.get("valid")
+    raw = c["raw"][:v] if v else SA.clean_record(c["raw"])        # continuous part only
+    return {"raw": raw, "clean": True, "rate": f["rate"], "vpc": c["vpc"], "zero": f.get("zero%d" % ch, 0.0) or 0.0,
             "probe": c["probe"], "cpl": c["cpl"], "rng": c["rng"], "tier": info["range_tier"][c["rng"]],
             "enabled": bool(c["en"]), "channel": ch, "counts_per_div": info["counts_per_div"],
             "gain": info.get("calib", {}).get("gain", {}).get(str(ch), {}).get(str(c["rng"]), 1.0), "t": f.get("t")}
@@ -123,10 +125,25 @@ def parse_params(items):
 
 
 def parse_time(t):
-    """unix seconds | 'now' | '-10m' / '-2h' / '-30s' (ago) | 'YYYY-MM-DD HH:MM[:SS]' local."""
+    """unix seconds | 'now' | '-10m' / '-2h' / '-30s' (ago) | 'YYYY-MM-DD HH:MM[:SS]' local |
+    'mark:<text>' (latest marker whose text contains <text>), optionally '+30s' / '-1m' after it."""
     if t is None or t == "now":
         return time.time()
     t = str(t).strip()
+    if t.startswith("mark:"):
+        body, off = t[5:], 0.0
+        for sep in ("+", "-"):
+            if sep in body[1:]:
+                k = body.rindex(sep)
+                tail = body[k + 1:]
+                if tail and tail[-1] in "smh" and tail[:-1].replace(".", "").isdigit():
+                    off = float(tail[:-1]) * {"s": 1, "m": 60, "h": 3600}[tail[-1]] * (1 if sep == "+" else -1)
+                    body = body[:k]
+                break
+        ms = [m for m in api("/api/marks") if body.lower() in m["text"].lower()]
+        if not ms:
+            raise SystemExit("no marker matching %r" % body)
+        return ms[-1]["t"] + off
     if t.startswith("-") and t[-1] in "smhd":
         return time.time() - float(t[1:-1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[t[-1]]
     try:
@@ -227,6 +244,99 @@ def timing(fs, info, p=None):
     return SA.timing(f["b1"], f["b2"], f["rate"], p)
 
 
+# ------------------------------------------------------------------ self-test
+REF_V = 3.194      # Pi GPIO high level (the owner's meter, 2026-10-10)
+
+
+def refsig(mode, hz=1000.0, duty=0.5):
+    return api("/api/refsig", {"mode": mode, "hz": hz, "duty": duty})
+
+
+def selftest(info, verbose=True):
+    """End-to-end check of scope + Pi + analysis against the Pi's own reference on GPIO18.
+    Needs a probe tip on header pin 12 and its clip on pin 6 (either channel). Restores settings."""
+    say = (lambda *x: print(*x)) if verbose else (lambda *x: None)
+    res = []
+
+    def check(name, ok, detail):
+        res.append((name, bool(ok), detail))
+        say("%s %-28s %s" % ("PASS" if ok else "FAIL", name, detail))
+
+    h0 = api("/api/frame.json")["hdr"]
+    try:
+        cmd("fpga scope trigmode auto")
+        cmd("fpga scope timebase 0x0D")
+        for ch in (1, 2):
+            cmd("fpga scope vdiv %d 6" % ch)
+        # 1. which channel carries the reference?
+        lv = {}
+        for mode in ("high", "low"):
+            refsig(mode)
+            fs = frames(4, settle=0.8)
+            lv[mode] = {ch: statistics.fmean(SA.levels(f["b%d" % ch], f["vpc%d" % ch], f.get("zero%d" % ch, 0.0))["vavg"] for f in fs) for ch in (1, 2)}
+        chans = [ch for ch in (1, 2) if lv["high"][ch] - lv["low"][ch] > 2.0]
+        check("reference detected", chans, "on CH%s (high-low = %s)" % ("+".join(map(str, chans)) or "none",
+              ", ".join("CH%d %.2f V" % (ch, lv["high"][ch] - lv["low"][ch]) for ch in (1, 2))))
+        if not chans:
+            say("put a probe tip on Pi header pin 12 (GPIO18) and its ground clip on pin 6, then re-run")
+            return res
+        for ch in chans:
+            pre = "CH%d " % ch
+            check(pre + "zero (pin low)", abs(lv["low"][ch]) < 0.03, "%+.1f mV (limit +/-30)" % (lv["low"][ch] * 1e3))
+            e = (lv["high"][ch] / REF_V - 1) * 100
+            check(pre + "DC level (pin high)", abs(e) < 1.5, "%.3f V vs %.3f V (%+.2f%%, limit 1.5)" % (lv["high"][ch], REF_V, e))
+            # 1 kHz square at 125 kS/s
+            refsig("pwm", 1000)
+            cmd("fpga scope timebase 0x0D")
+            d = analyze(frames(5, settle=0.9), ch, info)
+            fe = ((d["freq_hz"] or 0) / 1000.0 - 1) * 100
+            check(pre + "1 kHz frequency", d["freq_hz"] and abs(fe) < 0.2, "%s (%+.3f%%, limit 0.2)" % (fmt_f(d["freq_hz"]), fe))
+            ae = (d["amp_top_base"] / REF_V - 1) * 100
+            check(pre + "1 kHz amplitude", abs(ae) < 1.5, "%.3f V (%+.2f%%, limit 1.5)" % (d["amp_top_base"], ae))
+            du = d["duty"] or 0
+            check(pre + "1 kHz duty", abs(du - 0.5) < 0.01, "%.1f%% (limit 49-51)" % (du * 100))
+            check(pre + "shape / glitches", d["shape"] == "square/pulse" and not (d["pulse"] or {}).get("glitches"),
+                  "%s, %s glitches" % (d["shape"], (d["pulse"] or {}).get("glitches")))
+            pk = (d.get("spectrum_peaks") or [{}])[0].get("hz")
+            check(pre + "spectrum peak", pk and abs(pk / 1000 - 1) < 0.01, "%s" % fmt_f(pk))
+            other = 2 if ch == 1 else 1
+            f = frames(1)[-1]
+            st = SA.decode_steps(f["b%d" % ch], f["b%d" % other], f["rate"])
+            sr = st.get("step_rate_hz") or 0
+            check(pre + "step decoder", sr and abs(sr / 1000 - 1) < 0.003, "%d steps, %s" % (st.get("steps", 0), fmt_f(sr) if sr else "--"))
+            # 10 kHz, 25 % duty at 2.5 MS/s (0.4 us/sample): pulse width, limit = max(2 %, 1 sample)
+            refsig("pwm", 10000, 0.25)
+            cmd("fpga scope timebase 0x09")
+            d = analyze(frames(5, settle=0.9), ch, info)
+            hs = (d["pulse"] or {}).get("high_s") or 0
+            lim = max(0.02, (1.0 / (d["rate_sps"] or 1)) / 25e-6)
+            check(pre + "pulse width 25 us", abs(hs / 25e-6 - 1) < lim, "%s (limit %.1f%%), duty %.1f%%" % (fmt_t(hs), lim * 100, (d["duty"] or 0) * 100))
+            # 100 kHz at 5 MS/s
+            refsig("pwm", 100000)
+            cmd("fpga scope timebase 0x08")
+            d = analyze(frames(5, settle=0.9), ch, info)
+            fe = ((d["freq_hz"] or 0) / 1e5 - 1) * 100
+            check(pre + "100 kHz @ 5 MS/s", d["freq_hz"] and abs(fe) < 0.3, "%s (%+.3f%%, limit 0.3)" % (fmt_f(d["freq_hz"]), fe))
+        # 2. the Pi side
+        h1 = api("/api/health"); time.sleep(2.5); h2 = api("/api/health")
+        grow = (h2["recorder"]["frames_total"] or 0) - (h1["recorder"]["frames_total"] or 0)
+        check("recorder writing", grow > 0, "+%d frames in 2.5 s" % grow)
+        check("metrics index", (h2["recorder"]["indexer_backlog"] or 0) < 100 and not h2["recorder"]["indexer_dropped"],
+              "backlog %s, dropped %s" % (h2["recorder"]["indexer_backlog"], h2["recorder"]["indexer_dropped"]))
+        import urllib.parse
+        ev = api("/api/events?from=%f&to=%f&where=%s" % (time.time() - 60, time.time(), urllib.parse.quote("ch%d_amp>2" % chans[0])), timeout=60)
+        check("event search", ev["matched"] > 0, "%d frames matched ch%d_amp>2 in the last minute" % (ev["matched"], chans[0]))
+        check("disk", h2["disk_free_gb"] > 5, "%.1f GB free" % h2["disk_free_gb"])
+    finally:
+        refsig("pwm", 1000)
+        cmd("fpga scope timebase 0x%02X" % h0["tb"])
+        cmd("fpga scope vdiv 1 %d" % h0["rng1"]); cmd("fpga scope vdiv 2 %d" % h0["rng2"])
+        cmd("fpga scope trigmode %s" % TMODE[h0["tmode"]])
+    n_fail = sum(1 for _, ok, _ in res if not ok)
+    say("SELFTEST %s: %d/%d passed" % ("PASSED" if not n_fail else "FAILED", len(res) - n_fail, len(res)))
+    return res
+
+
 # ------------------------------------------------------------------ plotting
 def plot(fs, chans, info, path, descs):
     import matplotlib
@@ -234,7 +344,7 @@ def plot(fs, chans, info, path, descs):
     import matplotlib.pyplot as plt
     f = fs[-1]
     rate = f["rate"] or 0
-    n = 1024
+    n = len(f["b1"])
     t0 = -512 if f["hdr"].get("ordered") else 0
     xs = [((i + t0) / rate) for i in range(n)] if rate else list(range(n))
     xl = "time (s, 0 = trigger)" if (rate and f["hdr"].get("ordered")) else ("time (s)" if rate else "sample")
@@ -243,7 +353,10 @@ def plot(fs, chans, info, path, descs):
         c = ch_fields(f, ch)
         z = f.get("zero%d" % ch, 0.0) or 0.0
         vals = [(b - 128 - z) * c["vpc"] for b in c["raw"]] if c["vpc"] else list(c["raw"])
-        ax.plot(xs, vals, color="#1fb4d8" if ch == 1 else "#2458e8", lw=1)
+        v = f.get("valid") or len(vals)
+        ax.plot(xs[:v], vals[:v], color="#1fb4d8" if ch == 1 else "#2458e8", lw=1)
+        if v < len(vals):
+            ax.plot(xs[v:], vals[v:], color="#bbbbbb", lw=1)          # junk block of the ring buffer, not signal
         ax.set_ylabel("CH%d (%s)" % (ch, "V" if c["vpc"] else "ADC counts"))
         ax.grid(True, alpha=.3)
         d = descs.get(ch)
@@ -266,6 +379,10 @@ def main():
     ap.add_argument("--url", default=URL)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    p = sub.add_parser("mark", help="session marker, e.g. mark 'spindle on' (use later: --from=mark:spindle)"); p.add_argument("text")
+    p = sub.add_parser("marks", help="list session markers"); p.add_argument("--from", dest="t0", default="-7d")
+    p = sub.add_parser("selftest", help="end-to-end check against the Pi reference (probe on Pi pin 12 + GND)"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("refsig", help="the Pi's reference signal on GPIO18"); p.add_argument("mode", choices=["pwm", "high", "low", "show"]); p.add_argument("--hz", type=float, default=1000.0); p.add_argument("--duty", type=float, default=0.5)
     sub.add_parser("health", help="one-shot check of the whole chain (link, fps, recorder, index, disk, load, firmware)")
     p = sub.add_parser("wait"); p.add_argument("--ch", default="any"); p.add_argument("--timeout", type=float, default=120); p.add_argument("--counts", type=int, default=12)
     p = sub.add_parser("autoset"); p.add_argument("--ch", default="1", help="1, 2 or both"); p.add_argument("--png")
@@ -303,6 +420,25 @@ def main():
                       fmt(c["meas"]["vamp"], "V" if c["vpc"] else "cnt"), fmt(c["meas"]["vavg"], "V" if c["vpc"] else "cnt"),
                       fmt_f(c["meas"]["freq"]) if c["meas"].get("freq") else "--", "  CLIPPED" if c["meas"]["clipped"] else ""))
         lg = api("/api/log"); print("logger:   %s, %d rows" % ("ON" if lg["logging"] else "off", lg["rows"]))
+        return
+
+    if a.cmd == "mark":
+        m = api("/api/mark", {"text": a.text})
+        print("marked %s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["t"])), m["text"])); return
+
+    if a.cmd == "marks":
+        for m in api("/api/marks?from=%f" % parse_time(a.t0)):
+            print("%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["t"])), m["text"]))
+        return
+
+    if a.cmd == "selftest":
+        res = selftest(info, verbose=not a.json)
+        if a.json:
+            print(json.dumps([{"check": n, "ok": ok, "detail": d} for n, ok, d in res], indent=1))
+        sys.exit(0 if all(ok for _, ok, _ in res) else 1)
+
+    if a.cmd == "refsig":
+        print(json.dumps(api("/api/refsig") if a.mode == "show" else refsig(a.mode, a.hz, a.duty)))
         return
 
     if a.cmd == "health":
@@ -655,7 +791,7 @@ def main():
             overall = SA.analyze_records(recs, p)
             res[ch] = {"overall": overall, "per_frame": []}
             for r in recs:
-                lv = SA.levels(r["raw"], r["vpc"], r["zero"]); fq = SA.frequency(r["raw"], r["rate"], p); pm = SA.pulse_metrics(r["raw"], r["rate"], p)
+                lv = SA.levels(r["raw"], r["vpc"], r["zero"]); fq = SA.frequency(r["raw"], r["rate"], p); pm = SA.pulse_metrics(r["raw"], r["rate"], p)   # r["raw"] is already the continuous part
                 row = {"t": r["t"], "ch": ch, "amp": lv["vamp"], "mean": lv["vavg"], "rms_ac": lv["vrms_ac"], "freq": fq, "clipped": lv["clipped"],
                        "glitches": pm["glitches"] if pm else 0, "duty": pm["duty"] if pm else None, "high_s": pm["high_s"] if pm else None}
                 res[ch]["per_frame"].append(row); rows.append(row)

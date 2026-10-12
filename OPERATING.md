@@ -9,6 +9,10 @@ and explains in plain language. The owner only connects probes.
 ```bash
 P=.venv/bin/python
 $P host/scopectl.py health                       # whole chain: link, fps, firmware, recorder, index, disk, Pi load -> ALL OK?
+$P host/scopectl.py selftest                     # 15 end-to-end checks against the Pi reference (probe on Pi pin 12 + GND)
+$P host/scopectl.py refsig pwm --hz 10000 --duty 0.25 | high | low | show   # the Pi's reference signal on GPIO18
+$P host/scopectl.py mark "spindle on"            # session marker; later: find/replay --from=mark:spindle (+30s / -1m)
+$P host/scopectl.py marks
 $P host/scopectl.py status                       # link, settings, both channels at a glance
 $P host/scopectl.py wait --ch any --timeout 300  # block until a probe sees something (ask the owner to hook up, then run this)
 $P host/scopectl.py autoset --ch 2 --png /tmp/a.png   # finest non-clipping range, ~10 cycles, mid-level trigger
@@ -98,11 +102,14 @@ time, which is how a sagging rail or an intermittent contact shows up.
   to 0.4 µs, which covers stepper step pulses, spindle PWM and most switching noise.
 - **Flags** in `describe`: clipped / no signal / low resolution / uncalibrated / frequency unstable
   (= intermittent contact or jitter) / ~60 Hz mains pickup (= a floating probe, missing ground clip).
-- **Free-run vs triggered:** most records are free-run (the plot says so); the time axis is still
-  exact, only the phase is random, and each record contains ONE seam where the ring buffer wrapped
-  (a phase jump). The analysis finds that seam (abnormal plateau or kink) and rotates it to the end
-  before averaging, comparing or counting steps; frequency uses the seam-tolerant estimator. Edge
-  timing *within* a record is reliable; timing between two records is not.
+- **Free-run records contain a junk block:** each record is a rotated ring buffer with a ~24-sample
+  block that is not part of the signal, at a drifting position (bench 2026-10-11, all timebases).
+  The Pi rotates every frame so the continuous part comes first and marks it with `valid`; the
+  junk (plus the two truncated plateaus around it) sits at the end, is drawn grey in plots and is
+  ignored by every measurement. Only ONE block per record is removed, so real glitches elsewhere
+  are still counted (synthetic test: 46/50 caught, 0/200 false). Edge timing *within* a record is
+  reliable; timing between two records is not.
+- **Regression tests** for the analysis: `.venv/bin/python -I -m unittest discover -s tests`.
 
 ## Safety limits (input)
 - Scope input with the probe at **×1: keep it under 40 V**. At **×10: under 400 V peak**, and the
