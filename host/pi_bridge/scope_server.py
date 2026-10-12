@@ -642,8 +642,12 @@ class Indexer(threading.Thread):
                            "ch2": self.metrics(c2, meta["rate"], meta["vpc2"], meta.get("zero2", 0.0))}
                     out.write(json.dumps(row, separators=(",", ":")) + "\n")
                     n += 1
-                    if n % 200 == 0:
-                        time.sleep(0.05)           # own niced process; brief yields only
+                    if n % 50 == 0:
+                        # ~50 % duty: a fully busy core made the Zero 2 W's WiFi drop 75-80 %
+                        # of packets (2026-10-11); sleep as long as the last batch took
+                        now_b = time.time()
+                        time.sleep(max(0.05, now_b - getattr(self, "_bt", now_b)))
+                        self._bt = time.time()
             os.replace(tmp, mpath)
             log("indexer: backfilled %s (%d frames)" % (sg["name"], n))
 
@@ -683,11 +687,12 @@ class Indexer(threading.Thread):
     def run(self):
         # Backfill runs as a separate, niced PROCESS (`--backfill-worker`): a thread here would share
         # the one Python core (GIL) with the hub and live indexing and crawl at ~4 frames/s.
-        try:
-            subprocess.Popen(["nice", "-n", "10", sys.executable, os.path.abspath(__file__), "--backfill-worker",
-                              self.recorder.root], stdout=None, stderr=None)          # logs go to the journal
-        except Exception as e:
-            log("backfill worker not started:", e)
+        if BACKFILL:
+            try:
+                subprocess.Popen(["nice", "-n", "10", sys.executable, os.path.abspath(__file__), "--backfill-worker",
+                                  self.recorder.root], stdout=None, stderr=None)          # logs go to the journal
+            except Exception as e:
+                log("backfill worker not started:", e)
         while True:
             with self.cv:
                 while not self.q:
@@ -1419,6 +1424,8 @@ class ThreadingTCP(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
 
+BACKFILL = False      # --backfill 1: re-index old segments in a niced worker. OFF by default: a second
+                      # busy core made the Zero 2 W's WiFi lose 42-80 % of packets (2026-10-11).
 recorder = None
 indexer = None
 refsig = RefSignal()
@@ -1464,8 +1471,10 @@ def main():
     ap.add_argument("--pi-power", choices=["external", "internal"], default="external",
                     help="internal = Pi runs off the scope battery (always-recording only while VBUS is sensed)")
     ap.add_argument("--vbus-gpio", type=int, default=17, help="GPIO with the scope's VBUS via a divider (internal build)")
+    ap.add_argument("--backfill", type=int, default=0, help="1: index old segments in a background worker (costs WiFi stability)")
     a = ap.parse_args()
-    global indexer, la
+    global indexer, la, BACKFILL
+    BACKFILL = bool(a.backfill)
     if LA is not None:
         try:
             la = LA.LogicAnalyzer(a.records or os.path.expanduser("~/records"))

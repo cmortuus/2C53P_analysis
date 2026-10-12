@@ -1,0 +1,12 @@
+[Unit]
+Description=Disable WiFi power saving on wlan0 (weak-signal packet loss on the Zero 2 W)
+After=sys-subsystem-net-devices-wlan0.device wpa_supplicant@wlan0.service
+Wants=sys-subsystem-net-devices-wlan0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/iw dev wlan0 set power_save off
+
+[Install]
+WantedBy=multi-user.target
