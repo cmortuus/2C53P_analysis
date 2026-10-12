@@ -60,7 +60,7 @@ RATE_OVERRIDE = {0x0D: 124960.0}
 #   zero is the ADC count the input reads with the probe on ground, minus 128,
 #   subtracted before scaling. Written by POST /api/calib (scopectl zero/gain).
 CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
-CALIB = {"gain": {}, "zero": {}}
+CALIB = {"gain": {}, "zero": {}, "transducer": {}}
 
 
 def calib_load():
@@ -68,7 +68,7 @@ def calib_load():
     try:
         with open(CALIB_PATH) as f:
             d = json.load(f)
-        CALIB = {"gain": d.get("gain", {}), "zero": d.get("zero", {})}
+        CALIB = {"gain": d.get("gain", {}), "zero": d.get("zero", {}), "transducer": d.get("transducer", {})}
         log("calibration loaded:", CALIB)
     except FileNotFoundError:
         pass
@@ -85,6 +85,13 @@ def calib_save():
 
 def calib_gain(ch, rng):
     return float(CALIB["gain"].get(str(ch), {}).get(str(rng), 1.0))
+
+
+def transducer(ch):
+    """(unit, volts per unit) for a channel carrying a transducer (e.g. a current clamp at
+    10 mV/A -> ("A", 0.01)); ("V", 1.0) otherwise."""
+    t = CALIB.get("transducer", {}).get(str(ch))
+    return (t["unit"], float(t["v_per_unit"])) if t else ("V", 1.0)
 
 
 def calib_zero(ch, rng):
@@ -105,7 +112,7 @@ RANGE_TIER = ["none"] * 4 + ["provisional", "measured", "measured", "measured", 
 
 # Commands the web UI may send. Anything else (mem write, flash, fwload…) is refused over HTTP.
 ALLOWED = [re.compile(p) for p in (
-    r"^fpga scope (timebase|vdiv|level|trigmode|edge|graticule|softtrig|hpos|measure|freq|cal)( [\w.\-]+){0,2}$",
+    r"^fpga scope (timebase|vdiv|probe|level|trigmode|edge|graticule|softtrig|hpos|measure|freq|cal)( [\w.\-]+){0,2}$",
     r"^idle( off| \d{1,3})?$",
     r"^power$",   # not `center`: it stalls the CDC shell for seconds (link drop, 2026-10-10)
     r"^btn (ch1|ch2|move|select|trigger|prm|auto|save|menu|up|down|left|right|ok)( \d+)?$",
@@ -321,7 +328,7 @@ def png_rgb(w, h, rows, scale=1):
             + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
 
 
-def measure(raw, vpc, rate, zero_counts=0.0):
+def measure(raw, vpc, rate, zero_counts=0.0, unit_name="V"):
     """Basic measurements on one channel. Volts when vpc>0, else ADC counts."""
     n = len(raw)
     if n == 0:
@@ -329,7 +336,7 @@ def measure(raw, vpc, rate, zero_counts=0.0):
     mn, mx = min(raw), max(raw)
     mean = sum(raw) / n
     var = sum((x - mean) ** 2 for x in raw) / n
-    unit = "V" if vpc else "cnt"
+    unit = unit_name if vpc else "cnt"
     s = vpc if vpc else 1.0
     zero = (128 + zero_counts) if vpc else 0
     # Top/base = median of the samples above/below the mean: a square wave's flat levels,
@@ -919,10 +926,12 @@ class Hub:
             vpc1 = h.get("vpc1_nv", 0) / 1e9 * calib_gain(1, h.get("rng1"))
             vpc2 = h.get("vpc2_nv", 0) / 1e9 * calib_gain(2, h.get("rng2"))
             z1, z2 = calib_zero(1, h.get("rng1")), calib_zero(2, h.get("rng2"))
+            (u1, k1), (u2, k2) = transducer(1), transducer(2)
+            vpc1, vpc2 = vpc1 / k1, vpc2 / k2                     # units per count (V, or A for a clamp)
             fr = {"seq": self.seq + 1, "t": now, "hdr": h, "rate": rate, "vpc1": vpc1, "vpc2": vpc2,
                   "ch1": base64.b64encode(c1).decode(), "ch2": base64.b64encode(c2).decode(),
-                  "zero1": z1, "zero2": z2, "seam": seam_k, "valid": valid,
-                  "meas": {"ch1": measure(c1[:valid], vpc1, rate, z1), "ch2": measure(c2[:valid], vpc2, rate, z2)},
+                  "zero1": z1, "zero2": z2, "seam": seam_k, "valid": valid, "unit1": u1, "unit2": u2,
+                  "meas": {"ch1": measure(c1[:valid], vpc1, rate, z1, u1), "ch2": measure(c2[:valid], vpc2, rate, z2, u2)},
                   "fps": round(self.fps, 1), "errors": self.errors}
             if recorder is not None:
                 try:
@@ -1303,12 +1312,21 @@ def make_http_handler(hub):
             if self.path == "/api/calib":
                 # {"ch": 2, "rng": 6, "gain": 1.062} and/or {"ch": 2, "rng": 6, "zero": 16.4}; "clear": true
                 try:
-                    ch, rng = str(int(req["ch"])), str(int(req["rng"]))
+                    ch = str(int(req["ch"]))
+                    rng = str(int(req.get("rng", -1)))
                 except (KeyError, ValueError):
-                    return self._send(400, {"error": "need ch and rng"})
+                    return self._send(400, {"error": "need ch (and rng for gain/zero)"})
+                if rng == "-1" and any(k in req for k in ("gain", "zero", "clear")):
+                    return self._send(400, {"error": "gain/zero/clear need rng"})
                 if req.get("clear"):
                     CALIB["gain"].get(ch, {}).pop(rng, None)
                     CALIB["zero"].get(ch, {}).pop(rng, None)
+                if "transducer" in req:                   # {"unit": "A", "v_per_unit": 0.01} or null
+                    if req["transducer"]:
+                        CALIB.setdefault("transducer", {})[ch] = {"unit": str(req["transducer"]["unit"])[:4],
+                                                                  "v_per_unit": float(req["transducer"]["v_per_unit"])}
+                    else:
+                        CALIB.setdefault("transducer", {}).pop(ch, None)
                 if "gain" in req:
                     CALIB["gain"].setdefault(ch, {})[rng] = float(req["gain"])
                 if "zero" in req:

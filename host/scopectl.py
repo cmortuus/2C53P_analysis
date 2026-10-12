@@ -15,7 +15,7 @@ Everything goes through http://scope-pi.local:8080 (override with --url or SCOPE
 uncalibrated range, intermittent, mains pickup) and can render a PNG of the record with
 real volt/time axes (matplotlib on this machine, nothing needed on the Pi).
 """
-import argparse, base64, json, math, os, statistics, sys, time, urllib.request
+import argparse, base64, json, math, os, re, statistics, sys, time, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scope_analysis as SA
 from scope_analysis import fmt, fmt_f, fmt_t, fmt_rate, Params
@@ -81,7 +81,7 @@ def rec_from_frame(f, ch, info):
     raw = c["raw"][:v] if v else SA.clean_record(c["raw"])        # continuous part only
     return {"raw": raw, "clean": True, "rate": f["rate"], "vpc": c["vpc"], "zero": f.get("zero%d" % ch, 0.0) or 0.0,
             "probe": c["probe"], "cpl": c["cpl"], "rng": c["rng"], "tier": info["range_tier"][c["rng"]],
-            "enabled": bool(c["en"]), "channel": ch, "counts_per_div": info["counts_per_div"],
+            "enabled": bool(c["en"]), "channel": ch, "counts_per_div": info["counts_per_div"], "unit": f.get("unit%d" % ch, "V"),
             "gain": info.get("calib", {}).get("gain", {}).get(str(ch), {}).get(str(c["rng"]), 1.0), "t": f.get("t")}
 
 
@@ -389,6 +389,9 @@ def main():
     p.add_argument("--pd", help="sigrok decoder, e.g. uart:rx=D0:baudrate=115200 | i2c:scl=D0:sda=D1 | spi:clk=D0:mosi=D1:cs=D2")
     p.add_argument("--ann", help="annotation filter, e.g. uart=rx-data"); p.add_argument("--limit", type=int, default=200)
     p.add_argument("--out")
+    p = sub.add_parser("probe", help="probe factor (x1/x10, sets the scope) and transducers (current clamp: --clamp 10mV/A)")
+    p.add_argument("--ch", type=int, required=True); p.add_argument("--x1", action="store_true"); p.add_argument("--x10", action="store_true")
+    p.add_argument("--clamp", help="e.g. 10mV/A or 100mV/A (Hantek CC-65 positions)"); p.add_argument("--clear-clamp", action="store_true")
     p = sub.add_parser("mark", help="session marker, e.g. mark 'spindle on' (use later: --from=mark:spindle)"); p.add_argument("text")
     p = sub.add_parser("marks", help="list session markers"); p.add_argument("--from", dest="t0", default="-7d")
     p = sub.add_parser("selftest", help="end-to-end check against the Pi reference (probe on Pi pin 12 + GND)"); p.add_argument("--json", action="store_true")
@@ -483,6 +486,22 @@ def main():
             data = urllib.request.urlopen(req, timeout=300).read()
             out = a.out or name + ".bin"
             open(out, "wb").write(data); print("saved", out, len(data), "bytes"); return
+
+    if a.cmd == "probe":
+        if a.x1 or a.x10:
+            print(cmd("fpga scope probe %d %d" % (a.ch, 10 if a.x10 else 1)).strip())
+        if a.clamp:
+            m = re.match(r"^\s*([\d.]+)\s*(m?)V\s*/\s*([A-Za-z]+)\s*$", a.clamp)
+            if not m:
+                raise SystemExit("--clamp like 10mV/A or 0.1V/A")
+            vpu = float(m.group(1)) * (1e-3 if m.group(2) else 1.0)
+            api("/api/calib", {"ch": a.ch, "transducer": {"unit": m.group(3), "v_per_unit": vpu}})
+            print("CH%d now reads in %s (%g V per %s)" % (a.ch, m.group(3), vpu, m.group(3)))
+        if a.clear_clamp:
+            api("/api/calib", {"ch": a.ch, "transducer": None}); print("CH%d back to volts" % a.ch)
+        f = decode(api("/api/frame.json"))
+        print("CH%d: scope probe setting x%d, unit %s" % (a.ch, 10 if f["hdr"]["prb%d" % a.ch] else 1, f.get("unit%d" % a.ch, "V")))
+        return
 
     if a.cmd == "mark":
         m = api("/api/mark", {"text": a.text})

@@ -222,10 +222,10 @@ def spectrum_peaks(raw, rate, n_peaks=3):
 def fmt(v, unit):
     if v is None or (isinstance(v, float) and not math.isfinite(v)):
         return "--"
-    if unit != "V":
+    if unit in (None, "cnt"):
         return "%.1f cnt" % v
     a = abs(v)
-    return ("%.2f V" % v) if a >= 1 else ("%.0f mV" % (v * 1e3)) if a >= 1e-3 else ("%.0f uV" % (v * 1e6))
+    return ("%.2f %s" % (v, unit)) if a >= 1 else ("%.0f m%s" % (v * 1e3, unit)) if a >= 1e-3 else ("%.0f u%s" % (v * 1e6, unit))
 
 
 def fmt_f(f):
@@ -255,7 +255,7 @@ def analyze_records(recs, p=None):
     c = recs[-1]
     raw, rate, vpc, zero = c["raw"], c["rate"], c["vpc"], c.get("zero", 0.0)
     cal = vpc > 0
-    unit = "V" if cal else "cnt"
+    unit = c.get("unit", "V") if cal else "cnt"
     lv = levels(raw, vpc, zero)
     amps = [levels(r["raw"], r["vpc"], r.get("zero", 0.0))["vamp"] for r in recs]
     freqs = [f for f in (frequency(r["raw"], r["rate"], p) for r in recs) if f]
@@ -264,7 +264,7 @@ def analyze_records(recs, p=None):
         "channel": c.get("channel"), "enabled": bool(c.get("enabled", True)), "range": c["rng"], "coupling": c.get("cpl"),
         "probe": c.get("probe", 1), "calibrated": cal, "unit": unit, "rate_sps": rate,
         "record_s": len(raw) / rate if rate else None, "range_tier": c.get("tier"),
-        "vdiv": (vpc * c.get("counts_per_div", 32)) if cal else None,
+        "vdiv": (vpc * c.get("counts_per_div", 32)) if cal else None, "transducer": c.get("unit", "V") != "V",
         "amp_top_base": statistics.median(amps), "vpp": lv["vpp"], "mean": lv["vavg"], "rms_ac": lv["vrms_ac"],
         "top": lv["vtop"], "base": lv["vbase"], "freq_hz": statistics.median(freqs) if freqs else None,
         "duty": pm["duty"] if pm else None, "span_counts": lv["span_counts"], "clipped": lv["clipped"],
@@ -295,7 +295,7 @@ def analyze_records(recs, p=None):
         d["flags"].append("~60 Hz: mains pickup -- a floating/unconnected probe or missing ground clip looks exactly like this")
     if pm and pm["glitches"]:
         d["flags"].append("%d runt pulse(s) shorter than %.0f%% of the normal width: glitches or contact bounce" % (pm["glitches"], p.glitch_ratio * 100))
-    if cal:
+    if cal and unit == "V":
         limit = p.input_limit_v * d["probe"]
         if max(abs(d["top"]), abs(d["base"])) > p.limit_fraction * limit:
             d["flags"].append("within %.0f%% of the input limit for a x%d probe (%g V): stop and switch to x10 / check the source"
@@ -344,7 +344,7 @@ def analyze_records(recs, p=None):
                 tt.append("%s %s" % (nm, fmt_t(v)))
         parts.append("high %s / low %s, %s" % (fmt_t(pm["high_s"]), fmt_t(pm["low_s"]), ", ".join(tt)))
     parts.append("probe x%d %s, range %d%s, %s/div" % (d["probe"], d["coupling"], c["rng"], "" if cal else " (uncal)",
-                 fmt(d["vdiv"], "V") if cal else "--"))
+                 fmt(d["vdiv"], unit) if cal else "--"))
     if zero or d["gain"] != 1.0:
         parts.append("unit cal applied (gain x%.3f, zero %+.1f cnt)" % (d["gain"], zero))
     if d["spectrum_peaks"]:

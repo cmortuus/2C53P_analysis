@@ -38,7 +38,7 @@ Commands are from `/Users/c/2C53P_analysis`. Python = `.venv/bin/python`.
 ## 2. Flash OpenScope + streaming command
 Device off → MENU + tap Power → `IAP` drive:
 ```bash
-.venv/bin/python third_party/OpenScope-2C53T/scripts/iap_flash.py flash "firmware_builds/openscope-2c53t-guest-coldtrace-2eae008+dumpbin-v3+ui-fnirsi-r15-offsets.bin"   # currently flashed (2026-10-11: + power-off notice + per-unit centred offsets)
+.venv/bin/python third_party/OpenScope-2C53T/scripts/iap_flash.py flash "firmware_builds/openscope-2c53t-guest-coldtrace-2eae008+dumpbin-v3+ui-fnirsi-r16-probe.bin"   # currently flashed (2026-10-11: + power-off notice + centred offsets + probe command)
 ```
 Expected: it reboots into OpenScope's scope UI with a live trace (the demo trace disappears once
 real samples arrive). The factory bootloader is untouched: MENU + Power always works again.

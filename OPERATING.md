@@ -109,7 +109,10 @@ the Pi Zero: ~4 MS/s for seconds, 24 MS/s for short bursts (USB 2 + RAM; 64 M sa
   amplitude (the Pi square is a good one for 1–7 V/div ranges).
 - **Probe switch:** the scope only knows the probe factor from its own setting (`prb1/prb2` in
   `status`). If the owner's probe is physically at ×10 and the scope says ×1, every voltage is 10× low.
-  Ask which position the switch is in; set the scope to match (`btn` menus, or ask him).
+  Ask which position the switch is in and set it: `scopectl probe --ch N --x10` (or `--x1`).
+- **Current clamp** (Hantek CC-65 on a channel): `scopectl probe --ch 2 --clamp 10mV/A` (or 100mV/A,
+  matching the clamp's switch); that channel then reads in amps everywhere. `--clear-clamp` to undo.
+  Zero the clamp itself (its button) with no conductor before measuring.
 - **Timebase:** codes 0x08–0x14 verified against the Pi's crystal (5 MS/s … 500 S/s, all within
   0.2 %); 0x07 (12.5 MS/s) and 0x06 (25 MS/s) are provisional; 0x05 and faster are not usable
   (records are not uniform-rate). Records are 1024 samples; `describe` says the record length in

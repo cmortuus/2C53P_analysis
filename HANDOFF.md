@@ -1,5 +1,10 @@
 # FNIRSI 2C53P — read & control from a computer (handoff)
 
+## PROBE FACTOR + CURRENT CLAMPS (2026-10-11 evening)
+- **Firmware r16 FLASHED** (`…+ui-fnirsi-r16-probe.bin`, sha `22ebc1ba…`): new shell `fpga scope probe <1|2> <1|10>` — the probe attenuation was only settable from the on-screen menu, yet every volts value depends on it. Allow-listed on the Pi.
+- **Transducers:** `calib.json` gains `transducer: {ch: {unit, v_per_unit}}`; the hub divides that channel's units-per-count by it and labels frames `unit1/unit2`, so measurements, viewer, logger, index and scopectl all report e.g. amps. `scopectl probe --ch 2 --x10 | --x1 | --clamp 10mV/A | --clear-clamp`. Verified on the 3.196 V reference: ×10 → 31.96 V, clamp 100 mV/A → 31.97 A. The input-limit flag is skipped for non-volt channels.
+- Self-test 15/15 after r16.
+
 ## LOGIC ANALYZER SUPPORT, READY BEFORE THE HARDWARE (2026-10-11 evening)
 - `host/logic_analysis.py` (deployed to `/opt/scope`, imported by the server): `LogicAnalyzer` (sigrok-cli capture to `<records>/la/la_*.bin` raw + `.json`, one capture at a time, ≤64 M samples, optional `--triggers`; `decode()` runs sigrok decoders on the stored file via the binary input — which names channels 0..7, so `D0..D7` in decoder specs are mapped), numpy `channel_stats()` (edges, freq, jitter, duty, median/min pulse widths, glitches) and `step_dir()` (count, ± by DIR level, median/max step rate, DIR changes, min DIR setup time).
 - Server routes `/api/la/status|captures|capture|decode|<name>.bin|<name>/stats?step=&dir=`; `scopectl la status|capture|list|stats|decode|fetch`. **Verified with sigrok's demo device** (capture, stats, step/dir) and a synthetic UART file on D2 that decoded to "Hello CNC\n". `tests/test_logic_analysis.py` (3 tests: freq/duty/glitch, step/dir counting, rate parsing); whole suite 13/13.

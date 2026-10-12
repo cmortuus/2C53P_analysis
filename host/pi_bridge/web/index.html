@@ -176,7 +176,9 @@ function fmtV(v) { if (v == null || !isFinite(v)) return '—'; const a = Math.a
 function fmtT(s) { if (s == null || !isFinite(s)) return '—'; const a = Math.abs(s);
   return a >= 1 ? s.toFixed(2) + ' s' : a >= 1e-3 ? (s * 1e3).toPrecision(3) + ' ms' : a >= 1e-6 ? (s * 1e6).toPrecision(3) + ' µs' : (s * 1e9).toPrecision(3) + ' ns'; }
 function fmtF(f) { if (f == null || !isFinite(f)) return '—'; return f >= 1e6 ? (f / 1e6).toPrecision(4) + ' MHz' : f >= 1e3 ? (f / 1e3).toPrecision(4) + ' kHz' : f.toPrecision(4) + ' Hz'; }
-function fmtM(v, unit) { return unit === 'V' ? fmtV(v) : (v == null ? '—' : v.toFixed(1) + ' cnt'); }
+function fmtU(v, u) { if (v == null || !isFinite(v)) return '—'; const a = Math.abs(v);
+  return a >= 1 ? v.toFixed(a >= 10 ? 1 : 2) + ' ' + u : a >= 1e-3 ? (v * 1e3).toFixed(a >= 0.1 ? 0 : 1) + ' m' + u : (v * 1e6).toFixed(0) + ' µ' + u; }
+function fmtM(v, unit) { return unit === 'V' ? fmtV(v) : unit && unit !== 'cnt' ? fmtU(v, unit) : (v == null ? '—' : v.toFixed(1) + ' cnt'); }
 
 async function api(path, body) {
   const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
