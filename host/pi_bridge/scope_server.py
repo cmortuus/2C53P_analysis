@@ -778,7 +778,8 @@ def find_events(recorder, t0, t1, conds, gap=2.0, limit_rows=200000):
 
 
 class RefSignal:
-    """The calibration reference on GPIO18 (header pin 12): hardware PWM from the Pi's crystal,
+    """The calibration reference on GPIO18 (header pin 12) AND GPIO12 (header pin 32, the same
+    PWM0 channel via ALT0, so a second probe gets the identical signal): hardware PWM from the Pi's crystal,
     or a steady level. Only this pin, only these modes. Needs passwordless sudo (pinctrl, sysfs)."""
     C = "/sys/class/pwm/pwmchip0/pwm0"
 
@@ -796,13 +797,14 @@ class RefSignal:
                 raise ValueError("hz 1..10e6, duty 0..1")
             period = int(round(1e9 / hz))
             d = max(1, min(period - 1, int(round(period * duty))))
-            r = self._sh("pinctrl set 18 a5; C=%s; [ -d $C ] || echo 0 > /sys/class/pwm/pwmchip0/export; sleep 0.1; "
+            r = self._sh("pinctrl set 18 a5; pinctrl set 12 a0; C=%s; [ -d $C ] || echo 0 > /sys/class/pwm/pwmchip0/export; sleep 0.1; "
                          "echo 0 > $C/duty_cycle; echo %d > $C/period; echo %d > $C/duty_cycle; echo 1 > $C/enable; cat $C/period"
                          % (self.C, period, d))
             actual = 1e9 / int(r.stdout.strip()) if r.stdout.strip().isdigit() else None
             self.state = {"mode": "pwm", "hz": actual or hz, "duty": d / period}
         elif mode in ("high", "low"):
-            self._sh("pinctrl set 18 op %s" % ("dh" if mode == "high" else "dl"))
+            lv = "dh" if mode == "high" else "dl"
+            self._sh("pinctrl set 18 op %s; pinctrl set 12 op %s" % (lv, lv))
             self.state = {"mode": mode}
         else:
             raise ValueError("mode pwm|high|low")
