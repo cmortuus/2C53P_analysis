@@ -379,6 +379,16 @@ def main():
     ap.add_argument("--url", default=URL)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    p = sub.add_parser("la", help="8-channel logic analyzer on the Pi (sigrok): status|capture|list|stats|decode|fetch")
+    p.add_argument("action", choices=["status", "capture", "list", "stats", "decode", "fetch"])
+    p.add_argument("name", nargs="?", help="capture name (stats/decode/fetch; default: latest)")
+    p.add_argument("--rate", default="4M"); p.add_argument("--seconds", type=float, default=1.0)
+    p.add_argument("--demo", action="store_true", help="sigrok's fake device (no hardware)")
+    p.add_argument("--label", default=""); p.add_argument("--trigger", help="sigrok trigger, e.g. D0=r")
+    p.add_argument("--step"); p.add_argument("--dir", default="D1"); p.add_argument("--dir-negative", action="store_true")
+    p.add_argument("--pd", help="sigrok decoder, e.g. uart:rx=D0:baudrate=115200 | i2c:scl=D0:sda=D1 | spi:clk=D0:mosi=D1:cs=D2")
+    p.add_argument("--ann", help="annotation filter, e.g. uart=rx-data"); p.add_argument("--limit", type=int, default=200)
+    p.add_argument("--out")
     p = sub.add_parser("mark", help="session marker, e.g. mark 'spindle on' (use later: --from=mark:spindle)"); p.add_argument("text")
     p = sub.add_parser("marks", help="list session markers"); p.add_argument("--from", dest="t0", default="-7d")
     p = sub.add_parser("selftest", help="end-to-end check against the Pi reference (probe on Pi pin 12 + GND)"); p.add_argument("--json", action="store_true")
@@ -421,6 +431,58 @@ def main():
                       fmt_f(c["meas"]["freq"]) if c["meas"].get("freq") else "--", "  CLIPPED" if c["meas"]["clipped"] else ""))
         lg = api("/api/log"); print("logger:   %s, %d rows" % ("ON" if lg["logging"] else "off", lg["rows"]))
         return
+
+    if a.cmd == "la":
+        if a.action == "status":
+            print(json.dumps(api("/api/la/status", timeout=30))); return
+        if a.action == "capture":
+            m = api("/api/la/capture", {"rate": a.rate, "seconds": a.seconds, "demo": a.demo, "label": a.label, "trigger": a.trigger},
+                    timeout=a.seconds * 3 + 60)
+            if "error" in m:
+                raise SystemExit("capture failed: " + m["error"])
+            print("captured %s: %d samples at %s (%s)%s" % (m["name"], m["samples"], fmt_rate(m["rate"]), m["driver"], ("  " + m["label"]) if m["label"] else ""))
+            return
+        caps = api("/api/la/captures")
+        if a.action == "list":
+            for m in caps:
+                print("%-22s %s  %9d samples  %-10s %-9s %s" % (m["name"], time.strftime("%m-%d %H:%M:%S", time.localtime(m["t"])), m["samples"], fmt_rate(m["rate"]), m["driver"], m.get("label", "")))
+            return
+        name = a.name or (caps[-1]["name"] if caps else None)
+        if not name:
+            raise SystemExit("no captures yet")
+        if a.action == "stats":
+            q = "?step=%s&dir=%s&dir_pos=%s" % (a.step, a.dir, "low" if a.dir_negative else "high") if a.step else ""
+            d = api("/api/la/%s/stats%s" % (name, q), timeout=120)
+            m = d["meta"]
+            print("%s: %s, %s at %s" % (name, fmt_t(m["samples"] / m["rate"]), m["driver"], fmt_rate(m["rate"])))
+            for ch, st in d["channels"].items():
+                if "state" in st:
+                    print("  %s  constant %s" % (ch, st["state"])); continue
+                print("  %s  %6d edges  %s  duty %s  high %s (min %s)  low %s (min %s)%s" % (
+                    ch, st["rising"] + st["falling"], fmt_f(st.get("freq_hz")), ("%.1f%%" % (st["duty"] * 100)) if "duty" in st else "--",
+                    fmt_t(st.get("high_median_s")), fmt_t(st.get("high_min_s")), fmt_t(st.get("low_median_s")), fmt_t(st.get("low_min_s")),
+                    ("  GLITCHES %d/%d" % (st.get("high_glitches", 0), st.get("low_glitches", 0))) if (st.get("high_glitches") or st.get("low_glitches")) else ""))
+            if d.get("step_dir"):
+                sd = d["step_dir"]
+                print("  step/dir (%s/%s): %d steps (+%d / -%d, net %+d), median %s, max %s, DIR changes %d, min DIR setup %s" % (
+                    a.step, a.dir, sd["steps"], sd.get("plus", 0), sd.get("minus", 0), sd["net"], fmt_f(sd.get("median_step_rate_hz")),
+                    fmt_f(sd.get("max_step_rate_hz")), sd.get("dir_changes", 0), fmt_t(sd.get("min_dir_setup_s"))))
+            return
+        if a.action == "decode":
+            if not a.pd:
+                raise SystemExit("decode needs --pd, e.g. --pd uart:rx=D0:baudrate=115200")
+            d = api("/api/la/decode", {"name": name, "pd": a.pd, "ann": a.ann, "limit": a.limit}, timeout=600)
+            if d.get("error"):
+                print("decoder message: " + d["error"])
+            print("%d annotation lines (showing %d)" % (d.get("total_lines", 0), len(d.get("lines", []))))
+            for ln in d.get("lines", []):
+                print("  " + ln)
+            return
+        if a.action == "fetch":
+            req = urllib.request.Request(URL + "/api/la/%s.bin" % name)
+            data = urllib.request.urlopen(req, timeout=300).read()
+            out = a.out or name + ".bin"
+            open(out, "wb").write(data); print("saved", out, len(data), "bytes"); return
 
     if a.cmd == "mark":
         m = api("/api/mark", {"text": a.text})

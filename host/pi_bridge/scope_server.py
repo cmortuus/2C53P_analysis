@@ -18,6 +18,7 @@ Owns the scope's USB CDC shell and serves:
            GET/POST /api/refs, GET /api/refs/<name>   reference waveforms (scopectl ref save|compare)
            GET/POST /api/refsig    the Pi's calibration signal on GPIO18: {mode: pwm, hz, duty} | {mode: high|low}
            POST /api/mark {text}, GET /api/marks?from&to   session markers ("spindle on") kept with the records
+           GET /api/la/status|captures|<name>.bin|<name>/stats?step=D0&dir=D1, POST /api/la/capture {rate, seconds, demo, trigger}, POST /api/la/decode {name, pd, ann}
            POST /api/cmd          {"cmd": "<shell command>"}   (allow-listed scope controls only)
            POST /api/run          {"run": true|false}           (pause/resume streaming)
   :7001  raw shell proxy, line based — drop-in for the old socat bridge, so
@@ -30,6 +31,10 @@ import argparse, base64, glob, json, math, os, re, socket, socketserver, struct,
 sys_path_dir = os.path.dirname(os.path.abspath(__file__))
 import sys
 sys.path.insert(0, sys_path_dir)
+try:
+    import logic_analysis as LA          # 8-channel logic analyzer (sigrok); deployed next to this file
+except Exception as _e:
+    LA = None
 try:
     import scope_analysis as SA          # shared with host/scopectl.py; deployed next to this file
 except Exception as _e:                  # analysis endpoints then report the import error
@@ -1007,6 +1012,33 @@ def make_http_handler(hub):
                     return self._send(404, {"error": "no such reference"})
                 with open(fn) as f:
                     return self._send(200, json.load(f))
+            if p.startswith("/api/la"):
+                if LA is None or la is None:
+                    return self._send(503, {"error": "logic analyzer support not available"})
+                if p == "/api/la/status":
+                    return self._send(200, dict(la.scan(), busy=la.busy, captures=len(la.list())))
+                if p == "/api/la/captures":
+                    return self._send(200, la.list())
+                m = re.match(r"^/api/la/([\w.-]+)\.bin$", p)
+                if m:
+                    b, _ = la.path(m.group(1))
+                    if not os.path.exists(b):
+                        return self._send(404, {"error": "no such capture"})
+                    with open(b, "rb") as f:
+                        return self._send(200, f.read(), "application/octet-stream", {"Content-Disposition": 'attachment; filename="%s.bin"' % m.group(1)})
+                m = re.match(r"^/api/la/([\w.-]+)/stats$", p)
+                if m:
+                    q = dict(x.split("=", 1) for x in (self.path.split("?", 1)[1].split("&") if "?" in self.path else []) if "=" in x)
+                    try:
+                        meta = la.meta(m.group(1)); data = LA.load(la.path(m.group(1))[0])
+                    except FileNotFoundError:
+                        return self._send(404, {"error": "no such capture"})
+                    out = {"meta": meta, "channels": LA.channel_stats(data, meta["rate"], float(q.get("glitch_ratio", 0.2)))}
+                    if "step" in q:
+                        out["step_dir"] = LA.step_dir(data, meta["rate"], int(q["step"].lstrip("D")), int(q.get("dir", "D1").lstrip("D")),
+                                                      q.get("dir_pos", "high") == "high")
+                    return self._send(200, out)
+                return self._send(404, {"error": "unknown la route"})
             if p == "/api/refsig":
                 return self._send(200, refsig.state)
             if p.startswith("/api/marks"):
@@ -1205,6 +1237,22 @@ def make_http_handler(hub):
                 req = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if self.path == "/api/la/capture":
+                if LA is None or la is None:
+                    return self._send(503, {"error": "logic analyzer support not available"})
+                try:
+                    meta = la.capture(req.get("rate", "1M"), float(req.get("seconds", 1.0)), bool(req.get("demo")),
+                                      str(req.get("label", ""))[:100], req.get("trigger"))
+                except (ValueError, RuntimeError, subprocess.SubprocessError) as e:
+                    return self._send(400, {"error": str(e)})
+                return self._send(200, meta)
+            if self.path == "/api/la/decode":
+                if LA is None or la is None:
+                    return self._send(503, {"error": "logic analyzer support not available"})
+                try:
+                    return self._send(200, la.decode(str(req["name"]), str(req["pd"]), req.get("ann"), int(req.get("limit", 2000))))
+                except Exception as e:                    # never leave the client without a JSON answer
+                    return self._send(400, {"error": "%s: %s" % (type(e).__name__, e)})
             if self.path == "/api/mark":
                 # {"text": "spindle on", "t": optional unix time} -> markers.jsonl next to the records
                 text = str(req.get("text", "")).strip()[:200]
@@ -1330,6 +1378,7 @@ class ThreadingTCP(socketserver.ThreadingMixIn, socketserver.TCPServer):
 recorder = None
 indexer = None
 refsig = RefSignal()
+la = None
 
 
 def urllib_unquote(x):
@@ -1350,7 +1399,12 @@ def main():
                     help="internal = Pi runs off the scope battery (always-recording only while VBUS is sensed)")
     ap.add_argument("--vbus-gpio", type=int, default=17, help="GPIO with the scope's VBUS via a divider (internal build)")
     a = ap.parse_args()
-    global indexer
+    global indexer, la
+    if LA is not None:
+        try:
+            la = LA.LogicAnalyzer(a.records or os.path.expanduser("~/records"))
+        except Exception as e:
+            log("logic analyzer disabled:", e)
     if a.records:
         recorder = Recorder(a.records, int(a.max_gb * 1e9))
         recorder.forced = bool(a.record_always)

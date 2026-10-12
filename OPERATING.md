@@ -77,6 +77,21 @@ tool and by the Pi (`/api/analyze`), and all thresholds are `Params` fields — 
 command line, nothing else moves. Strip charts show amplitude / mean / frequency per frame over
 time, which is how a sagging rail or an intermittent contact shows up.
 
+## Logic analyzer (8 channels, when plugged into the Pi via an OTG hub)
+```bash
+$P host/scopectl.py la status                                   # is the fx2lafw analyzer present?
+$P host/scopectl.py la capture --rate 4M --seconds 2 --label "jog X"   # on demand, stored on the Pi
+$P host/scopectl.py la capture --rate 4M --seconds 5 --trigger D0=r    # wait for a rising edge on D0
+$P host/scopectl.py la stats --step D0 --dir D1               # per channel freq/duty/widths/glitches; step count, net, rates, DIR setup
+$P host/scopectl.py la decode --pd uart:rx=D2:baudrate=115200 --ann uart=rx-data
+$P host/scopectl.py la decode --pd i2c:scl=D0:sda=D1        # also spi, can, pwm, stepper_motor, onewire ... (sigrok -L)
+$P host/scopectl.py la list | fetch [name]
+```
+Captures live in `/home/pi/records/la/` (raw byte per sample, bit n = Dn, + JSON); any capture can
+be re-decoded later with other settings. `--demo` uses sigrok's fake device (pipeline test without
+hardware). Inputs are 0–5 V logic only; ground the analyzer's GND to the circuit. Practical limits on
+the Pi Zero: ~4 MS/s for seconds, 24 MS/s for short bursts (USB 2 + RAM; 64 M samples max).
+
 ## What the readings mean, and when NOT to trust them
 - **Ranges:** 0–3 are uncalibrated on this unit (OpenScope has no gain for them) — counts only.
   Ranges 4 and 8/9 are "provisional" (±10 %). Ranges 5–7 are measured: CH1 within ~2 %,

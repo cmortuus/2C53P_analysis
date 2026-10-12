@@ -4,10 +4,10 @@
 # Replaces the older socat-only scope-bridge service (same port 7001 for t_scope.py --tcp).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-apt-get update -qq && apt-get install -y -qq python3-serial python3-numpy mtools
+apt-get update -qq && apt-get install -y -qq python3-serial python3-numpy python3-libgpiod mtools sigrok-cli sigrok-firmware-fx2lafw
 install -d /opt/scope/web /home/pi/records
 install -m 644 "$HERE/scope_server.py" /opt/scope/
-install -m 644 "$HERE/../scope_analysis.py" /opt/scope/      # shared analysis (server-side /api/analyze)
+install -m 644 "$HERE/../scope_analysis.py" "$HERE/../logic_analysis.py" /opt/scope/   # shared analysis + logic analyzer
 chown -R pi /opt/scope /home/pi/records                       # calib.json and raw records are written by the service
 install -m 644 "$HERE/web/index.html" /opt/scope/web/
 install -m 644 "$HERE/scope-server.service" "$HERE/pwm-ref.service" /etc/systemd/system/

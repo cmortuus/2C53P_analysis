@@ -18,6 +18,7 @@ Start with [`OPERATING.md`](OPERATING.md) (how to drive the scope remotely), [`I
 |------|------|
 | `host/pi_bridge/` | Pi server (`scope_server.py`), web viewer (`web/`), systemd unit, install script, cloud-init templates |
 | `host/scopectl.py` | **the operator tool**: status, wait-for-signal, autoset, describe (+plot), report, zero/gain calibration, record/replay (post-hoc re-evaluation), set, screen, log — see `OPERATING.md` |
+| `host/logic_analysis.py` | 8-channel logic analyzer (sigrok fx2lafw): captures on the Pi, edge stats, step/dir counting, protocol decoding |
 | `host/scope_analysis.py` | the analysis module (levels, edges, frequency, pulse metrics, spectrum, shape, flags, timing) shared by scopectl and the Pi's `/api/analyze`; all criteria are `Params` |
 | `host/t_scope.py` | 2C53T streamer/CLI (USB or `--tcp scope-pi.local:7001`): CSV, plot, set commands |
 | `host/t_calcheck.py` | calibration sweep against a known generator signal via the viewer API |
@@ -29,6 +30,7 @@ Start with [`OPERATING.md`](OPERATING.md) (how to drive the scope remotely), [`I
 | `host/fnirsi_uart0.py`, `host/pi_server.py`, `host/client.py` | 2C53P UART0 factory-protocol tools (unused since the 2C53T pivot) |
 | `esp32_bridge/` | optional ESP32-S3 USB-host↔WiFi transparent bridge (ESP-IDF; built, untested on hardware) |
 | `samples/` | saved waveforms/screens from both scopes |
+| `tests/` | regression tests for the analysis modules (`python -m unittest discover -s tests`) |
 
 Not in the repo (see `.gitignore`): downloads, `third_party/` checkouts (clone OpenScope-2C53T and
 apply the patch), the Ghidra project, FNIRSI's own firmware, and the Pi cloud-init file that

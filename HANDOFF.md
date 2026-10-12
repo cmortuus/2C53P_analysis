@@ -1,5 +1,10 @@
 # FNIRSI 2C53P — read & control from a computer (handoff)
 
+## LOGIC ANALYZER SUPPORT, READY BEFORE THE HARDWARE (2026-10-11 evening)
+- `host/logic_analysis.py` (deployed to `/opt/scope`, imported by the server): `LogicAnalyzer` (sigrok-cli capture to `<records>/la/la_*.bin` raw + `.json`, one capture at a time, ≤64 M samples, optional `--triggers`; `decode()` runs sigrok decoders on the stored file via the binary input — which names channels 0..7, so `D0..D7` in decoder specs are mapped), numpy `channel_stats()` (edges, freq, jitter, duty, median/min pulse widths, glitches) and `step_dir()` (count, ± by DIR level, median/max step rate, DIR changes, min DIR setup time).
+- Server routes `/api/la/status|captures|capture|decode|<name>.bin|<name>/stats?step=&dir=`; `scopectl la status|capture|list|stats|decode|fetch`. **Verified with sigrok's demo device** (capture, stats, step/dir) and a synthetic UART file on D2 that decoded to "Hello CNC\n". `tests/test_logic_analysis.py` (3 tests: freq/duty/glitch, step/dir counting, rate parsing); whole suite 13/13.
+- Installer now also installs `sigrok-cli sigrok-firmware-fx2lafw python3-libgpiod` and copies `logic_analysis.py`.
+
 ## SELF-TEST, JUNK BLOCK, MARKERS, TESTS (2026-10-11 afternoon)
 - **CH1 range 5 calibrated** (×0.9916) with `t_calibrate.py --shift-clipped`: for ranges where the 3.2 V square clips, the offset DAC is moved (raw shell `trig raw` / `trig2 raw`) so the base sits at ~58 counts, the step is measured (gain depends only on the step), and the boot offset restored. Range 4 still needs a ~1 V reference.
 - **`/api/refsig`** (server `RefSignal`, sudo pinctrl + PWM sysfs; GPIO18 only): pwm hz/duty, high, low. `scopectl refsig`.
