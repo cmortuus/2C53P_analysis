@@ -104,3 +104,27 @@ def own_board(src):
     for i, (c, t) in enumerate(leg):
         d.text((30, im.height + 20 + i * 42), t, font=F(32), fill=c)
     p = os.path.join(OUT, "own_board_taps.jpg"); canvas.save(p, quality=90); return p
+
+
+def own_usbc(src):
+    """The owner's USB-C receptacle pad row (16-pin USB 2.0 type: 12 pads, wide-wide-8 narrow-wide-wide)."""
+    im = Image.open(src).convert("RGB").crop((150, 140, 300, 200)).resize((1200, 480), Image.LANCZOS)
+    canvas = Image.new("RGB", (1200, 480 + 390), BLK); canvas.paste(im, (0, 0))
+    d = ImageDraw.Draw(canvas)
+    xs = [230, 320, 400, 455, 515, 570, 625, 685, 740, 800, 875, 960]
+    role = {0: ("GND", (150, 150, 150)), 11: ("GND", (150, 150, 150)), 1: ("VBUS", (255, 140, 0)), 10: ("VBUS", (255, 140, 0)),
+            5: ("D", GRN), 6: ("D", GRN)}
+    for i, x in enumerate(xs):
+        nm, c = role.get(i, ("", (90, 90, 90)))
+        if nm:
+            d.rectangle([x - 26, 200, x + 26, 345], outline=c, width=7)
+        d.text((x, 375), str(i + 1), font=F(30), fill=c if nm else (150, 150, 150), anchor="mm")
+    y = 500
+    for c, t in ((GRN, "6 + 7 (middle two): USB D+ and D-  ->  the switch  ->  Pi USB data"),
+                 (GRN, "   Which is which can't be seen. Swapped: no harm, no connection, swap them."),
+                 (GRN, "   (5 and 8 are the same pair for the flipped plug: no need to tap them.)"),
+                 ((255, 140, 0), "2 or 11 (wide): VBUS 5 V  ->  15k/22k divider  ->  Pi pin 11 (optional)"),
+                 ((150, 150, 150), "1 and 12: GND.   3, 4, 9, 10: leave alone (CC / SBU)."),
+                 (RED, "0.5 mm pitch: flux, fine tip, 30 AWG, tack the pad's tip; check 6-7 not bridged.")):
+        d.text((30, y), t, font=F(30), fill=c); y += 58
+    p = os.path.join(OUT, "own_board_usbc.jpg"); canvas.save(p, quality=90); return p
