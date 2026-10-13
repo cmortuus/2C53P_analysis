@@ -13,7 +13,7 @@ index 415adbe..e172ab8 100644
  C_SOURCES += src/ui/meter_ui.c
  C_SOURCES += src/ui/softkey.c
 diff --git a/firmware/src/drivers/fpga.c b/firmware/src/drivers/fpga.c
-index 00816fa..00a4a52 100644
+index 00816fa..90db2e3 100644
 --- a/firmware/src/drivers/fpga.c
 +++ b/firmware/src/drivers/fpga.c
 @@ -39,6 +39,19 @@
@@ -390,7 +390,7 @@ index 33b2db6..4243316 100644
      /* Initialize oscilloscope state */
      scope_state_init(scope_state_get());
 diff --git a/firmware/src/tasks/input_handler.c b/firmware/src/tasks/input_handler.c
-index 974bbbf..427668f 100644
+index 974bbbf..798a541 100644
 --- a/firmware/src/tasks/input_handler.c
 +++ b/firmware/src/tasks/input_handler.c
 @@ -34,6 +34,7 @@
@@ -415,20 +415,28 @@ index 974bbbf..427668f 100644
      scope_state_t *ss = scope_state_get();
      uint8_t cmd = DCMD_REDRAW_ALL;
      char pb[24];
-@@ -1117,6 +1125,7 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
-              * the "Goodbye!" frame so its SPI2 traffic is invisible to the
+@@ -1118,11 +1126,10 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
               * user, and before the rail drops. */
              (void)settings_store_flush(settings_now_ms());
-+            power_off_notify_and_wait();     /* a connected Pi closes its files (idle_off.h) */
  
-             /* Drop PC9 LOW — device powers off */
-             GPIOC->clr = (1U << 9);
+-            /* Drop PC9 LOW — device powers off */
+-            GPIOC->clr = (1U << 9);
+-
+-            /* Should never reach here */
+-            while (1);
++            /* Drop PC9 LOW — device powers off. On USB power the rail stays up and this
++             * returns in dark sleep (idle_off.c); the next press wakes the UI. */
++            power_off_or_dark_sleep();
++            goto power_done;
+         }
+         power_done:
+         break;
 diff --git a/firmware/src/ui/idle_off.c b/firmware/src/ui/idle_off.c
 new file mode 100644
-index 0000000..8deaded
+index 0000000..4a90c58
 --- /dev/null
 +++ b/firmware/src/ui/idle_off.c
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,105 @@
 +/*
 + * idle_off.c — see idle_off.h.
 + */
@@ -515,11 +523,18 @@ index 0000000..8deaded
 +    font_draw_string_center(160, 125, "no activity", th->text_secondary, th->background, &font_small);
 +    vTaskDelay(pdMS_TO_TICKS(800));
 +    (void)settings_store_flush((uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS));
++    power_off_or_dark_sleep();
++}
++
++void power_off_or_dark_sleep(void)
++{
 +    power_off_notify_and_wait();              /* let a connected Pi close its files */
 +    GPIOC->clr = (1U << 9);                   /* release the power hold */
 +    vTaskDelay(pdMS_TO_TICKS(600));
 +
-+    /* Still here: USB (VBUS) keeps the rail up. Dark sleep instead. */
++    /* Still here: USB (VBUS) keeps the rail up. Dark sleep instead. (Before r17 the
++     * POWER button ended in while(1) here, which starved the shell task: frozen
++     * "Goodbye!" screen, USB enumerated but every command timed out, until a reset.) */
 +    GPIOC->scr = (1U << 9);                   /* re-arm the hold so a wake is a normal state */
 +    GPIOB->clr = (1U << 8);                   /* backlight off */
 +    lcd_display_off();
@@ -529,10 +544,10 @@ index 0000000..8deaded
 +}
 diff --git a/firmware/src/ui/idle_off.h b/firmware/src/ui/idle_off.h
 new file mode 100644
-index 0000000..61c40ae
+index 0000000..0bb4992
 --- /dev/null
 +++ b/firmware/src/ui/idle_off.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,41 @@
 +/*
 + * idle_off.h — auto power-off after N minutes without activity.
 + *
@@ -568,6 +583,10 @@ index 0000000..61c40ae
 +extern volatile uint8_t power_off_pending;
 +void power_off_notify_and_wait(void);
 +void     idle_off_service(void);              /* display task only, every loop pass */
++/* The shutdown tail shared by the POWER button, auto power-off and battery-critical
++ * paths: notice + PC9 low; if VBUS keeps the rail up, return in DARK SLEEP (the next
++ * button press or shell command wakes the UI). Task context only. */
++void     power_off_or_dark_sleep(void);
 +
 +#endif /* IDLE_OFF_H */
 diff --git a/firmware/src/ui/scope_freq_edges.c b/firmware/src/ui/scope_freq_edges.c
@@ -715,7 +734,7 @@ index fd4a766..be1d01d 100644
      s->trig_x = 160;
  
 diff --git a/firmware/src/ui/scope_timebase.c b/firmware/src/ui/scope_timebase.c
-index af44976..9ce0765 100644
+index af44976..73015ff 100644
 --- a/firmware/src/ui/scope_timebase.c
 +++ b/firmware/src/ui/scope_timebase.c
 @@ -49,14 +49,20 @@
@@ -1799,7 +1818,7 @@ index 0236d1c..a497ce1 100644
      if (selected)
          font_draw_string(MENU_LEFT, y + 4, ">",
 diff --git a/firmware/src/ui/status_bar.c b/firmware/src/ui/status_bar.c
-index 4a9ecad..c5187dd 100644
+index 4a9ecad..4f7f9ff 100644
 --- a/firmware/src/ui/status_bar.c
 +++ b/firmware/src/ui/status_bar.c
 @@ -10,6 +10,8 @@
@@ -1880,15 +1899,18 @@ index 4a9ecad..c5187dd 100644
      if (battery_is_critical()) {
          static uint8_t shutdown_timer = 0;
          shutdown_timer++;
-@@ -70,6 +95,7 @@ void draw_status_bar(void)
+@@ -70,8 +95,8 @@ void draw_status_bar(void)
                                      th->text_secondary, 0x0000, &font_medium);
              /* Brief delay so user can see the message */
              for (volatile uint32_t d = 0; d < 100000000; d++);
-+            power_off_notify_and_wait();     /* a connected Pi closes its files */
-             GPIOC->clr = (1U << 9);  /* PC9 LOW = power off */
-             while (1);
+-            GPIOC->clr = (1U << 9);  /* PC9 LOW = power off */
+-            while (1);
++            power_off_or_dark_sleep();       /* off; on USB (charging) dark sleep instead of a hang */
++            shutdown_timer = 0;
          }
-@@ -91,6 +117,17 @@ void draw_info_bar(void)
+     }
+ }
+@@ -91,6 +116,17 @@ void draw_info_bar(void)
          meter_softkeys_draw();
          return;
      }
