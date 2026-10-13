@@ -867,6 +867,7 @@ class Hub:
         self.battery_mv = None
         self.quiesced_idle = False
         self.IDLE_STOP_S = 180
+        self.scope_off = False          # firmware r18+: slp=2 = switched off with POWER while USB keeps it powered
         self.logging = False            # measurement logger: one row per frame, in memory
         self.log_rows = []
         self.log_started = None
@@ -895,8 +896,10 @@ class Hub:
             if not stopped:
                 self.quiesced_idle = False
             self.mode = ("paused (RUN off)" if not self.run else "stopped (idle, scope may auto-off)" if stopped
+                         else "scope switched off (USB keeps it powered; 1 Hz check, not recording)" if self.scope_off
                          else "idle (1 Hz, no viewer)" if idle else "streaming")
-            if not self.run or (idle and self.latest and time.time() - self.latest["t"] < 1.0) or stopped:
+            slow = (idle or self.scope_off) and self.latest and time.time() - self.latest["t"] < 1.0
+            if not self.run or slow or stopped:
                 time.sleep(0.05)
                 continue
             try:
@@ -921,6 +924,13 @@ class Hub:
             if h.get("off") and recorder is not None and time.time() >= recorder.paused_until:
                 recorder.paused_until = time.time() + 15.0      # resumes if power did not drop
                 recorder.quiesce("scope power-off notice")
+            # Switched off with POWER while USB holds the rail up (dark sleep, only a button
+            # wakes it): keep checking once a second, record nothing until it is back on.
+            was_off, self.scope_off = self.scope_off, h.get("slp") == 2
+            if self.scope_off and recorder is not None:
+                if not was_off:
+                    recorder.quiesce("scope switched off (dark sleep on USB power)")
+                recorder.paused_until = max(recorder.paused_until, time.time() + 3.0)
             now = time.time()
             times = [t for t in times if now - t < 3.0] + [now]
             self.fps = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else 0.0
