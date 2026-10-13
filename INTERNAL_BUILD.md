@@ -17,7 +17,7 @@ photos, not guessed.**
 | Part | Why | Example |
 |---|---|---|
 | 5 V buck-boost regulator **with EN pin and true shutdown** | battery (3.0–4.2 V) → 5 V for the Pi, switched by the scope | [Pololu S9V11F5](https://www.pololu.com/product/2836) (2–16 V in, EN, 7.6 × 11.4 mm, ~$7) |
-| Resettable fuse, ~750 mA–1 A hold | a short on the Pi side must not reach the Li-ion cell | any 1206/0805 or leaded PTC polyfuse |
+| Resettable fuse (PTC), **1.35 A hold / ~2.7 A trip**, ≥6 V | a short on the Pi side (or on the wires leaving the case) must not reach the Li-ion cell | Bourns MF-R135 or Littelfuse RXEF135 (radial, easy inline). Sizing: Pi Zero 2 W peak ~3 W → ~1.07 A from a 3.3 V cell at ~85 % efficiency; a 1.1 A-hold part derates to ~0.94 A at 50 °C and could nuisance-trip, so 1.35 A. Power wires 26 AWG |
 | DPDT micro slide switch | moves the USB data lines between "Pi" and "external" | any SMD/through-hole DPDT, 2 positions |
 | Resistors 15 kΩ + 22 kΩ | VBUS sense divider (5 V → ~3 V for a Pi GPIO) | 1/8 W or 0603 |
 | Resistor 10 kΩ | in series with the regulator's EN wire | |
