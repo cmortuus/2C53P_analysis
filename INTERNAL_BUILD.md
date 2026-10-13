@@ -29,6 +29,12 @@ power socket (the Pi is fed on its 5 V pin instead), the scope's VBUS for the Pi
 
 ## 2. Connections
 
+Pictures: [scope-side taps](docs/internal_build/scope_taps.jpg) (battery +/−, 3V3, GND marked on
+OpenScope's photo of a V1.4 board; USB D+/D−/VBUS still to be located from a photo of this unit's
+USB-C area) and [Pi pins](docs/internal_build/pi_pins.png) (pins 2, 6, 11 and the USB data port,
+drawn in the bench orientation: SD card up, header on the right). Regenerate with
+`tools/make_build_images.py`.
+
 ```
  scope battery +  ──[ PTC fuse ]──► S9V11F5 VIN          S9V11F5 VOUT ──► Pi 5V  (header pin 2)
  scope battery −  ─────────────────► S9V11F5 GND ─────────────────────► Pi GND  (header pin 6)
