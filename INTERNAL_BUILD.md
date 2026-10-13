@@ -10,6 +10,30 @@ main board (especially around the USB-C port, the battery connector and the SWD 
 send them. The exact solder points for D+/D−, 3V3 and the battery are confirmed from those
 photos, not guessed.**
 
+
+## 0. Current plan (2026-10-13): Pi mounted OUTSIDE the case, latching power switch
+
+Supersedes the internal D+/D− tap, the regulator and the data switch below (kept for reference).
+
+- **Data:** short right-angle USB-C → micro-USB cable from the scope's port to the Pi's "USB" port,
+  **5 V wire cut** (D+, D−, GND kept). The Pi's USB host mode is forced in software if needed.
+- **Power:** the Pi runs at battery voltage (no regulator; the owner's choice, and it runs). It is
+  reliable above about 3.4 V, and the scope turns itself off at 3.3 V.
+- **Switch:** Pololu Mini Pushbutton Power Switch **LV #2808** (2.2–16 V, latching, ~0.01 µA off; not the SV,
+  which needs ≥4.5 V; pololu.com, not on Amazon). Wiring:
+  ```
+  battery + ──[1.35 A PTC]──► switch VIN        switch VOUT ──► Pi pin 2
+  battery − ────────────────► switch GND ──────────────────────► Pi pin 6
+  scope 3V3 ──[10k]─────────► switch ON          scope on  ⇒ latches on ⇒ Pi boots
+  scope 3V3 ──[22k]─────────► Pi GPIO17 (pin 11) scope off ⇒ clean Linux shutdown (gpio-shutdown)
+  Pi GPIO27 (pin 13) ───────► switch OFF         end of shutdown ⇒ gpio-poweroff raises it ⇒ power cut
+  ```
+- **Pi config (enable ONLY after the wiring exists, or pin 11 floating low shuts it down at boot):**
+  `dtoverlay=gpio-shutdown,gpio_pin=17,active_low=1,gpio_pull=down` and `dtoverlay=gpio-poweroff,gpiopin=27`
+  in `/boot/firmware/config.txt`. Test: scope off → Pi halts → switch LED off; scope on → Pi boots.
+- **Manual fallback** (owner's option): a ≥2 A toggle in the battery + lead instead of the switch board,
+  plus the pin-11 shutdown trigger; flip it off after the Pi's LED stops.
+
 ---
 
 ## 1. Parts
