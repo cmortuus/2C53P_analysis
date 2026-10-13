@@ -85,3 +85,22 @@ def pi():
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     print(scope()); print(pi())
+
+
+def own_board(src):
+    """The owner's own board (2C53T-V1.4_20250507), USB-C corner: confirmed taps marked."""
+    im = Image.open(src).convert("RGB").crop((0, 60, 260, 360)).resize((780, 900), Image.LANCZOS)
+    d = ImageDraw.Draw(im)
+    def m(x, y, n, col, r=22):
+        d.ellipse([x - r, y - r, x + r, y + r], outline=col, width=6)
+        d.ellipse([x + r - 4, y - r - 36, x + r + 32, y - r], fill=col)
+        d.text((x + r + 14, y - r - 18), str(n), font=F(28), fill=WHT, anchor="mm")
+    m(331, 548, 1, RED); m(286, 548, 2, YEL); m(262, 806, 3, BLU, 18); m(350, 806, 4, YEL, 18)
+    d.rectangle([215, 190, 340, 340], outline=(255, 120, 0), width=5)
+    d.text((40, 160), "USB-C: D+ / D- / VBUS still to locate", font=F(26), fill=(255, 140, 0))
+    leg = [(RED, "1 Battery +"), (YEL, "2 Battery -  and  4 GND (same ground)"), (BLU, "3 3V3 (square pad)"), (WHT, "Your board: 2C53T-V1.4_20250507")]
+    canvas = Image.new("RGB", (im.width, im.height + 190), BLK); canvas.paste(im, (0, 0))
+    d = ImageDraw.Draw(canvas)
+    for i, (c, t) in enumerate(leg):
+        d.text((30, im.height + 20 + i * 42), t, font=F(32), fill=c)
+    p = os.path.join(OUT, "own_board_taps.jpg"); canvas.save(p, quality=90); return p
