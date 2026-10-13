@@ -51,6 +51,10 @@ drawn in the bench orientation: SD card up, header on the right). Regenerate wit
 ```
 
 Rules:
+- **Switching:** the battery only feeds the regulator; the scope's 3V3 on EN switches it. Scope on ⇒ Pi on,
+  scope off (on battery) ⇒ Pi off. On USB the scope's rails stay up even when "off", so the Pi stays on
+  while charging. The owner OK'd that (2026-10-13): it keeps recording and stays reachable. Before
+  soldering, confirm with a meter that the 3V3 pad reads 0 V with the scope off on battery.
 - **Never connect the Pi's 5 V to the scope's VBUS.** The scope would then "charge" its own battery
   from its own battery through two converters.
 - The switch only connects or disconnects the Pi's data pair. The scope's USB-C connector stays
