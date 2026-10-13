@@ -63,5 +63,5 @@ the matching setting.
 - `cnc levels --family 3v3`: highs 3.27 V and lows −20 mV. The timebase switched to 5 MS/s by itself to resolve the 5 µs plateaus.
 - `cnc rail --nominal 3.3`: level PASS. Ripple MARGINAL, correctly: a 66 mV limit is below the range-6 noise floor.
 - `cnc bounce`: a synthetic 6-pulse bounce from the Pi's GPIO (direct register writes) read 13 transitions over 3.95 ms and settled high, matching the ~3.8 ms that was sent.
-- `cnc encoder`: synthetic tests only so far, because CH2 is not on a source.
+- `cnc encoder`: CH1 on GPIO18, CH2 on GPIO12, driven by a real-time quadrature generator on the Pi (250 Hz, 90°): 20/20 frames PASS, phase 90.0°, duty cycle 50/50, direction A leads B, 15.0 rpm at 1000 lines. Earlier it FAILed while CH1's hook had lost contact (A stuck high or low for 40 ms at a time), which shows it catches a dropped encoder channel.
 - Tests: `tests/test_cnc_checks.py` (14 tests); whole suite 28/28.
