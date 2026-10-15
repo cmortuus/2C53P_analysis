@@ -149,6 +149,18 @@ the Pi Zero: ~4 MS/s for seconds, 24 MS/s for short bursts (USB 2 + RAM; 64 M sa
 - Encoder / quadrature: "CH1 on A, CH2 on B, both ground clips on the encoder GND."
 - Motor phase / anything switching: "×10, and clip only to earth ground."
 
+## Probe touches, battery, checks from the phone (2026-10-14)
+- **Probe-touch capture (on by default):** the scope idles at a touch-ready setting (range 8, 20 ms records). When a
+  probe touches a signal, the Pi picks each channel's range and records at 4 timebases (5 MS/s, 500 kS/s,
+  50 kS/s, 12.5 kS/s) within ~1.5 s, analyses it, saves `<records>/touches/<id>.json` and adds a marker. Two seconds of
+  contact is enough. `scopectl touches [id]`, `scopectl touch-mode on|off|resume|show`. It pauses for 60 s after any
+  manual command (viewer controls, scopectl, raw shell) and while a CNC job runs, so it never fights manual work.
+  Every frame is still recorded (tagged with the touch id).
+- **Battery:** `scopectl battery` (also in `health` and the viewer's BAT chip): level, charging/discharging trend,
+  minutes to empty, and a warning when it drains while the Pi is on its own supply (= the scope is not charging).
+- **CNC checks as jobs on the Pi:** `POST /api/cnc/run {check, params}` or the viewer's "CNC checks" card; results in
+  `<records>/cnc/<id>.json` with the time window, so the raw frames can be re-evaluated (`scopectl replay`).
+
 ## CNC-flavoured checks the tool can do today
 **PASS/FAIL checks: `scopectl cnc step|encoder|levels|rail|bounce`. The runbook for wiring each one, in
 order, is [CNC_BRINGUP.md](CNC_BRINGUP.md).** The manual equivalents:

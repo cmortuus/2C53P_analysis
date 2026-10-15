@@ -27,7 +27,7 @@ Owns the scope's USB CDC shell and serves:
 
 Only the standard library + pyserial. Run:  python3 scope_server.py [--http 8080] [--tcp 7001]
 """
-import argparse, base64, glob, json, math, os, re, socket, socketserver, struct, subprocess, threading, time, zlib
+import argparse, base64, collections, glob, json, math, os, re, socket, socketserver, struct, subprocess, threading, time, zlib
 sys_path_dir = os.path.dirname(os.path.abspath(__file__))
 import sys
 sys.path.insert(0, sys_path_dir)
@@ -536,6 +536,8 @@ class Recorder:
         meta = {"hdr": fr["hdr"], "rate": fr["rate"], "vpc1": fr["vpc1"], "vpc2": fr["vpc2"],
                 "zero1": fr.get("zero1", 0.0), "zero2": fr.get("zero2", 0.0), "seq": fr["seq"], "n": len(c1),
                 "seam": fr.get("seam", 0), "valid": fr.get("valid", len(c1))}
+        if fr.get("touch"):
+            meta["touch"] = fr["touch"]
         mb = json.dumps(meta, separators=(",", ":")).encode()
         rec = self.MAGIC + struct.pack("<dI", fr["t"], len(mb)) + mb + c1 + c2
         with self.lock:
@@ -782,6 +784,400 @@ def find_events(recorder, t0, t1, conds, gap=2.0, limit_rows=200000):
     return {"scanned": scanned, "matched": matched, "events": events}
 
 
+class BatteryLog:
+    """Scope battery history from every frame header's bat= (mV), persisted to battery.jsonl, with a
+    trend and a plain verdict. Exists because on 2026-10-13 the cell drained to 2.98 V unnoticed
+    (the Pi was wired to it and nothing charged it) and a day of CNC work went without the scope."""
+    EMPTY_MV, LOW_MV = 3300, 3500                       # firmware critical shutdown ~3.3 V
+    PCT = [(3300, 0), (3500, 5), (3600, 12), (3650, 20), (3700, 30), (3750, 40), (3800, 50),
+           (3900, 65), (4000, 80), (4100, 90), (4200, 100)]   # resting Li-ion, approximate
+
+    def __init__(self, root):
+        self.path = os.path.join(root, "battery.jsonl") if root else None
+        self.samples = collections.deque(maxlen=24 * 360)    # one per 10 s, 24 h
+        self.last_saved = 0.0
+        if self.path and os.path.exists(self.path):
+            cut = time.time() - 86400
+            try:
+                with open(self.path) as f:
+                    for ln in f:
+                        try:
+                            d = json.loads(ln)
+                        except ValueError:
+                            continue
+                        if d.get("t", 0) >= cut and d.get("mv"):
+                            self.samples.append((d["t"], int(d["mv"])))
+            except OSError:
+                pass
+
+    def add(self, t, mv):
+        if not mv or mv < 2000 or mv > 4600:
+            return
+        if self.samples and t - self.samples[-1][0] < 10.0:
+            return
+        self.samples.append((t, int(mv)))
+        if self.path and t - self.last_saved >= 60.0:
+            self.last_saved = t
+            try:
+                with open(self.path, "a") as f:
+                    f.write(json.dumps({"t": round(t, 1), "mv": int(mv)}) + "\n")
+            except OSError:
+                pass
+
+    @classmethod
+    def pct(cls, mv):
+        tb = cls.PCT
+        if mv <= tb[0][0]:
+            return 0
+        for (v0, p0), (v1, p1) in zip(tb, tb[1:]):
+            if mv <= v1:
+                return round(p0 + (p1 - p0) * (mv - v0) / (v1 - v0))
+        return 100
+
+    def slope_mv_per_h(self, window_s=1200):
+        now = time.time()
+        pts = [(t, v) for t, v in self.samples if now - t <= window_s]
+        if len(pts) < 6 or pts[-1][0] - pts[0][0] < 300:
+            return None
+        n = len(pts); mt = sum(t for t, _ in pts) / n; mv = sum(v for _, v in pts) / n
+        den = sum((t - mt) ** 2 for t, _ in pts)
+        return (sum((t - mt) * (v - mv) for t, v in pts) / den * 3600.0) if den else None
+
+    def status(self, pi_external=None):
+        if not self.samples:
+            return {"mv": None, "state": "unknown", "warnings": ["no battery reading yet (scope not connected?)"]}
+        t, mv = self.samples[-1]
+        recent = [v for tt, v in self.samples if t - tt <= 60]
+        mv_s = sorted(recent)[len(recent) // 2]               # median of the last minute: ADC noise
+        sl = self.slope_mv_per_h()
+        state = "unknown (need ~5 min of data)" if sl is None else "charging" if sl > 25 else "discharging" if sl < -25 else "steady"
+        d = {"mv": mv_s, "pct_approx": self.pct(mv_s), "slope_mv_per_h": None if sl is None else round(sl),
+             "state": state, "age_s": round(time.time() - t, 1), "warnings": []}
+        if state == "discharging":
+            d["minutes_to_empty"] = max(0, round((mv_s - self.EMPTY_MV) / -sl * 60))
+        w = d["warnings"]
+        if mv_s < self.EMPTY_MV:
+            w.append("CRITICAL %.2f V: the scope will switch itself off; charge it now" % (mv_s / 1000))
+        elif mv_s < self.LOW_MV:
+            w.append("LOW %.2f V: charge soon" % (mv_s / 1000))
+        if state == "discharging" and pi_external:
+            w.append("NOT CHARGING although the Pi is on its own supply: the Pi's USB cable should be charging the scope "
+                     "(5 V wire intact? Pi supply strong enough?) - use a USB-C charger on the scope if this persists")
+        if state == "discharging" and d.get("minutes_to_empty") is not None and d["minutes_to_empty"] < 60:
+            w.append("about %d min until the scope shuts down" % d["minutes_to_empty"])
+        return d
+
+    def history(self, hours=24.0, step_s=300.0):
+        cut = time.time() - hours * 3600
+        out, last = [], 0.0
+        for t, v in self.samples:
+            if t >= cut and t - last >= step_s:
+                out.append([round(t), v]); last = t
+        return out
+
+
+class CncJobs:
+    """Runs `scopectl cnc <check>` (host/cnc_checks.py) ON THE PI as a background job, so a check can be
+    started from the viewer (a phone at the machine) without the assistant. One job at a time (they move
+    the scope's settings). Every job is saved to <records>/cnc/<id>.json with its log, the parsed result
+    and the time window, so the raw frames it saw can be re-evaluated later (`scopectl replay --from/--to`)."""
+    CHECKS = ("step", "encoder", "levels", "rail", "bounce")
+    VALUES = {"ch", "frames", "active", "dir-ch", "min-pulse", "min-space", "min-setup", "min-hold", "max-rate",
+              "steps-per-mm", "lines", "family", "vil", "vih", "nominal", "tol", "ripple", "seconds", "tb",
+              "edge", "vhigh", "window", "timeout", "debounce"}
+    FLAGS = {"no-autoset", "no-default-spec", "provisional"}
+    SAFE = re.compile(r"^[\w.+-]{1,24}$")
+
+    def __init__(self, root, http_port):
+        self.dir = os.path.join(root, "cnc")
+        os.makedirs(self.dir, exist_ok=True)
+        self.port = http_port
+        self.jobs = collections.OrderedDict()
+        self.lock = threading.Lock()
+        self.current = None
+        for fn in sorted(os.listdir(self.dir))[-50:]:            # recent history survives restarts
+            if fn.endswith(".json"):
+                try:
+                    with open(os.path.join(self.dir, fn)) as f:
+                        j = json.load(f)
+                    self.jobs[j["id"]] = j
+                except Exception:
+                    pass
+
+    @property
+    def busy(self):
+        return self.current is not None
+
+    def start(self, check, params):
+        if check not in self.CHECKS:
+            raise ValueError("check must be one of %s" % ", ".join(self.CHECKS))
+        argv = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scopectl.py"),
+                "--url", "http://127.0.0.1:%d" % self.port, "cnc", check, "--json"]
+        clean = {}
+        for k, v in (params or {}).items():
+            k = str(k).lstrip("-")
+            if k in self.FLAGS:
+                if v in (True, 1, "1", "true", "on"):
+                    argv.append("--" + k); clean[k] = True
+            elif k in self.VALUES:
+                if v is None or str(v).strip() == "":
+                    continue
+                v = str(v).strip()
+                if not self.SAFE.match(v):
+                    raise ValueError("bad value for %s: %r" % (k, v))
+                argv += ["--" + k, v]; clean[k] = v
+            else:
+                raise ValueError("unknown parameter %r" % k)
+        with self.lock:
+            if self.current:
+                raise RuntimeError("check %s is still running" % self.current)
+            jid = time.strftime("%Y%m%d_%H%M%S_") + check
+            job = {"id": jid, "check": check, "params": clean, "state": "running", "started": time.time(),
+                   "ended": None, "log": [], "result": None, "verdict": None, "exit": None}
+            self.jobs[jid] = job
+            while len(self.jobs) > 200:
+                self.jobs.popitem(last=False)
+            self.current = jid
+        threading.Thread(target=self._run, args=(job, argv), daemon=True).start()
+        return job
+
+    def _run(self, job, argv):
+        out = []
+        try:
+            p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                 env=dict(os.environ, PYTHONUNBUFFERED="1"))
+            json_started = False
+            for ln in p.stdout:
+                out.append(ln)
+                if ln.startswith("{"):
+                    json_started = True
+                if not json_started:
+                    job["log"].append(ln.rstrip("\n"))
+            job["exit"] = p.wait(timeout=900)
+            text = "".join(out)
+            k = text.find("\n{")
+            if k >= 0 or text.startswith("{"):
+                try:
+                    job["result"] = json.loads(text[k + 1:] if k >= 0 else text)
+                except ValueError:
+                    pass
+            r = job["result"] or {}
+            job["verdict"] = r.get("verdict") or (r.get("worst") or {}).get("verdict") or ("ERROR" if job["exit"] not in (0, 1) else None)
+            job["state"] = "done"
+        except Exception as e:
+            job["log"].append("job failed: %s" % e)
+            job["state"] = "error"; job["verdict"] = "ERROR"
+        finally:
+            job["ended"] = time.time()
+            with self.lock:
+                self.current = None
+            try:
+                with open(os.path.join(self.dir, job["id"] + ".json"), "w") as f:
+                    json.dump(job, f, default=str)
+            except OSError as e:
+                log("cnc job not saved:", e)
+
+    def summary(self):
+        return [{k: j.get(k) for k in ("id", "check", "params", "state", "verdict", "started", "ended")}
+                for j in reversed(list(self.jobs.values()))]
+
+
+class TouchCapture:
+    """Probe-touch capture: a 2-second contact must be enough. While idle the scope sits at a
+    TOUCH-READY setting (coarsest calibrated range, 20 ms records). When a channel goes from flat to
+    showing a signal, a burst runs from the hub loop (no HTTP, ~1.5 s): set each touched channel's
+    range from the measured top/base, then record at four timebases (5 MS/s edges, 500 kS/s, 50 kS/s
+    mains-scale, 12.5 kS/s slow). Every frame is recorded as usual and tagged with the burst; the burst
+    is analysed on the Pi (scope_analysis) and saved to <records>/touches/<id>.json, plus a marker.
+    While the signal stays, the scope stays at the burst's range and 50 kS/s; when it goes flat for 1 s
+    it returns to touch-ready. Suspended while a CNC job runs or someone drove the scope in the last
+    60 s (so it never fights manual work); /api/touch turns it on/off."""
+    READY_RANGE = 8                                           # ~279 mV/count: 24 V field I/O fits, 3.3 V logic = 12 counts
+    READY_TB = 0x0E
+    PLAN = [(0x08, 4), (0x0B, 3), (0x0E, 3), (0x10, 2)]      # (timebase, frames kept)
+    SWING = 8                                                 # counts of swing that mean "a signal"
+    SHIFT = 5                                                 # counts of DC shift from the flat baseline
+
+    def __init__(self, root):
+        self.dir = os.path.join(root, "touches")
+        os.makedirs(self.dir, exist_ok=True)
+        self.enabled = True
+        self.state = "init"           # init -> ready -> burst -> holding -> ready
+        self.base = {1: None, 2: None}
+        self.flat_since = None
+        self.burst = None
+        self.manual_until = 0.0
+        self.last = None              # summary of the latest burst
+
+    # -- helpers --------------------------------------------------------------------------
+    @staticmethod
+    def _sig(raw):
+        mn, mx = min(raw), max(raw)
+        return mx - mn, sum(raw) / len(raw)
+
+    def _best_range(self, ch, raw, rng):
+        """Finest calibrated range that holds top and base inside +/-3.4 div, from a coarse frame."""
+        mv_now = MV_PER_COUNT[ch][rng]
+        if not mv_now:
+            return rng
+        z = calib_zero(ch, rng)
+        vmax = (max(raw) - 128 - z) * mv_now / 1000.0
+        vmin = (min(raw) - 128 - z) * mv_now / 1000.0
+        need = max(abs(vmax), abs(vmin)) * 1.15
+        for r in sorted((r for r in range(10) if MV_PER_COUNT[ch][r] and RANGE_TIER[r] != "none"), key=lambda r: MV_PER_COUNT[ch][r]):
+            if need <= 3.4 * COUNTS_PER_DIV * MV_PER_COUNT[ch][r] / 1000.0:
+                return r
+        return rng
+
+    def _cmd(self, scope, line):
+        try:
+            scope.cmd(line, timeout=2.0)
+        except Exception as e:
+            log("touch: %s failed: %s" % (line, e))
+
+    def ready(self, scope):
+        for ch in (1, 2):
+            self._cmd(scope, "fpga scope vdiv %d %d" % (ch, self.READY_RANGE))
+        self._cmd(scope, "fpga scope timebase 0x%02X" % self.READY_TB)
+        self._cmd(scope, "fpga scope trigmode auto")
+        self.state = "ready"
+        self.base = {1: None, 2: None}
+        self.flat_since = time.time()
+
+    def note_manual(self):
+        self.manual_until = time.time() + 60.0
+
+    # -- called by the hub for every frame (loop thread) ----------------------------------
+    def on_frame(self, hub, h, c1, c2):
+        """c1/c2: continuous part of the record. Returns a tag dict for the recorder, or None."""
+        if not self.enabled or (cnc is not None and cnc.busy) or time.time() < self.manual_until:
+            if self.state not in ("off",):
+                self.state = "suspended" if self.enabled else "off"
+            return None
+        scope = hub.scope
+        if self.state in ("init", "off", "suspended"):
+            self.ready(scope)
+            return None
+        sig = {1: self._sig(c1), 2: self._sig(c2)}
+        if self.state == "ready":
+            if h.get("rng1") != self.READY_RANGE or h.get("rng2") != self.READY_RANGE or h.get("tb") != self.READY_TB:
+                return None                                   # settings not applied yet
+            touched = []
+            for ch in (1, 2):
+                swing, mean = sig[ch]
+                if self.base[ch] is None:
+                    self.base[ch] = mean
+                    continue
+                if swing >= self.SWING or abs(mean - self.base[ch]) >= self.SHIFT:
+                    touched.append(ch)
+                elif swing < self.SWING / 2:
+                    self.base[ch] = 0.9 * self.base[ch] + 0.1 * mean       # follow slow drift
+            if not touched:
+                return None
+            raws = {1: bytes(c1), 2: bytes(c2)}
+            rng = {ch: self._best_range(ch, raws[ch], h.get("rng%d" % ch)) if ch in touched else self.READY_RANGE for ch in (1, 2)}
+            bid = time.strftime("%Y%m%d_%H%M%S")
+            self.burst = {"id": bid, "t0": time.time(), "touched": touched, "ranges": rng, "step": 0, "kept": 0,
+                          "skip": 1, "frames": [], "detect": {ch: {"swing": sig[ch][0], "mean": round(sig[ch][1], 1)} for ch in (1, 2)}}
+            for ch in (1, 2):
+                if rng[ch] != h.get("rng%d" % ch):
+                    self._cmd(scope, "fpga scope vdiv %d %d" % (ch, rng[ch]))
+            self._cmd(scope, "fpga scope timebase 0x%02X" % self.PLAN[0][0])
+            self.state = "burst"
+            log("touch: CH%s, ranges %s -> burst %s" % ("+".join(map(str, touched)), rng, bid))
+            return {"touch": bid, "step": "detect"}
+        if self.state == "burst":
+            b = self.burst
+            tb, keep = self.PLAN[b["step"]]
+            if h.get("tb") != tb or any(h.get("rng%d" % ch) != b["ranges"][ch] for ch in (1, 2)):
+                return {"touch": b["id"], "step": "settling"}
+            if b["skip"]:
+                b["skip"] -= 1                                # first record after a change may be stale
+                return {"touch": b["id"], "step": "settling"}
+            b["frames"].append((tb, h, bytes(c1), bytes(c2)))
+            b["kept"] += 1
+            tag = {"touch": b["id"], "step": "tb 0x%02X" % tb}
+            if b["kept"] >= keep:
+                b["step"] += 1; b["kept"] = 0; b["skip"] = 1
+                if b["step"] < len(self.PLAN):
+                    self._cmd(scope, "fpga scope timebase 0x%02X" % self.PLAN[b["step"]][0])
+                else:
+                    b["t1"] = time.time()
+                    self._cmd(scope, "fpga scope timebase 0x%02X" % self.READY_TB)
+                    threading.Thread(target=self._finish, args=(b,), daemon=True).start()
+                    self.state = "holding"; self.flat_since = None
+            return tag
+        if self.state == "holding":
+            flat = all(sig[ch][0] < self.SWING / 2 for ch in (1, 2))
+            if flat:
+                self.flat_since = self.flat_since or time.time()
+                if time.time() - self.flat_since > 1.0:
+                    self.ready(scope)
+            else:
+                self.flat_since = None
+            return None
+        return None
+
+    # -- analysis (worker thread) ---------------------------------------------------------
+    def _finish(self, b):
+        out = {"id": b["id"], "t0": b["t0"], "t1": b.get("t1"), "touched": b["touched"], "ranges": b["ranges"],
+               "detect": b["detect"], "timebases": {}, "summary": {}}
+        try:
+            for ch in b["touched"]:
+                for tb, _ in self.PLAN:
+                    recs = []
+                    for ftb, h, c1, c2 in b["frames"]:
+                        if ftb != tb:
+                            continue
+                        raw = c1 if ch == 1 else c2
+                        rng = h.get("rng%d" % ch)
+                        vpc = h.get("vpc%d_nv" % ch, 0) / 1e9 * calib_gain(ch, rng)
+                        rate = RATE_OVERRIDE.get(tb) or h.get("rate_hz") or TIMEBASE_RATE.get(tb, 0)
+                        recs.append({"raw": raw, "clean": True, "rate": rate, "vpc": vpc, "zero": calib_zero(ch, rng),
+                                     "probe": 10 if h.get("prb%d" % ch) else 1, "cpl": ["DC", "AC", "GND"][h.get("cpl%d" % ch, 0)],
+                                     "rng": rng, "tier": RANGE_TIER[rng], "enabled": True, "channel": ch,
+                                     "counts_per_div": COUNTS_PER_DIV, "gain": calib_gain(ch, rng)})
+                    if not recs or SA is None:
+                        continue
+                    d = SA.analyze_records(recs)
+                    keep = {k: d.get(k) for k in ("summary", "flags", "shape", "freq_hz", "duty", "top", "base", "vpp", "mean",
+                                                  "rms_ac", "amp_top_base", "span_counts", "clipped", "range", "rate_sps")}
+                    keep["pulse"] = d.get("pulse")
+                    out["timebases"].setdefault("ch%d" % ch, {})["0x%02X" % tb] = keep
+                # one line per channel: the most informative timebase = most periods resolved without clipping
+                tbs = out["timebases"].get("ch%d" % ch, {})
+                best = None
+                for code, d in tbs.items():
+                    score = (0 if d.get("clipped") else 2) + (1 if d.get("freq_hz") else 0) + min(d.get("span_counts") or 0, 200) / 200.0
+                    if best is None or score > best[0]:
+                        best = (score, code, d)
+                if best:
+                    out["summary"]["ch%d" % ch] = best[2]["summary"]
+        except Exception as e:
+            out["error"] = "%s: %s" % (type(e).__name__, e)
+        try:
+            with open(os.path.join(self.dir, b["id"] + ".json"), "w") as f:
+                json.dump(out, f, default=str)
+            if recorder is not None:
+                with open(os.path.join(recorder.root, "markers.jsonl"), "a") as f:
+                    f.write(json.dumps({"t": b["t0"], "text": "probe touch %s CH%s" % (b["id"], "+".join(map(str, b["touched"])))}) + "\n")
+        except OSError as e:
+            log("touch: save failed:", e)
+        self.last = {k: out[k] for k in ("id", "t0", "touched", "summary")}
+        log("touch %s: %s" % (b["id"], " | ".join("%s: %s" % kv for kv in out["summary"].items())[:300]))
+
+    def list(self, n=30):
+        out = []
+        for fn in sorted(os.listdir(self.dir), reverse=True)[:n]:
+            try:
+                with open(os.path.join(self.dir, fn)) as f:
+                    d = json.load(f)
+                out.append({k: d.get(k) for k in ("id", "t0", "touched", "ranges", "summary", "error")})
+            except Exception:
+                pass
+        return out
+
+
 class RefSignal:
     """The calibration reference on GPIO18 (header pin 12) AND GPIO12 (header pin 32, the same
     PWM0 channel via ALT0, so a second probe gets the identical signal): hardware PWM from the Pi's crystal,
@@ -888,7 +1284,7 @@ class Hub:
             else:
                 self.ext_power = True
             always = recorder is not None and (recorder.user_forced or (recorder.forced and self.ext_power))
-            idle = self.viewers == 0 and not self.logging and not always
+            idle = self.viewers == 0 and not self.logging and not always and not (cnc is not None and cnc.busy)
             stopped = idle and time.time() - self.last_interest > self.IDLE_STOP_S
             if stopped and not self.quiesced_idle and recorder is not None:
                 recorder.quiesce("idle (no viewer, on battery or recording off)")
@@ -921,6 +1317,7 @@ class Hub:
             if "ext" in h:
                 self.scope_ext_hdr = bool(h["ext"])
                 self.battery_mv = h.get("bat")
+                battery.add(time.time(), h.get("bat"))
             if h.get("off") and recorder is not None and time.time() >= recorder.paused_until:
                 recorder.paused_until = time.time() + 15.0      # resumes if power did not drop
                 recorder.quiesce("scope power-off notice")
@@ -969,6 +1366,13 @@ class Hub:
                   "zero1": z1, "zero2": z2, "seam": seam_k, "valid": valid, "unit1": u1, "unit2": u2,
                   "meas": {"ch1": measure(c1[:valid], vpc1, rate, z1, u1), "ch2": measure(c2[:valid], vpc2, rate, z2, u2)},
                   "fps": round(self.fps, 1), "errors": self.errors}
+            if touch is not None:
+                try:
+                    tag = touch.on_frame(self, h, c1[:valid], c2[:valid])
+                    if tag:
+                        fr["touch"] = tag
+                except Exception as e:
+                    log("touch:", e)
             if recorder is not None:
                 try:
                     recorder.write(fr, c1, c2)
@@ -1129,8 +1533,38 @@ def make_http_handler(hub):
                     "power": {"pi_power": hub.pi_power, "external": hub.ext_power, "battery_mv": hub.battery_mv,
                               "scope_ext_flag": hub.scope_ext_hdr,
                               "vbus_gpio": (hub.vbus.line if hub.vbus else None), "vbus_err": (hub.vbus.err if hub.vbus else None)},
-                    "hub_mode": hub.mode,
+                    "hub_mode": hub.mode, "battery": battery.status(hub.ext_power if hub.pi_power == "external" else None),
+                    "cnc_busy": bool(cnc and cnc.busy),
+                    "touch": ({"enabled": touch.enabled, "state": touch.state, "last": touch.last} if touch else None),
                     "logging": hub.logging, "viewers": hub.viewers, "calib": CALIB})
+            if p == "/api/battery":
+                q = dict(x.split("=", 1) for x in self.path.split("?", 1)[1].split("&") if "=" in x) if "?" in self.path else {}
+                try:
+                    hours = max(0.1, min(24.0, float(q.get("hours", 24))))
+                except ValueError:
+                    hours = 24.0
+                d = battery.status(hub.ext_power if hub.pi_power == "external" else None)
+                d["history"] = battery.history(hours, 60 if hours <= 3 else 300)
+                return self._send(200, d)
+            if p == "/api/touch":
+                if touch is None:
+                    return self._send(200, {"enabled": False, "available": False})
+                return self._send(200, {"available": True, "enabled": touch.enabled, "state": touch.state,
+                                        "suspended_s": max(0, round(touch.manual_until - time.time())), "last": touch.last})
+            if p == "/api/touches":
+                return self._send(200, touch.list() if touch else [])
+            if p.startswith("/api/touches/"):
+                fn = os.path.join(touch.dir, re.sub(r"[^\w.-]", "", p.rsplit("/", 1)[1]) + ".json") if touch else ""
+                try:
+                    with open(fn) as f:
+                        return self._send(200, json.load(f))
+                except (OSError, ValueError):
+                    return self._send(404, {"error": "no such touch"})
+            if p == "/api/cnc/jobs":
+                return self._send(200, cnc.summary() if cnc else [])
+            if p.startswith("/api/cnc/jobs/"):
+                j = cnc.jobs.get(p.rsplit("/", 1)[1]) if cnc else None
+                return self._send(200, j) if j else self._send(404, {"error": "no such job"})
             if p == "/api/record":
                 return self._send(200, recorder.status() if recorder else {"enabled": False})
             if p == "/api/records":
@@ -1287,6 +1721,24 @@ def make_http_handler(hub):
                 req = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if self.path == "/api/touch":
+                if touch is None:
+                    return self._send(503, {"error": "touch capture not available"})
+                if "enabled" in req:
+                    touch.enabled = bool(req["enabled"])
+                    touch.state = "init" if touch.enabled else "off"
+                if req.get("resume"):
+                    touch.manual_until = 0.0
+                return self._send(200, {"enabled": touch.enabled, "state": touch.state})
+            if self.path == "/api/cnc/run":
+                if cnc is None:
+                    return self._send(503, {"error": "cnc jobs not available"})
+                try:
+                    job = cnc.start(str(req.get("check", "")), req.get("params") or {})
+                except (ValueError, RuntimeError) as e:
+                    return self._send(400, {"error": str(e)})
+                hub.last_interest = time.time()
+                return self._send(200, {"id": job["id"]})
             if self.path == "/api/la/capture":
                 if LA is None or la is None:
                     return self._send(503, {"error": "logic analyzer support not available"})
@@ -1393,6 +1845,8 @@ def make_http_handler(hub):
                 c = str(req.get("cmd", "")).strip()
                 if not any(r.match(c) for r in ALLOWED):
                     return self._send(403, {"ok": False, "out": f"not allowed from the web UI: {c!r}"})
+                if touch is not None:
+                    touch.note_manual()
                 try:
                     return self._send(200, {"ok": True, "out": scope.cmd(c)})
                 except Exception as e:
@@ -1421,6 +1875,8 @@ class TcpShell(socketserver.BaseRequestHandler):
                     if not line:
                         sock.sendall(b"\r\n> ")
                         continue
+                    if touch is not None:
+                        touch.note_manual()
                     try:
                         sock.sendall(self.scope.raw(line, 5.0))
                     except ConnectionError as e:
@@ -1440,6 +1896,9 @@ recorder = None
 indexer = None
 refsig = RefSignal()
 la = None
+battery = BatteryLog(None)
+cnc = None
+touch = None
 
 
 def urllib_unquote(x):
@@ -1481,9 +1940,10 @@ def main():
     ap.add_argument("--pi-power", choices=["external", "internal"], default="external",
                     help="internal = Pi runs off the scope battery (always-recording only while VBUS is sensed)")
     ap.add_argument("--vbus-gpio", type=int, default=17, help="GPIO with the scope's VBUS via a divider (internal build)")
+    ap.add_argument("--touch", type=int, default=1, help="1: probe-touch capture (auto range + 4-timebase burst on contact)")
     ap.add_argument("--backfill", type=int, default=0, help="1: index old segments in a background worker (costs WiFi stability)")
     a = ap.parse_args()
-    global indexer, la, BACKFILL
+    global indexer, la, BACKFILL, battery, cnc, touch
     BACKFILL = bool(a.backfill)
     if LA is not None:
         try:
@@ -1497,6 +1957,17 @@ def main():
         indexer.start()
         st = recorder.status()
         log("recorder: %s, %d segments, %.1f MB, ring %.0f GB, always=%s" % (a.records, st["segments"], st["total_mb"], a.max_gb, recorder.forced))
+    root = a.records or os.path.expanduser("~/records")
+    battery = BatteryLog(root)
+    try:
+        cnc = CncJobs(root, a.http)
+    except OSError as e:
+        log("cnc jobs disabled:", e)
+    if a.touch:
+        try:
+            touch = TouchCapture(root)
+        except OSError as e:
+            log("touch capture disabled:", e)
     scope = Scope()
     hub = Hub(scope)
     hub.pi_power = a.pi_power

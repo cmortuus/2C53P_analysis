@@ -653,6 +653,9 @@ def main():
     p = sub.add_parser("decode", help="decoders on the latest frames: steps (step/dir) or uart"); p.add_argument("proto", choices=["steps", "uart"]); p.add_argument("--ch", type=int, default=1, help="step or data channel"); p.add_argument("--dir-ch", type=int, default=2); p.add_argument("--baud", type=int, default=9600); p.add_argument("--bits", type=int, default=8); p.add_argument("--idle-low", action="store_true"); p.add_argument("--frames", type=int, default=3)
     p = sub.add_parser("avg", help="aligned average of N frames (small signals, ripple): levels + plot"); p.add_argument("--ch", type=int, default=1); p.add_argument("--frames", type=int, default=16); p.add_argument("--png")
     p = sub.add_parser("ref", help="reference waveforms on the Pi: save | list | compare"); p.add_argument("action", choices=["save", "list", "compare"]); p.add_argument("name", nargs="?"); p.add_argument("--ch", type=int, default=1); p.add_argument("--note", default=""); p.add_argument("--png")
+    p = sub.add_parser("touches", help="probe-touch captures on the Pi (auto range + 4 timebases each): list, or one in full"); p.add_argument("id", nargs="?"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("battery", help="scope battery: level, charging/discharging, time left, warnings, history"); p.add_argument("--hours", type=float, default=6)
+    p = sub.add_parser("touch-mode", help="probe-touch capture on/off/resume"); p.add_argument("action", choices=["on", "off", "resume", "show"])
     p = sub.add_parser("cnc", help="CNC bring-up checks with PASS/FAIL: step | encoder | levels | rail | bounce")
     p.add_argument("check", choices=["step", "encoder", "levels", "rail", "bounce"])
     p.add_argument("--ch", type=int, default=1); p.add_argument("--frames", type=int, default=30); p.add_argument("--no-autoset", action="store_true")
@@ -781,6 +784,42 @@ def main():
         for m in api("/api/marks?from=%f" % parse_time(a.t0)):
             print("%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(m["t"])), m["text"]))
         return
+
+    if a.cmd == "touches":
+        if a.id:
+            d = api("/api/touches/" + a.id)
+            if a.json:
+                print(json.dumps(d, indent=1)); return
+            print("touch %s  CH%s  ranges %s" % (d["id"], "+".join(map(str, d["touched"])), d["ranges"]))
+            for ch, tbs in d.get("timebases", {}).items():
+                for code, v in tbs.items():
+                    print("  %s tb %s: %s" % (ch, code, v.get("summary")))
+            return
+        for t in api("/api/touches"):
+            print("%s  %s  CH%s" % (t["id"], time.strftime("%H:%M:%S", time.localtime(t["t0"])), "+".join(map(str, t.get("touched") or []))))
+            for ch, line in (t.get("summary") or {}).items():
+                print("    " + line)
+        return
+
+    if a.cmd == "battery":
+        b = api("/api/battery?hours=%g" % a.hours)
+        if b.get("mv") is None:
+            print("no reading:", "; ".join(b.get("warnings", []))); return
+        print("battery %.3f V (~%d%%), %s%s%s" % (b["mv"] / 1000, b["pct_approx"], b["state"],
+              (", %+d mV/h" % b["slope_mv_per_h"]) if b.get("slope_mv_per_h") is not None else "",
+              (", ~%d min to empty" % b["minutes_to_empty"]) if b.get("minutes_to_empty") is not None else ""))
+        for w in b.get("warnings", []):
+            print("  !! " + w)
+        hist = b.get("history", [])
+        if hist:
+            print("  history: " + "  ".join("%s %.2f" % (time.strftime("%H:%M", time.localtime(t)), v / 1000) for t, v in hist[-12:]))
+        return
+
+    if a.cmd == "touch-mode":
+        if a.action == "show":
+            print(json.dumps(api("/api/touch"), indent=1)); return
+        body = {"resume": True} if a.action == "resume" else {"enabled": a.action == "on"}
+        print(json.dumps(api("/api/touch", body))); return
 
     if a.cmd == "cnc":
         r = cnc(a, info)

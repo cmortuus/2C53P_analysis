@@ -68,6 +68,7 @@
       <div class="chip ch2" id="chip2"><span class="tag">CH2</span><span class="val" id="s2">—</span></div>
       <div class="chip h"><span class="tag">H</span><span class="val" id="sh">—</span></div>
       <div class="chip trig"><span class="tag" style="background:#f8a800">T</span><span class="val" id="st">—</span></div>
+      <div class="chip" id="batchip" title="scope battery"><span class="tag" style="background:#3a4250">BAT</span><span class="val" id="sbat">—</span></div>
       <div class="spacer"></div>
       <div class="link"><span class="dot" id="dot"></span><span id="fps">offline</span></div>
       <button class="pill run" id="runbtn">RUN</button>
@@ -143,6 +144,31 @@
         <button class="b" id="logdl" title="download the current log as CSV">Log CSV</button>
       </div>
       <div class="hint">Device screen = the scope's own LCD, fetched over the shell (16-colour copy; the olive grid shows gray). The trigger is parked in Single for the capture and restored.</div>
+    </div>
+
+    <div class="card">
+      <h3>Probe touches</h3>
+      <div class="hint" id="touchstate">—</div>
+      <div class="btns"><button class="b" id="touchbtn" style="grid-column: 1 / -1">Touch capture: …</button></div>
+      <pre id="touchlist" style="background:#07090c;border:1px solid #20252c;border-radius:5px;padding:6px;max-height:140px;overflow:auto;margin:6px 0 0;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#b9c2cf"></pre>
+      <div class="hint">Touch a probe to a point for ~2 s: the Pi picks the range, records at 4 timebases and analyses it. Everything is kept on the Pi; the assistant can re-evaluate it later.</div>
+    </div>
+
+    <div class="card">
+      <h3>CNC checks</h3>
+      <div class="btns">
+        <select id="cncck" style="grid-column: 1 / -1">
+          <option value="step">Step / dir timing (CH1 step, CH2 dir)</option>
+          <option value="encoder">Encoder A/B (CH1 A, CH2 B)</option>
+          <option value="levels">Logic levels (CH1)</option>
+          <option value="rail">Supply rail (CH1)</option>
+          <option value="bounce">Switch bounce (CH1, press when armed)</option>
+        </select>
+      </div>
+      <div class="btns" id="cncparams"></div>
+      <div class="btns"><button class="b" id="cncrun" style="grid-column: 1 / -1">Run check</button></div>
+      <pre id="cncout" style="background:#07090c;border:1px solid #20252c;border-radius:5px;padding:6px;max-height:220px;overflow:auto;margin:6px 0 0;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#b9c2cf">(no check run yet)</pre>
+      <pre id="cncjobs" style="background:#07090c;border:1px solid #20252c;border-radius:5px;padding:6px;max-height:110px;overflow:auto;margin:6px 0 0;font:11px/1.35 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#b9c2cf"></pre>
     </div>
 
     <div class="card">
@@ -421,6 +447,83 @@ function connect() {
   };
   es.onerror = () => { $('dot').className = 'dot'; $('fps').textContent = 'reconnecting…'; };
 }
+
+// ---------- battery ----------
+async function battery() {
+  try {
+    const b = await api('/api/battery?hours=1');
+    const el = $('sbat'), chip = $('batchip');
+    if (b.mv == null) { el.textContent = '—'; chip.title = (b.warnings || []).join('\n'); return; }
+    const arrow = b.state === 'charging' ? ' ↑' : b.state === 'discharging' ? ' ↓' : '';
+    const left = b.minutes_to_empty != null ? ` ${Math.floor(b.minutes_to_empty / 60)}h${String(b.minutes_to_empty % 60).padStart(2, '0')}` : '';
+    el.textContent = (b.mv / 1000).toFixed(2) + ' V ~' + b.pct_approx + '%' + arrow + left;
+    el.style.color = (b.warnings || []).length ? '#ef4444' : b.state === 'charging' ? '#22c55e' : '';
+    chip.title = [b.state + (b.slope_mv_per_h != null ? ` (${b.slope_mv_per_h} mV/h)` : '')].concat(b.warnings || []).join('\n');
+  } catch (e) {}
+}
+setInterval(battery, 15000); battery();
+
+// ---------- probe touches ----------
+let touchOn = true;
+async function touches() {
+  try {
+    const st = await api('/api/touch');
+    touchOn = st.enabled;
+    $('touchbtn').textContent = 'Touch capture: ' + (st.enabled ? 'ON' : 'OFF');
+    $('touchstate').textContent = !st.available ? 'not available' :
+      st.state === 'burst' ? 'CAPTURING… keep the probe on' :
+      st.state === 'holding' ? 'signal present (captured; still recording)' :
+      st.state === 'suspended' ? `paused ${st.suspended_s}s (someone is driving the scope)` :
+      st.state === 'ready' ? 'ready: touch a probe to a point' : st.state;
+    $('touchstate').style.color = st.state === 'burst' ? '#f8a800' : '';
+    const ts = await api('/api/touches');
+    $('touchlist').textContent = ts.slice(0, 10).map(t => new Date(t.t0 * 1000).toLocaleTimeString() + '  CH' + (t.touched || []).join('+') + '\n' +
+      Object.entries(t.summary || {}).map(([c, v]) => '  ' + v).join('\n') + (t.error ? '\n  error: ' + t.error : '')).join('\n') || '(no touches yet)';
+  } catch (e) {}
+}
+$('touchbtn').onclick = async () => { await api('/api/touch', { enabled: !touchOn }); touches(); };
+setInterval(touches, 2000); touches();
+
+// ---------- CNC checks ----------
+const CNC_PARAMS = {
+  step: [['active', 'edge the drive counts', ['rising', 'falling']], ['min-pulse', 'min pulse (e.g. 2.5us)'], ['min-setup', 'min DIR setup (e.g. 5us)'], ['max-rate', 'max step rate (e.g. 100k)'], ['steps-per-mm', 'steps/mm (optional)']],
+  encoder: [['lines', 'pulses per rev (optional)']],
+  levels: [['family', 'logic family', ['3v3', '5v-ttl', '5v-cmos', '24v']], ['vil', 'VIL (optional)'], ['vih', 'VIH (optional)']],
+  rail: [['nominal', 'nominal volts (e.g. 24)'], ['tol', 'tolerance % (5)'], ['seconds', 'seconds (5)']],
+  bounce: [['debounce', 'input filter (e.g. 5ms)'], ['vhigh', 'closed voltage if idle low (e.g. 24)'], ['timeout', 'wait s (60)']],
+};
+function cncForm() {
+  const ck = $('cncck').value, box = $('cncparams'); box.innerHTML = '';
+  for (const [k, label, opts] of CNC_PARAMS[ck]) {
+    let el;
+    if (opts) { el = document.createElement('select'); for (const o of opts) { const op = document.createElement('option'); op.value = op.textContent = o; el.appendChild(op); } }
+    else { el = document.createElement('input'); el.type = 'text'; el.placeholder = label; }
+    el.dataset.k = k; el.title = label; el.style.gridColumn = '1 / -1'; box.appendChild(el);
+  }
+}
+$('cncck').onchange = cncForm; cncForm();
+let cncJob = null;
+async function cncPoll() {
+  if (!cncJob) return;
+  const j = await api('/api/cnc/jobs/' + cncJob);
+  $('cncout').textContent = (j.log || []).join('\n') + (j.state === 'running' ? '\n… running' : '\n== ' + (j.verdict || j.state));
+  $('cncout').style.color = j.verdict === 'PASS' ? '#22c55e' : j.verdict === 'FAIL' || j.verdict === 'ERROR' ? '#ef4444' : j.verdict === 'MARGINAL' ? '#f8a800' : '';
+  if (j.state === 'running') setTimeout(cncPoll, 700); else { cncJob = null; $('cncrun').disabled = false; cncJobs(); }
+}
+$('cncrun').onclick = async () => {
+  const params = {};
+  for (const el of $('cncparams').children) if (el.value) params[el.dataset.k] = el.value;
+  const r = await api('/api/cnc/run', { check: $('cncck').value, params });
+  if (r.error) { $('cncout').textContent = 'error: ' + r.error; return; }
+  cncJob = r.id; $('cncrun').disabled = true; $('cncout').textContent = 'started…'; cncPoll();
+};
+async function cncJobs() {
+  try {
+    const js = await api('/api/cnc/jobs');
+    $('cncjobs').textContent = js.slice(0, 8).map(j => new Date(j.started * 1000).toLocaleTimeString() + '  ' + j.check + '  ' + (j.verdict || j.state)).join('\n') || '(history empty)';
+  } catch (e) {}
+}
+cncJobs();
 grid(); init().then(connect);
 </script>
 </body>
