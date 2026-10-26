@@ -11,28 +11,37 @@ send them. The exact solder points for D+/D−, 3V3 and the battery are confirme
 photos, not guessed.**
 
 
-## 0. Current plan (2026-10-13): Pi mounted OUTSIDE the case, latching power switch
+## 0. Current plan (2026-10-14): Pi OUTSIDE the case on its OWN supply; a normal USB cable charges the scope
 
-Supersedes the internal D+/D− tap, the regulator and the data switch below (kept for reference).
+Decided after the battery-fed attempt drained the scope's cell to 2.98 V and cost a day of CNC work (below).
+- **Pi power:** its own micro-USB supply in "PWR IN" (official 5 V 2.5 A, or the machine's 5 V, or a power bank).
+- **Data + charging:** a normal USB data cable from the Pi's "USB" port to the scope, **5 V wire intact**: the
+  Pi's port charges the scope continuously, so the scope runs indefinitely at the CNC. Verify with
+  `scopectl battery` (state must read "charging" or "steady", never "discharging", while connected).
+- **POWER on USB:** firmware r18 dark-sleeps (USB holds the rail up) and only a button wakes it; the Pi sees `slp=2`,
+  backs off to 1 Hz and pauses recording.
+- **Nothing soldered inside the scope is needed.** Remove the battery leads at the battery end (not just at the Pi) and
+  tape the 3V3 trigger wire if it stays.
+- **Pi mounting:** outside the case, antenna end toward the router.
 
-- **Data:** short right-angle USB-C → micro-USB cable from the scope's port to the Pi's "USB" port,
-  **5 V wire cut** (D+, D−, GND kept). The Pi's USB host mode is forced in software if needed.
-- **Power:** the Pi runs at battery voltage (no regulator; the owner's choice, and it runs). It is
-  reliable above about 3.4 V, and the scope turns itself off at 3.3 V.
-- **Switch:** Pololu Mini Pushbutton Power Switch **LV #2808** (2.2–16 V, latching, ~0.01 µA off; not the SV,
-  which needs ≥4.5 V; pololu.com, not on Amazon). Wiring:
-  ```
-  battery + ──[1.35 A PTC]──► switch VIN        switch VOUT ──► Pi pin 2
-  battery − ────────────────► switch GND ──────────────────────► Pi pin 6
-  scope 3V3 ──[10k]─────────► switch ON          scope on  ⇒ latches on ⇒ Pi boots
-  scope 3V3 ──[22k]─────────► Pi GPIO17 (pin 11) scope off ⇒ clean Linux shutdown (gpio-shutdown)
-  Pi GPIO27 (pin 13) ───────► switch OFF         end of shutdown ⇒ gpio-poweroff raises it ⇒ power cut
-  ```
-- **Pi config (enable ONLY after the wiring exists, or pin 11 floating low shuts it down at boot):**
-  `dtoverlay=gpio-shutdown,gpio_pin=17,active_low=1,gpio_pull=down` and `dtoverlay=gpio-poweroff,gpiopin=27`
-  in `/boot/firmware/config.txt`. Test: scope off → Pi halts → switch LED off; scope on → Pi boots.
-- **Manual fallback** (owner's option): a ≥2 A toggle in the battery + lead instead of the switch board,
-  plus the pin-11 shutdown trigger; flip it off after the Pi's LED stops.
+### Tried and abandoned (keep for reference)
+- **Pi fed straight from the scope's Li-ion cell (2026-10-13/14).** It runs: the Zero's own 3.3 V regulator copes down to
+  about 3.4 V. But with no switch it drew 0.3–0.5 A around the clock, scope on or off. Its USB port only outputs the cell
+  voltage, so nothing charged the scope. The cell went 3.81 V → 2.98 V in about a day, and the scope's battery-critical
+  shutdown (30 s below about 3.3 V) kept switching it off. The Zero 2 W has no undervoltage detector, so `get_throttled=0x0`
+  proves nothing there.
+- **Fixes considered for battery-feeding:**
+  - Pololu S9V11F5: EN is not one of the three holes. Its pad wasn't identified from the drawing.
+  - Pololu S7V8F5: SHDN is a through-hole, but it needs <0.4 V against a 100k pull-up, so use a ~5k pull-down.
+  - A diode-OR hold (scope 3V3 / Pi GPIO27 → EN, `gpio-shutdown` on GPIO17, `gpio-poweroff` on GPIO27).
+  - A latching switch: Pololu Mini Pushbutton Power Switch **LV #2808**. The SV version needs ≥4.5 V. One #2808 was
+    ordered and is now a spare.
+  - All of these fix the drain while the scope is off, but not the runtime while working, nor charging. Cheap
+    "MOSFET trigger" modules switch ground; USB GND then back-feeds, so they never fully cut power.
+- **Internal D+/D− tap.** On the owner's board (2C53T-V1.4_20250507) the USB-C receptacle is the 16-pin USB 2.0
+  type: pads 6+7 (the middle two) are D+/D−, and 2/11 are VBUS. Mapped in `docs/internal_build/own_board_usbc.jpg`.
+  It was dropped for fine-pitch soldering. Battery +/−, 3V3 and GND are confirmed on the owner's board
+  (`own_board_taps.jpg`).
 
 ---
 
